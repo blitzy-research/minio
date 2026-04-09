@@ -155,7 +155,7 @@ mc stat myminio/test-encrypt/test-file.txt
 The trace captures the full request lifecycle. The critical observation is that the `NewMultipartUpload` request (initiated by `mc pipe`) shows the `X-Amz-Server-Side-Encryption: AES256` header, even though the client (`mc pipe`) did not send it — `sseConfig.Apply()` injected it server-side before the request was logged.
 
 **NewMultipartUpload request trace:**
-```
+```text
 localhost:9000 [REQUEST s3.NewMultipartUpload] [2026-04-09T22:35:59.271] [Client IP: 127.0.0.1]
 localhost:9000 POST /test-encrypt/test-file.txt?uploads=
 localhost:9000 Proto: HTTP/1.1
@@ -174,7 +174,7 @@ localhost:9000 200 OK
 > **Key observation:** The client's original request did not include the `X-Amz-Server-Side-Encryption` header. The `Apply()` method at `bucket-sse-config.go:135` detected no existing SSE headers (via `crypto.Requested()` returning `false`), then checked the bucket's configured algorithm (`AES256` via `Algo()`), and set `X-Amz-Server-Side-Encryption: AES256` on the request headers. By the time the trace is emitted, the header has already been injected.
 
 **PutObjectPart response (confirms server-side encryption):**
-```
+```text
 localhost:9000 [REQUEST s3.PutObjectPart] [2026-04-09T22:35:59.275] [Client IP: 127.0.0.1]
 localhost:9000 PUT /test-encrypt/test-file.txt?partNumber=1&uploadId=...
 localhost:9000 Content-Length: 197
@@ -186,7 +186,7 @@ localhost:9000 X-Amz-Server-Side-Encryption: AES256   ← response confirms encr
 ```
 
 **mc stat output confirming encryption:**
-```
+```text
 Name      : test-file.txt
 Date      : 2026-04-09 22:35:59 UTC
 Size      : 24 B
@@ -309,7 +309,7 @@ mc rm --version-id=<VERSION_ID> myminio/test-lock/locked-file.txt
 ### Server Trace Output
 
 **mc stat showing the object with COMPLIANCE retention:**
-```
+```text
 Name      : locked-file.txt
 Date      : 2026-04-09 22:36:24 UTC
 Size      : 15 B
@@ -324,7 +324,7 @@ Metadata  :
 ```
 
 **Delete attempt and error trace:**
-```
+```text
 $ mc rm --version-id=3ebede55-529a-42b9-a7f7-f72ccb28b19c myminio/test-lock/locked-file.txt
 mc: <ERROR> Failed to remove `myminio/test-lock/locked-file.txt`. Object,
   'locked-file.txt (Version ID=3ebede55-529a-42b9-a7f7-f72ccb28b19c)' is
@@ -332,7 +332,7 @@ mc: <ERROR> Failed to remove `myminio/test-lock/locked-file.txt`. Object,
 ```
 
 **Server trace of the `DeleteMultipleObjects` request and XML error response:**
-```
+```text
 localhost:9000 [REQUEST s3.DeleteMultipleObjects] [2026-04-09T22:36:43.691] [Client IP: 127.0.0.1]
 localhost:9000 POST /test-lock/?delete=
 localhost:9000 Proto: HTTP/1.1
@@ -464,7 +464,7 @@ mc cat myminio/test-bitrot/important-data.txt
 ### Server Trace Output
 
 **`storage.ReadFileStream` operations on all shards (including corrupted disk1):**
-```
+```text
 127.0.0.1:9000  [STORAGE storage.ReadFileStream] [2026-04-09T22:38:44.270]
   /tmp/minio-erasure/data1 test-bitrot important-data.txt/63c03519-.../part.1
   total-errs-availability=0 total-errs-timeout=0 40.455µs 58 B      ← corrupted shard on disk1
@@ -481,7 +481,7 @@ mc cat myminio/test-bitrot/important-data.txt
 > **Key observation:** The `storage.ReadFileStream` call on disk1 succeeds at the I/O level (the file is read), but when `bitrotVerify()` at `cmd/bitrot.go:158` processes the shard data, the HighwayHash256S hash mismatch at line 205 returns `errFileCorrupt`. The erasure decoder nullifies this reader and proceeds with the remaining healthy shards.
 
 **Successful `GetObject` response (200 OK — data reconstructed):**
-```
+```text
 localhost:9000 [REQUEST s3.GetObject] [2026-04-09T22:38:44.270] [Client IP: 127.0.0.1]
 localhost:9000 GET /test-bitrot/important-data.txt
 localhost:9000 Proto: HTTP/1.1
@@ -497,13 +497,13 @@ localhost:9000 ETag: "8528587d616c1e2f8ce28fff96505058-1"
 > **Key observation:** Despite the corruption on disk1, the client receives a `200 OK` response with the complete 52-byte object. The erasure decoder reconstructed the original data from the remaining healthy shards (data2, data3, data4).
 
 **Verified client output:**
-```
+```text
 $ mc cat myminio/test-bitrot/important-data.txt
 This is important data that must survive corruption
 ```
 
 **Background `[HEALING heal.Object]` triggered ~1 second after the read:**
-```
+```text
 127.0.0.1:9000  [HEALING heal.Object] [2026-04-09T22:38:45.271]
   test-bitrot/important-data.txt version-id=null disks=4 dry=false mode=0
   remove=true 5.970719ms 52 B
@@ -512,7 +512,7 @@ This is important data that must survive corruption
 > **Key observation:** The `[HEALING heal.Object]` event fires approximately 1 second after the `GetObject` response, confirming that MinIO detected the corruption during the read and enqueued a background healing job. The `disks=4` field shows all 4 disks participated, `dry=false` indicates an actual repair (not a dry run), and `52 B` confirms the full object was healed.
 
 **Repaired shard written back to disk1:**
-```
+```text
 127.0.0.1:9000  [STORAGE storage.CreateFile] [2026-04-09T22:38:45.272]
   /tmp/minio-erasure/data1 .minio.sys/tmp .../part.1
   total-errs-timeout=0 total-errs-availability=0 3.923112ms 58 B
@@ -632,7 +632,7 @@ The STS session policy enforcement follows two phases: credential issuance and c
    - Both must be true for the request to be allowed
    - **Result:** The effective permissions are the **INTERSECTION** of the parent user's policy and the session policy
 
-### Runtime Test Program and Output
+### Runtime Setup
 
 A Go test program was written to verify the session policy intersection enforcement:
 
@@ -654,7 +654,6 @@ sessionPolicy := `{
 // Session policy restricts to ONLY s3:GetObject on test-sts/allowed-file.txt
 ```
 
-**Setup commands:**
 ```bash
 # Create test bucket and files
 mc mb myminio/test-sts
@@ -669,8 +668,10 @@ mc admin policy attach myminio readwrite --user=testuser
 go run /tmp/sts-test.go
 ```
 
+### Runtime Test Output
+
 **Test output:**
-```
+```text
 === STS Session Policy Enforcement Test ===
 1. Parent user 'testuser' has readwrite policy
 2. AssumeRole with session policy: s3:GetObject on test-sts/allowed-file.txt
@@ -764,7 +765,7 @@ The admin API authorization gate prevents any non-admin user from accessing admi
    Source: `cmd/admin-handler-utils.go:37-61`
 
 3. **Policy evaluation for admin actions**: When `IsAllowed()` at `cmd/iam.go:2437` evaluates a request from a user with the `readonly` built-in policy:
-   - The `readonly` policy contains only two S3-level statements:
+   - The `readonly` policy contains only one S3-level statement with two actions:
      - `s3:GetBucketLocation` on `arn:aws:s3:::*`
      - `s3:GetObject` on `arn:aws:s3:::*`
    - It contains **zero** admin-level statements (no `admin:*` actions)
@@ -772,7 +773,7 @@ The admin API authorization gate prevents any non-admin user from accessing admi
    - With no matching Allow statement, the default policy evaluation result is `Deny`
    - This causes every admin API call to return `ErrAccessDenied`
 
-### Test Command Output
+### Runtime Setup
 
 ```bash
 # Create a readonly user
@@ -788,36 +789,38 @@ $ mc alias set basicminio http://localhost:9000 basicuser basicuser123
 Added `basicminio` successfully.
 ```
 
+### Test Command Output
+
 **Attempt 1: Create a new admin user**
-```
+```text
 $ mc admin user add basicminio newadmin newadmin123
 mc: <ERROR> Unable to add new user. Access Denied.
 ```
 > Code path: `AddUser()` at `admin-handlers-users.go:444` → `validateAdminSignature()` at line 457 → `globalIAMSys.IsAllowed()` evaluates `policy.CreateUserAdminAction` against `readonly` policy → no match → `ErrAccessDenied`
 
 **Attempt 2: Attach consoleAdmin policy to self**
-```
+```text
 $ mc admin policy attach basicminio consoleAdmin --user=basicuser
 mc: <ERROR> Unable to make user/group policy association. Access Denied.
 ```
 > Code path: `AttachPolicyHandler` → `validateAdminReq(policy.AttachPolicyAdminAction)` → `checkAdminRequestAuth()` → `readonly` policy has no `admin:AttachUserOrGroupPolicy` → `ErrAccessDenied`
 
 **Attempt 3: Create an admin group**
-```
+```text
 $ mc admin group add basicminio admingroup basicuser
 mc: <ERROR> Unable to add new group. Access Denied.
 ```
 > Code path: `AddServiceAccountGroup` → `validateAdminReq(policy.AddUserToGroupAdminAction)` → `readonly` policy has no `admin:AddUserToGroup` → `ErrAccessDenied`
 
 **Attempt 4: List users (information gathering)**
-```
+```text
 $ mc admin user list basicminio
 mc: <ERROR> Unable to list user. Access Denied.
 ```
 > Code path: `ListUsers()` at `admin-handlers-users.go:136` → `validateAdminReq(ctx, w, r, policy.ListUsersAdminAction)` at line 139 → `readonly` policy has no `admin:ListUsers` → `ErrAccessDenied`
 
 **Verification: User policy unchanged**
-```
+```text
 $ mc admin user info myminio basicuser
 AccessKey: basicuser
 Status: enabled
