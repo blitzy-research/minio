@@ -1020,7 +1020,7 @@ MinIO exports detailed Prometheus metrics for erasure set health monitoring:
 
 **Per-drive health metrics** from `cmd/metrics-v3-system-drive.go` report individual drive states:
 - **0** = offline
-- **1** = online
+- **1** = healthy
 - **2** = healing
 
 **Cluster-wide drive counts** from `cmd/metrics-v3-cluster-health.go`:
