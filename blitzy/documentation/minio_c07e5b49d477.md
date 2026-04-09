@@ -289,17 +289,17 @@ The `shouldHealObjectOnDisk` function evaluates whether a specific object on a s
 
 The decision tree has the following conditions, evaluated in the order they appear in the code:
 
-1. **Missing or corrupt metadata** (line 157): If `erErr` is `errFileNotFound`, `errFileVersionNotFound`, or `errFileCorrupt` → returns `(true, erErr)`. The object's xl.meta file is missing or corrupted on this disk.
+- **Missing or corrupt metadata** (line 157): If `erErr` is `errFileNotFound`, `errFileVersionNotFound`, or `errFileCorrupt` → returns `(true, erErr)`. The object's xl.meta file is missing or corrupted on this disk.
 
-2. **Legacy XLV1 metadata** (lines 160-164): If `erErr` is nil and `meta.XLV1 == true` → returns `(true, errLegacyXLMeta)`. Legacy format metadata always triggers healing. The sentinel is `errLegacyXLMeta = errors.New("legacy XL meta")`. `Source: cmd/erasure-healing.go:148`
+- **Legacy XLV1 metadata** (lines 160-164): If `erErr` is nil and `meta.XLV1 == true` → returns `(true, errLegacyXLMeta)`. Legacy format metadata always triggers healing. The sentinel is `errLegacyXLMeta = errors.New("legacy XL meta")`. `Source: cmd/erasure-healing.go:148`
 
-3. **Outdated metadata** (lines 166-168): If `erErr` is nil and `!latestMeta.Equals(meta)` — the disk's metadata does not match the latest known version → returns `(true, errOutdatedXLMeta)`. The sentinel is `errOutdatedXLMeta = errors.New("outdated XL meta")`. `Source: cmd/erasure-healing.go:150`
+- **Outdated metadata** (lines 166-168): If `erErr` is nil and `!latestMeta.Equals(meta)` — the disk's metadata does not match the latest known version → returns `(true, errOutdatedXLMeta)`. The sentinel is `errOutdatedXLMeta = errors.New("outdated XL meta")`. `Source: cmd/erasure-healing.go:150`
 
-4. **Missing or corrupt part files** (lines 169-178): If `erErr` is nil, xl.meta is valid and current, but individual part data files (part.N) have `checkPartFileNotFound` or `checkPartFileCorrupt` errors → returns `(true, errPartMissingOrCorrupt)`. The sentinel is `errPartMissingOrCorrupt = errors.New("part missing or corrupt")`. `Source: cmd/erasure-healing.go:152`
+- **Missing or corrupt part files** (lines 169-178): If `erErr` is nil, xl.meta is valid and current, but individual part data files (part.N) have `checkPartFileNotFound` or `checkPartFileCorrupt` errors → returns `(true, errPartMissingOrCorrupt)`. The sentinel is `errPartMissingOrCorrupt = errors.New("part missing or corrupt")`. `Source: cmd/erasure-healing.go:152`
 
-5. **No healing needed** (line 180): If `erErr` is nil and none of the above nil-path conditions match → returns `(false, nil)`. The object is healthy on this disk.
+- **No healing needed** (line 180): If `erErr` is nil and none of the above nil-path conditions match → returns `(false, nil)`. The object is healthy on this disk.
 
-6. **Unknown error — fallback** (line 182): If `erErr` is non-nil but not one of the recognized errors in condition #1 → returns `(false, erErr)`. Healing is **not** attempted for unrecognized errors. This is a safety measure and serves as the final fallback branch, reached only when `erErr` is neither nil nor a recognized file error.
+- **Unknown error — fallback** (line 182): If `erErr` is non-nil but not one of the recognized errors in the first condition above → returns `(false, erErr)`. Healing is **not** attempted for unrecognized errors. This is a safety measure and serves as the final fallback branch, reached only when `erErr` is neither nil nor a recognized file error.
 
 Note: For deleted objects (`meta.Deleted`) or tiered/remote objects (`meta.IsRemote()`), the part file check is skipped since there are no local part files to verify. `Source: cmd/erasure-healing.go:169`
 
