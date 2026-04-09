@@ -1060,6 +1060,7 @@ if latestMeta.InlineData() {
 | | `parallelReader.Read()` | 127-235 |
 | | `Erasure.Decode()` | 239-314 |
 | | `Erasure.Heal()` | 317-364 |
+| `cmd/erasure-coding.go` | `NewErasure()`, `EncodeData()`, `DecodeDataBlocks()`, `DecodeDataAndParityBlocks()` | 42-111 |
 | `cmd/erasure.go` | `defaultWQuorum()` | 85-91 |
 | | `defaultRQuorum()` | 94-96 |
 | | `diskErrToDriveState()` | 98-119 |
