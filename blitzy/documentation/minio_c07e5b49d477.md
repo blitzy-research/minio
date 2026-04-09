@@ -196,7 +196,7 @@ This policy grants the same three actions as the canned `readonly` policy, but s
 
 ## 3. Complete S3 API Handler-to-Policy-Action Map
 
-This section provides an exhaustive mapping of every S3 API handler to the IAM policy action it checks. Each entry cites the exact source file and line number where the `checkRequestAuthType()`, `authenticateRequest()`, or `isPutActionAllowed()` call occurs.
+This section provides a comprehensive mapping of every S3 API handler with a `checkRequestAuthType()`, `authenticateRequest()`, `isPutActionAllowed()`, or `checkRequestAuthTypeCredential()` authorization check to the IAM policy action it evaluates. Each entry cites the exact source file and line number where the check occurs. All handler files in `cmd/*-handlers.go` have been analyzed for completeness.
 
 **Legend:**
 - ✅ **YES** = Accessible with the `readonly` policy (action is in the grant set)
@@ -227,10 +227,10 @@ Source: `cmd/object-handlers.go`
 | `PutObjectExtractHandler` | PUT (extract/auto-extract) | `policy.PutObjectAction` | `cmd/object-handlers.go:2224` (via `isPutActionAllowed`) | ❌ NO |
 
 **Key findings for object operations:**
-- Only 4 operations are accessible: `GetObject`, `HeadObject`, `SelectObjectContent`, and the source-read portion of `CopyObject`.
+- Only 4 operations in this handler file are accessible: `GetObject`, `HeadObject`, `SelectObjectContent`, and the source-read portion of `CopyObject`. (Additional accessible operations exist in other handler files — see Sections 3.9 and 3.10 for `GetObjectLambda` and S3 ZIP handlers.)
 - `GetObjectTagging` requires its own separate `GetObjectTaggingAction` — it is NOT covered by `GetObjectAction`.
 - `GetObjectAttributes` requires both `GetObjectAttributesAction` AND `GetObjectAction` (checked sequentially at lines 593-595). Since `GetObjectAttributesAction` is not in the readonly grant, this operation is denied.
-- `SelectObjectContent` is gated only by `GetObjectAction` and is therefore accessible — this is a content access vector documented in Section 5.5.
+- `SelectObjectContent` is gated only by `GetObjectAction` and is therefore accessible — this is a content access vector documented in Section 5.6.
 
 ### 3.2 Multipart Upload Operations
 
@@ -324,14 +324,97 @@ Source: `cmd/bucket-listobjects-handlers.go`
 | `cmd/bucket-policy-handlers.go` | DELETE bucket policy | `policy.DeleteBucketPolicyAction` | `:142` | ❌ NO |
 | `cmd/bucket-policy-handlers.go` | GET bucket policy | `policy.GetBucketPolicyAction` | `:185` | ❌ NO |
 
-**Summary:** Of the 50+ S3 API handlers analyzed, a read-only principal can access only:
+### 3.6 ACL Handlers (S3 Compatibility Stubs)
+
+Source: `cmd/acl-handlers.go`
+
+MinIO does not implement S3 ACLs natively — these handlers exist for S3 compatibility and map ACL operations to bucket policy actions:
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `PutBucketACLHandler` | PUT `?acl` (bucket) | `policy.PutBucketPolicyAction` | `cmd/acl-handlers.go:77` | ❌ NO |
+| `GetBucketACLHandler` | GET `?acl` (bucket) | `policy.GetBucketPolicyAction` | `cmd/acl-handlers.go:139` | ❌ NO |
+| `PutObjectACLHandler` | PUT `?acl` (object) | `policy.PutBucketPolicyAction` | `cmd/acl-handlers.go:193` | ❌ NO |
+| `GetObjectACLHandler` | GET `?acl` (object) | `policy.GetBucketPolicyAction` | `cmd/acl-handlers.go:255` | ❌ NO |
+
+**Key finding:** All four ACL handlers are denied. Even the "get" operations (`GetBucketACLHandler`, `GetObjectACLHandler`) require `GetBucketPolicyAction`, which is not in the readonly grant.
+
+### 3.7 Stub/Dummy Handlers (AWS Compatibility)
+
+Source: `cmd/dummy-handlers.go`
+
+These handlers provide stub responses for AWS S3 features that MinIO does not implement. Each still enforces policy authorization:
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `GetBucketWebsiteHandler` | GET `?website` | `policy.GetBucketPolicyAction` | `cmd/dummy-handlers.go:49` | ❌ NO |
+| `GetBucketAccelerateHandler` | GET `?accelerate` | `policy.GetBucketPolicyAction` | `cmd/dummy-handlers.go:81` | ❌ NO |
+| `GetBucketRequestPaymentHandler` | GET `?requestPayment` | `policy.GetBucketPolicyAction` | `cmd/dummy-handlers.go:114` | ❌ NO |
+| `GetBucketLoggingHandler` | GET `?logging` | `policy.GetBucketPolicyAction` | `cmd/dummy-handlers.go:148` | ❌ NO |
+| `GetBucketCorsHandler` | GET `?cors` | `policy.GetBucketCorsAction` | `cmd/dummy-handlers.go:184` | ❌ NO |
+| `PutBucketCorsHandler` | PUT `?cors` | `policy.PutBucketCorsAction` | `cmd/dummy-handlers.go:214` | ❌ NO |
+| `DeleteBucketCorsHandler` | DELETE `?cors` | `policy.DeleteBucketCorsAction` | `cmd/dummy-handlers.go:244` | ❌ NO |
+
+> **Note:** `DeleteBucketWebsiteHandler` (at `cmd/dummy-handlers.go:165`) does NOT perform any authorization check — it immediately returns HTTP 200. This is a no-op stub handler that neither reads nor writes any state.
+
+### 3.8 Listen Notification Handler
+
+Source: `cmd/listen-notification-handlers.go`
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `ListenNotificationHandler` (no bucket) | GET `/` events stream | `policy.ListenNotificationAction` | `cmd/listen-notification-handlers.go:51` | ❌ NO |
+| `ListenNotificationHandler` (with bucket) | GET `/{bucket}` events stream | `policy.ListenBucketNotificationAction` | `cmd/listen-notification-handlers.go:56` | ❌ NO |
+
+**Key finding:** The `ListenNotificationHandler` checks two different actions depending on whether a bucket is specified. Neither `ListenNotificationAction` nor `ListenBucketNotificationAction` is in the readonly grant — event streams are denied.
+
+### 3.9 Object Lambda Handler
+
+Source: `cmd/object-lambda-handlers.go`
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `GetObjectLambdaHandler` | GET (via Object Lambda Access Point) | `policy.GetObjectAction` | `cmd/object-lambda-handlers.go:226` | ✅ YES |
+
+**⚠️ Security-significant finding:** `GetObjectLambdaHandler` is gated only by `policy.GetObjectAction`, which IS in the readonly grant. This means a read-only principal **CAN** invoke Object Lambda functions to retrieve transformed object content. This is an additional content access vector alongside `GetObject` and `SelectObjectContent` — see Section 5.7 for the metadata exposure assessment.
+
+### 3.10 S3 ZIP Archive Handlers
+
+Source: `cmd/s3-zip-handlers.go`
+
+These handlers allow retrieving individual files from within ZIP archives stored as S3 objects, without downloading the entire archive:
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `getObjectInArchiveFileHandler` | GET (file within ZIP) | `policy.GetObjectAction` | `cmd/s3-zip-handlers.go:87` | ✅ YES |
+| `headObjectInArchiveFileHandler` | HEAD (file within ZIP) | `policy.GetObjectAction` | `cmd/s3-zip-handlers.go:385` | ✅ YES |
+
+**⚠️ Security-significant finding:** Both S3 ZIP archive handlers are gated only by `policy.GetObjectAction`, which IS in the readonly grant. A read-only principal **CAN** browse and extract individual files from within ZIP archives stored as objects. This provides granular access to archive contents beyond what a simple `GetObject` download reveals — see Section 5.8 for the metadata exposure assessment.
+
+### 3.11 Additional Bucket Replication Handlers
+
+Source: `cmd/bucket-replication-handlers.go`
+
+In addition to the Put/Get/Delete replication config handlers listed in Section 3.5, five additional replication-related handlers exist:
+
+| Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
+|---|---|---|---|---|
+| `GetBucketReplicationMetricsHandler` | GET replication metrics | `policy.GetReplicationConfigurationAction` | `cmd/bucket-replication-handlers.go:214` | ❌ NO |
+| `GetBucketReplicationMetricsV2Handler` | GET replication metrics v2 | `policy.GetReplicationConfigurationAction` | `cmd/bucket-replication-handlers.go:270` | ❌ NO |
+| `ResetBucketReplicationStartHandler` | PUT reset replication start | `policy.ResetBucketReplicationStateAction` | `cmd/bucket-replication-handlers.go:348` | ❌ NO |
+| `ResetBucketReplicationStatusHandler` | PUT reset replication status | `policy.ResetBucketReplicationStateAction` | `cmd/bucket-replication-handlers.go:464` | ❌ NO |
+| `ValidateBucketReplicationCredsHandler` | GET validate replication creds | `policy.GetReplicationConfigurationAction` | `cmd/bucket-replication-handlers.go:530` | ❌ NO |
+
+**Summary:** Of the ~75 S3 API handlers analyzed across all handler files, a read-only principal can access only:
 - `GetObject`, `HeadObject`, `SelectObjectContent` (object-level reads)
+- `GetObjectLambdaHandler` (transformed object content via lambda — uses `GetObjectAction`)
+- `getObjectInArchiveFileHandler`, `headObjectInArchiveFileHandler` (file-level access within ZIP archives — uses `GetObjectAction`)
 - `GetBucketLocation`, `HeadBucket` (bucket-level metadata)
 - `ListObjectsV1`, `ListObjectsV2` (bucket listing)
 - `ListObjectVersions` (via the `ListBucketAction` fallback)
 - Source-read portion of `CopyObject` and `CopyObjectPart`
 
-Every other operation — every mutation, every configuration read, every tagging/retention/legal-hold read — is denied.
+Every other operation — every mutation, every configuration read, every tagging/retention/legal-hold read, every ACL operation, every notification listener, and every stub/dummy handler — is denied.
 
 ---
 
@@ -524,6 +607,8 @@ if s3Error == ErrNone {
 
 Since `GetObjectAttributesAction` is NOT in the readonly grant set, this operation is **DENIED** for a strict read-only principal, even though the second check (`GetObjectAction`) would pass. The first check fails and the request is rejected.
 
+> **Versioned variant:** When a `versionId` query parameter is present, the handler checks `policy.GetObjectVersionAttributesAction` + `policy.GetObjectVersionAction` instead (Source: `cmd/object-handlers.go:588-592`). Neither `GetObjectVersionAttributesAction` nor `GetObjectVersionAction` is in the readonly grant, so the versioned variant is also **DENIED**. The security conclusion is identical for both paths.
+
 If `GetObjectAttributesAction` were added to the policy, the response would expose: `ETag`, `Checksum`, `ObjectParts` (multipart part info), `StorageClass`, and `ObjectSize`.
 
 ### 5.5 GetObjectTagging (DENIED)
@@ -545,6 +630,40 @@ If `GetObjectAttributesAction` were added to the policy, the response would expo
 - Filter and aggregate data server-side before transfer
 
 **Security assessment:** S3 Select is a powerful content access vector. While `GetObject` downloads the entire object, S3 Select allows targeted extraction of specific data fields. For organizations storing sensitive structured data (e.g., CSV exports of database tables), a read-only principal with S3 Select access can efficiently extract individual records or columns without downloading entire files. This is by design — `s3:GetObject` permission is intentionally sufficient for S3 Select.
+
+### 5.7 GetObjectLambda (ALLOWED — Transformed Content Access Vector)
+
+**Gated by:** `policy.GetObjectAction` at `cmd/object-lambda-handlers.go:226` — **ALLOWED** for readonly.
+
+`GetObjectLambdaHandler` allows retrieving object content that has been transformed by a configured Lambda function (e.g., format conversion, redaction, enrichment). The authorization check uses `checkRequestAuthTypeCredential()` with `policy.GetObjectAction` — the same action as regular `GetObject`.
+
+**Security assessment:** If Lambda transformation targets are configured on the MinIO server (via `globalLambdaTargetList`), a read-only principal can invoke these transformations on objects within their prefix scope. This is an additional content access vector because:
+- The transformed output may expose data differently than the raw object (e.g., a Lambda that converts Parquet to CSV makes the data more accessible)
+- The Lambda function itself may add, enrich, or restructure data in the response
+- Organizations should be aware that `GetObjectAction` grants access to both raw and Lambda-transformed content
+
+**Practical note:** Object Lambda requires explicit server-side configuration of Lambda targets. If no Lambda targets are configured, the handler returns an error (`lambda ARN not found`) — the access vector only exists when the infrastructure is configured.
+
+### 5.8 S3 ZIP Archive Content Access (ALLOWED — Granular Archive Access Vector)
+
+**Gated by:** `policy.GetObjectAction` at `cmd/s3-zip-handlers.go:87` (GET) and `cmd/s3-zip-handlers.go:385` (HEAD) — **ALLOWED** for readonly.
+
+MinIO's S3 ZIP extension allows treating ZIP archives stored as objects as virtual directories. A read-only principal can:
+- **Browse individual files within ZIP archives** without downloading the entire archive (`headObjectInArchiveFileHandler`)
+- **Extract individual files from ZIP archives** server-side (`getObjectInArchiveFileHandler`)
+
+**Security assessment:** This is a significant content access vector for environments where ZIP archives are used as data containers:
+- A read-only principal can enumerate and extract any file within a ZIP archive stored in their accessible prefix
+- The ZIP table of contents is parsed server-side, so the principal can discover the internal structure of archives
+- Individual file extraction is more targeted than downloading the entire archive — the principal can selectively access specific files within the archive
+- Authorization is checked against the ZIP archive's path (the outer object key), not against individual files within the archive
+
+**Content access vector summary:** A read-only principal has **five** content access paths, all gated by `GetObjectAction`:
+1. `GetObject` — download raw object content
+2. `HeadObject` — read object metadata headers
+3. `SelectObjectContent` — execute SQL queries on structured data (CSV/JSON/Parquet)
+4. `GetObjectLambda` — retrieve Lambda-transformed content (if Lambda targets are configured)
+5. S3 ZIP handlers — browse and extract individual files within ZIP archives
 
 ---
 
@@ -762,10 +881,11 @@ mc ls local-ro/test-bucket/readonly-prefix/
 echo "--- HeadBucket (implicit via ls) ---"
 mc ls local-ro/test-bucket
 
-echo "--- GetBucketLocation ---"
+echo "--- GetBucketLocation (expect 200) ---"
 curl -s -o /dev/null -w "%{http_code}" \
   "http://localhost:9000/test-bucket?location" \
-  -H "Authorization: $(mc alias export local-ro 2>/dev/null | grep -oP 'Authorization: \K.*')"
+  --aws-sigv4 "aws:amz:us-east-1:s3" \
+  -u "readonly-user:readonly-password"
 
 echo ""
 echo "=== DENIED OPERATIONS (expect AccessDenied / 403) ==="
@@ -835,6 +955,11 @@ diff /tmp/before-state.txt /tmp/after-state.txt
 mc stat local/test-bucket/readonly-prefix/unauthorized.txt 2>&1  # expect "Object does not exist"
 mc stat local/test-bucket/readonly-prefix/copied.txt 2>&1        # expect "Object does not exist"
 mc stat local/test-bucket/readonly-prefix/multipart-test.dat 2>&1 # expect "Object does not exist"
+
+# Verify tag state was NOT mutated by denied PutObjectTagging attempts
+mc tag list local/test-bucket/readonly-prefix/file-1.txt 2>&1
+# Expected: no tags present (or tags unchanged from original state)
+# This confirms the denied PutObjectTagging did not have any side effect
 ```
 
 **Cleanup all temporary artifacts:**
@@ -1098,7 +1223,7 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 
 3. **No mutation-adjacent operation can bypass the policy check.** Multipart uploads (all 6 operations), copy-style writes, tagging mutations, delete operations, retention/legal-hold writes, and object restoration are all individually gated by distinct policy actions not in the readonly grant. Each was individually verified against the source code with line citations.
 
-4. **Metadata exposure through allowed operations is significant.** `HeadObject` reveals rich metadata (content properties, version IDs, SSE settings, object lock configuration, tagging count, user-defined metadata). `ListObjects` reveals object keys, sizes, ETags, and version histories. `SelectObjectContent` allows SQL queries on object content.
+4. **Metadata and content exposure through allowed operations is significant.** `HeadObject` reveals rich metadata (content properties, version IDs, SSE settings, object lock configuration, tagging count, user-defined metadata). `ListObjects` reveals object keys, sizes, ETags, and version histories. `SelectObjectContent` allows SQL queries on object content. `GetObjectLambda` enables retrieval of Lambda-transformed content (when Lambda targets are configured). S3 ZIP archive handlers allow browsing and extracting individual files within ZIP archives. In total, five content access paths exist, all gated by `GetObjectAction` (see Section 5.8).
 
 5. **Read operations with separate policy actions are denied.** `GetObjectTagging`, `GetObjectRetention`, `GetObjectLegalHold`, and `GetObjectAttributes` each require their own specific policy actions NOT included in the readonly grant. The readonly policy only allows the three core actions listed above.
 
@@ -1117,6 +1242,8 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 | Mutation via copy operations | **None** | Destination write check fails before source read |
 | Metadata leakage via HeadObject | **Low-Medium** | Rich metadata exposed (SSE info, lock config, user metadata) |
 | Content access via S3 Select | **Expected** | GetObject permission intentionally includes S3 Select |
+| Content access via Object Lambda | **Low** | Requires server-side Lambda target config; gated by GetObjectAction |
+| Content access via S3 ZIP handlers | **Low-Medium** | Granular extraction of files within ZIP archives; gated by GetObjectAction |
 | Version history exposure | **Low** | ListBucketAction fallback allows version listing |
 | Tag value exposure | **None** | GetObjectTagging requires separate action, only count exposed via HEAD |
 | Concurrent load bypass | **None** | Synchronous, per-request, stateless authorization model |
@@ -1217,10 +1344,24 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 | `cmd/bucket-lifecycle-handlers.go` | 61, 166, 213 | Put/Get/Delete lifecycle config |
 | `cmd/bucket-notification-handlers.go` | 53, 121 | Get/Put notification config |
 | `cmd/bucket-replication-handlers.go` | 54, 120, 159 | Put/Get/Delete replication config |
+| `cmd/bucket-replication-handlers.go` | 214, 270 | Get replication metrics v1/v2 |
+| `cmd/bucket-replication-handlers.go` | 348, 464 | Reset replication start/status |
+| `cmd/bucket-replication-handlers.go` | 530 | Validate replication creds |
 | `cmd/bucket-versioning-handler.go` | 57, 137 | Put/Get versioning config |
 | `cmd/bucket-policy-handlers.go` | 57, 142, 185 | Put/Delete/Get bucket policy |
 
-### 10.7 Error Definitions and Policy Fixtures
+### 10.7 ACL, Stub, Notification, Lambda, and ZIP Handlers
+
+| File | Key Lines | Content |
+|---|---|---|
+| `cmd/acl-handlers.go` | 77, 139, 193, 255 | Put/Get Bucket/Object ACL → PutBucketPolicyAction/GetBucketPolicyAction |
+| `cmd/dummy-handlers.go` | 49, 81, 114, 148 | Get Website/Accelerate/RequestPayment/Logging → GetBucketPolicyAction |
+| `cmd/dummy-handlers.go` | 184, 214, 244 | Get/Put/Delete CORS → GetBucketCorsAction/PutBucketCorsAction/DeleteBucketCorsAction |
+| `cmd/listen-notification-handlers.go` | 51, 56 | Listen notification → ListenNotificationAction/ListenBucketNotificationAction |
+| `cmd/object-lambda-handlers.go` | 226 | GetObjectLambda → `policy.GetObjectAction` (ALLOWED for readonly) |
+| `cmd/s3-zip-handlers.go` | 87, 385 | Get/Head object in archive → `policy.GetObjectAction` (ALLOWED for readonly) |
+
+### 10.8 Error Definitions and Policy Fixtures
 
 | File | Key Lines | Content |
 |---|---|---|
