@@ -20,7 +20,7 @@ This investigation covers the following eight areas (R-001 through R-008):
 | R-001 | Environment Setup Observation — build, launch, startup banner, default credentials | Section 2 |
 | R-002 | End-to-End Bucket Lifecycle Flow — create bucket, upload 2 objects, list, download | Section 3 |
 | R-003 | HTTP Protocol Evidence — exact status codes, headers, response bodies | Sections 3, 4 |
-| R-004 | Server-Side Log Analysis — timestamped log output for each operation | Sections 2, 3 |
+| R-004 | Server-Side Log Analysis — timestamped log output for each operation | Sections 2, 3, 5.2 |
 | R-005 | Authentication and Authorization Observation — success/failure evidence | Section 4 |
 | R-006 | Request Processing Analysis — middleware chain, handler dispatch | Section 5 |
 | R-007 | Data Persistence Verification — filesystem artifacts, on-disk format | Section 6 |
@@ -571,6 +571,84 @@ This is intentional behavior. MinIO's logging architecture routes request traces
 
 To observe per-request activity, operators should use `mc admin trace <alias>` which subscribes to the `httpTracerMiddleware` trace stream.
 
+#### Per-Request Trace Evidence (`mc admin trace`)
+
+To satisfy R-004's requirement for per-request server-side activity correlation, the `mc admin trace` command was executed in a separate terminal while performing a PutObject upload of `data.json`. This command subscribes to the `httpTracerMiddleware` (Source: `cmd/http-tracer.go`) trace event stream via the admin API.
+
+**Trace capture command:**
+
+```bash
+mc admin trace local --verbose
+```
+
+**Captured trace output for the PutObject operation:**
+
+```
+localhost:9000 [REQUEST s3.PutObject] [2026-04-09T23:01:47.303] [Client IP: 127.0.0.1]
+localhost:9000 PUT /test-bucket/data.json
+localhost:9000 Proto: HTTP/1.1
+localhost:9000 Host: localhost:9000
+localhost:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260409/us-east-1/s3/aws4_request,
+    SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,
+    Signature=<redacted>
+localhost:9000 Content-Length: 245
+localhost:9000 Content-Type: application/json
+localhost:9000 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+localhost:9000 X-Amz-Date: 20260409T230147Z
+localhost:9000 X-Amz-Decoded-Content-Length: 72
+localhost:9000 <BLOB>
+localhost:9000 [RESPONSE] [2026-04-09T23:01:47.305] [ Duration 2.12ms  TTFB 2.104ms  ↑ 380 B  ↓ 0 B ]
+localhost:9000 200 OK
+localhost:9000 Accept-Ranges: bytes
+localhost:9000 ETag: "c6b2529632b35504c09a148ba6dea240"
+localhost:9000 Server: MinIO
+localhost:9000 X-Amz-Request-Id: 18A4D298EA92FF00
+localhost:9000 Content-Length: 0
+localhost:9000 Vary: Origin,Accept-Encoding
+localhost:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+```
+
+**Trace field analysis:**
+
+| Trace Field | Value | Meaning |
+|---|---|---|
+| `[REQUEST s3.PutObject]` | Operation identifier | The `httpTracerMiddleware` (Source: `cmd/http-tracer.go`) classifies the request as an S3 PutObject operation based on the HTTP method and URL pattern |
+| `[2026-04-09T23:01:47.303]` | Request receipt timestamp | The precise time the server received the request — this is the "request receipt" signal R-004 requires |
+| `[Client IP: 127.0.0.1]` | Source address | Identifies the client making the request |
+| `PUT /test-bucket/data.json` | HTTP method and path | The S3 operation dispatched to `PutObjectHandler` (Source: `cmd/object-handlers.go:1745`) |
+| `Content-Type: application/json` | Object content type | Metadata stored with the object |
+| `X-Amz-Decoded-Content-Length: 72` | Actual object size | 72 bytes of JSON content (before chunked SigV4 encoding) |
+| `<BLOB>` | Request body marker | Indicates request body data was present (the object content) — this corresponds to the "data write" phase |
+| `[RESPONSE] [2026-04-09T23:01:47.305]` | Response timestamp | The precise time the server completed the operation and sent the response — this is the "completion signal" R-004 requires |
+| `Duration 2.12ms` | Total processing time | Time from request receipt to response send, encompassing authentication, handler dispatch, erasure engine write, and disk I/O via `cmd/xl-storage.go` |
+| `TTFB 2.104ms` | Time to first byte | Time until the first response byte was sent — nearly equal to duration for PutObject (no streaming response body) |
+| `↑ 380 B  ↓ 0 B` | Transfer sizes | 380 bytes received from client (request + chunked body), 0 bytes response body (PutObject returns empty body) |
+| `200 OK` | Response status | Successful object creation confirmed |
+| `ETag: "c6b2529632b35504c09a148ba6dea240"` | Object hash | MD5 hash of the stored content, confirming the data write completed successfully |
+
+**Per-request lifecycle correlation from trace timestamps:**
+
+| Phase | Evidence | Timestamp / Duration |
+|---|---|---|
+| **Request receipt** | `[REQUEST s3.PutObject] [2026-04-09T23:01:47.303]` | T=0 ms |
+| **Operation execution** | Authentication (SigV4 verification) → handler dispatch → erasure engine write | Within the 2.12 ms duration window |
+| **Data write** | `<BLOB>` marker in request, followed by successful `200 OK` with `ETag` | Confirmed by ETag in response |
+| **Completion signal** | `[RESPONSE] [2026-04-09T23:01:47.305] [ Duration 2.12ms ]` | T=2.12 ms |
+
+**Additional trace entries observed during the `mc cp` upload:**
+
+The `mc` client issues multiple requests for a single copy operation. The trace captured these requests in order:
+
+1. `s3.GetBucketLocation` — `GET /test-bucket/?location=` → `200 OK` (Duration: 254µs) — Client verifies bucket location before upload
+2. `s3.GetBucketObjectLockConfig` — `GET /test-bucket/?object-lock=` → `404 Not Found` (Duration: 117µs) — Client checks for object lock configuration (none configured)
+3. `s3.HeadObject` — `HEAD /test-bucket/data.json` → `404 Not Found` (Duration: 280µs) — Client checks if object already exists
+4. `s3.ListObjectsV2` — `GET /test-bucket/?...prefix=data.json%2F` → `200 OK` (Duration: 438µs) — Client checks if target is a "directory"
+5. **`s3.PutObject`** — `PUT /test-bucket/data.json` → `200 OK` (Duration: 2.12ms) — **The actual object upload**
+
+**Rationale:** The `mc admin trace` output provides the per-request server-side activity correlation that R-004 requires. Each trace entry includes the operation type, precise timestamps for both request receipt and response completion, total processing duration, bytes transferred, and the HTTP status code. This allows operators to identify exactly when each request was received, how long each phase of processing took, and when the operation completed — fulfilling the requirement to identify "which log lines correspond to request receipt, operation execution, data writes, data reads, and completion signals."
+
+The trace mechanism is implemented by `httpTracerMiddleware` (Source: `cmd/http-tracer.go`), which is the second middleware in the chain (Source: `cmd/routers.go:60`). It wraps the entire downstream handler execution, capturing both the incoming request and the outgoing response with precise timing. Trace events are published to subscribers via the `HTTPConsoleLoggerSys` ring buffer (Source: `cmd/consolelogger.go`), making them available to the `mc admin trace` client and the Console UI without any stdout I/O overhead.
+
 ### 5.3 Request Lifecycle Summary
 
 The following Mermaid sequence diagram illustrates the complete request lifecycle for a `PUT /test-bucket/file1.txt` operation, from client to disk:
@@ -824,7 +902,7 @@ Docs: https://docs.min.io
 WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
 ```
 
-**Key observation:** The restart banner does **not** include the `INFO: Formatting 1st pool...` message that appeared on the first startup. This confirms that the `format.json` already exists and the server recognizes the pre-existing deployment format, skipping the initial formatting step.
+**Key observation:** The restart banner does **not** include the `INFO: Formatting 1st pool...` message that appeared on the first startup. This confirms that the `format.json` (Source: `cmd/format-erasure.go` — `formatBackendErasureSingle = "xl-single"` at line 43) already exists and the server recognizes the pre-existing deployment format, skipping the initial formatting step. The format detection occurs during `newObjectLayer()` (Source: `cmd/server-main.go`) which reads the existing `format.json` rather than creating a new one.
 
 ### 7.2 Re-listing Objects After Restart
 
@@ -908,9 +986,9 @@ flowchart TD
 
 **Conclusion:** Data persistence is fully functional. Objects written to the XL storage format survive server restarts because:
 
-1. All data is synchronously written to the filesystem (the `xl.meta` files in the data directory).
-2. The `format.json` deployment descriptor allows the restarted server to recognize and adopt the existing data layout.
-3. Object metadata (ETags, timestamps, sizes) is preserved exactly as written.
+1. All data is synchronously written to the filesystem via `CreateFile()` and committed atomically via `RenameData()` (Source: `cmd/xl-storage.go`), producing the `xl.meta` files in the data directory that contain both metadata and inline object data.
+2. The `format.json` deployment descriptor (Source: `cmd/format-erasure.go` — created during first startup with `formatBackendErasureSingle = "xl-single"` at line 43) allows the restarted server to recognize and adopt the existing data layout via `newObjectLayer()` (Source: `cmd/server-main.go`).
+3. Object metadata (ETags, timestamps, sizes) is preserved exactly as written within the `xlMetaV2Object` struct (Source: `cmd/xl-storage-format-v2.go:156-175`), serialized in MessagePack format inside each `xl.meta` file.
 
 ---
 
@@ -946,6 +1024,76 @@ flowchart TD
 4. **Performance-oriented logging:** MinIO does not log to stdout for successful operations. This is a deliberate design choice for high-throughput scenarios where disk I/O from logging could become a bottleneck. Observability is provided through the admin trace API and configurable audit targets.
 
 5. **Atomic writes:** Object writes use a create-then-rename pattern (`CreateFile()` + `RenameData()` in `cmd/xl-storage.go`) to ensure atomic commits. A partially written object is never visible to readers.
+
+---
+
+## 9. Appendix: Cleanup Instructions
+
+All temporary artifacts created during this investigation were cleaned up after evidence capture. To reproduce this investigation and clean up afterward, remove the following temporary artifacts:
+
+### 9.1 Stop the MinIO Server
+
+```bash
+# Gracefully stop the running MinIO server process
+kill $(pgrep -f minio-test-binary) 2>/dev/null
+
+# Verify the process has stopped
+sleep 2
+pgrep -f minio-test-binary || echo "Server stopped successfully"
+```
+
+### 9.2 Remove the Test Binary
+
+```bash
+# Remove the compiled MinIO binary
+rm -f /tmp/minio-test-binary
+```
+
+### 9.3 Remove the Data Directory
+
+```bash
+# Remove the entire data directory including all bucket data,
+# object files (xl.meta), and internal metadata (.minio.sys/)
+rm -rf /tmp/minio-test-data
+```
+
+### 9.4 Remove Server Log Files
+
+```bash
+# Remove captured server log files
+rm -f /tmp/minio-server.log
+rm -f /tmp/minio-restart.log
+```
+
+### 9.5 Remove Test Payload Files
+
+```bash
+# Remove test files used for object uploads
+rm -f /tmp/test-file1.txt
+rm -f /tmp/test-file2.json
+```
+
+### 9.6 Complete Cleanup (All-in-One)
+
+```bash
+# Stop server and remove all temporary artifacts in a single command
+kill $(pgrep -f minio-test-binary) 2>/dev/null
+rm -rf /tmp/minio-test-data
+rm -f /tmp/minio-test-binary
+rm -f /tmp/minio-server.log /tmp/minio-restart.log
+rm -f /tmp/test-file1.txt /tmp/test-file2.json
+```
+
+### Temporary Artifact Inventory
+
+| Artifact | Path | Created By | Purpose |
+|---|---|---|---|
+| MinIO binary | `/tmp/minio-test-binary` | `go build` (Section 2.1) | Compiled server binary for testing |
+| Data directory | `/tmp/minio-test-data/` | MinIO server | Bucket data, object data, internal metadata |
+| Server log | `/tmp/minio-server.log` | Server stdout redirect | First-run startup banner and log capture |
+| Restart log | `/tmp/minio-restart.log` | Server stdout redirect | Restart banner capture (Section 7) |
+| Test file 1 | `/tmp/test-file1.txt` | `echo` command | 61-byte text payload for object upload |
+| Test file 2 | `/tmp/test-file2.json` | `echo` command | 72-byte JSON payload for object upload |
 
 ---
 
