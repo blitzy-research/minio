@@ -209,7 +209,7 @@ Source: `cmd/object-handlers.go`
 | Handler Function | S3 Operation | Policy Action | Source File:Line | Read-Only Access? |
 |---|---|---|---|---|
 | `SelectObjectContentHandler` | POST `?select` | `policy.GetObjectAction` | `cmd/object-handlers.go:139` | ✅ YES |
-| `GetObjectHandler` | GET object | `policy.GetObjectAction` | `cmd/object-handlers.go:139` (same pattern) | ✅ YES |
+| `GetObjectHandler` | GET object | `policy.GetObjectAction` | `cmd/object-handlers.go:715` (handler); auth at `:326` (`authenticateRequest`) and `:393` (`authorizeRequest`) | ✅ YES |
 | `headObjectHandler` | HEAD object | `policy.GetObjectAction` | `cmd/object-handlers.go:760` (via `authenticateRequest`) | ✅ YES |
 | `getObjectAttributesHandler` | GET `?attributes` | `policy.GetObjectAttributesAction` + `policy.GetObjectAction` | `cmd/object-handlers.go:593-595` | ❌ NO (requires `GetObjectAttributesAction`) |
 | `CopyObjectHandler` (dest check) | PUT (copy destination) | `policy.PutObjectAction` | `cmd/object-handlers.go:1173` | ❌ NO |
@@ -224,6 +224,7 @@ Source: `cmd/object-handlers.go`
 | `PutObjectTaggingHandler` | PUT `?tagging` | `policy.PutObjectTaggingAction` | `cmd/object-handlers.go:3151` | ❌ NO |
 | `DeleteObjectTaggingHandler` | DELETE `?tagging` | `policy.DeleteObjectTaggingAction` | `cmd/object-handlers.go:3301` | ❌ NO |
 | `PostRestoreObjectHandler` | POST `?restore` | `policy.RestoreObjectAction` | `cmd/object-handlers.go:3362` | ❌ NO |
+| `PutObjectExtractHandler` | PUT (extract/auto-extract) | `policy.PutObjectAction` | `cmd/object-handlers.go:2224` (via `isPutActionAllowed`) | ❌ NO |
 
 **Key findings for object operations:**
 - Only 4 operations are accessible: `GetObject`, `HeadObject`, `SelectObjectContent`, and the source-read portion of `CopyObject`.
@@ -265,6 +266,8 @@ Source: `cmd/bucket-handlers.go`
 | `PutBucketTaggingHandler` | PUT `?tagging` | `policy.PutBucketTaggingAction` | `cmd/bucket-handlers.go:1913` | ❌ NO |
 | `GetBucketTaggingHandler` | GET `?tagging` | `policy.GetBucketTaggingAction` | `cmd/bucket-handlers.go:1971` | ❌ NO |
 | `DeleteBucketTaggingHandler` | DELETE `?tagging` | `policy.PutBucketTaggingAction` | `cmd/bucket-handlers.go:2008` | ❌ NO |
+| `PutBucketHandler` | PUT bucket | `policy.CreateBucketAction` | `cmd/bucket-handlers.go:761` (via `checkRequestAuthTypeCredential`) | ❌ NO |
+| `PostPolicyBucketHandler` | POST (form upload) | `policy.PutObjectAction` | `cmd/bucket-handlers.go:1174` (via `globalIAMSys.IsAllowed`) | ❌ NO |
 
 Source: `cmd/bucket-listobjects-handlers.go`
 
@@ -1079,6 +1082,8 @@ The complete error response XML structure returned by MinIO follows the S3 error
 
 Every denied operation — whether it's a multipart initiation, a copy write, a tagging mutation, a delete, a retention change, or a restore request — returns this same 403 response structure. The S3 error code is always `AccessDenied` and the HTTP status is always `403 Forbidden`.
 
+> **Note:** The `APIErrorResponse` struct at `cmd/api-errors.go:64` also includes a `Region` field (tagged `xml:"Region,omitempty"`). Since it uses `omitempty`, this field is typically absent in `AccessDenied` responses but may appear when the server has an explicitly configured region.
+
 ---
 
 ## 9. Conclusions
@@ -1153,6 +1158,7 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 | File | Key Lines | Content |
 |---|---|---|
 | `cmd/object-handlers.go` | 139 | SelectObjectContent → `policy.GetObjectAction` |
+| `cmd/object-handlers.go` | 715, 326, 393 | GetObjectHandler → `policy.GetObjectAction` (via `authenticateRequest`/`authorizeRequest`) |
 | `cmd/object-handlers.go` | 593-595 | GetObjectAttributes → dual action check |
 | `cmd/object-handlers.go` | 760 | HeadObject → `policy.GetObjectAction` (via `authenticateRequest`) |
 | `cmd/object-handlers.go` | 1173 | CopyObject dest → `policy.PutObjectAction` |
@@ -1167,6 +1173,7 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 | `cmd/object-handlers.go` | 3151 | PutObjectTagging → `policy.PutObjectTaggingAction` |
 | `cmd/object-handlers.go` | 3301 | DeleteObjectTagging → `policy.DeleteObjectTaggingAction` |
 | `cmd/object-handlers.go` | 3362 | PostRestoreObject → `policy.RestoreObjectAction` |
+| `cmd/object-handlers.go` | 2143, 2224 | PutObjectExtractHandler → `policy.PutObjectAction` (via `isPutActionAllowed`) |
 
 ### 10.4 Multipart Handlers
 
@@ -1196,6 +1203,8 @@ This analysis examined MinIO's IAM policy enforcement boundary for a read-only p
 | `cmd/bucket-handlers.go` | 1913 | PutBucketTagging → `policy.PutBucketTaggingAction` |
 | `cmd/bucket-handlers.go` | 1971 | GetBucketTagging → `policy.GetBucketTaggingAction` |
 | `cmd/bucket-handlers.go` | 2008 | DeleteBucketTagging → `policy.PutBucketTaggingAction` |
+| `cmd/bucket-handlers.go` | 723, 761 | PutBucketHandler → `policy.CreateBucketAction` (via `checkRequestAuthTypeCredential`) |
+| `cmd/bucket-handlers.go` | 920, 1174 | PostPolicyBucketHandler → `policy.PutObjectAction` (via `globalIAMSys.IsAllowed`) |
 | `cmd/bucket-listobjects-handlers.go` | 87 | ListObjectVersions → `policy.ListBucketVersionsAction` |
 | `cmd/bucket-listobjects-handlers.go` | 172 | ListObjectsV2 → `policy.ListBucketAction` |
 | `cmd/bucket-listobjects-handlers.go` | 287 | ListObjectsV1 → `policy.ListBucketAction` |
