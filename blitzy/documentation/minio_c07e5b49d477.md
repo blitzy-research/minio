@@ -398,20 +398,22 @@ The client receives an **HTTP 503 Service Unavailable** response.
 ```mermaid
 flowchart TD
     A["putObject() entry"] --> B["Get storageDisks via er.getDisks()"]
-    B --> C["Count offline disks<br/>(nil or !IsOnline)"]
+    B --> F{"AvailabilityOptimized?<br/>(default: true)"}
+    F -->|"Yes"| C["Count offline disks<br/>(nil or !IsOnline)"]
     C --> D{"offlineDrives >= (N+1)/2?<br/>4-drive: >= 2?"}
     D -->|"Yes"| E["Return errErasureWriteQuorum<br/>(HTTP 503)"]
-    D -->|"No"| F{"AvailabilityOptimized?<br/>(default: true)"}
-    F -->|"Yes"| G["Upgrade parityDrives<br/>by offlineDrives count"]
+    D -->|"No"| G["Upgrade parityDrives<br/>by offlineDrives count"]
     G --> H["Cap parity at N/2"]
-    F -->|"No"| H
     H --> I["dataDrives = N - parityDrives"]
+    F -->|"No"| I
     I --> J["writeQuorum = dataDrives<br/>(+1 if data == parity)"]
     J --> K["Erasure Encode to<br/>online disks only"]
     K --> L{"Enough shards written<br/>to meet writeQuorum?"}
     L -->|"Yes"| M["Write succeeds<br/>Add to MRF if partial"]
     L -->|"No"| N["Return errErasureWriteQuorum"]
 ```
+
+> **Note**: The offline-disk counting (node C) and early quorum check (node D) are **nested inside** the `AvailabilityOptimized` branch in the source code (`cmd/erasure-object.go:1291-1318`). When `AvailabilityOptimized` is disabled, the code skips directly to computing `dataDrives` without the early offline-count quorum check or parity upgrade.
 
 ---
 
@@ -906,7 +908,7 @@ healthRouter.Methods(http.MethodHead).Path(healthCheckClusterPath).HandlerFunc(h
 
 The `ClusterCheckHandler` is the primary endpoint for evaluating cluster write-readiness:
 
-`Source: cmd/healthcheck-handler.go:56-89`
+`Source: cmd/healthcheck-handler.go:56-90`
 ```go
 func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
     ctx := newContext(r, w, "ClusterCheckHandler")
@@ -972,10 +974,11 @@ The `HealthResult` struct returned by `Health()` contains:
 | `ESHealth` | `[]struct{...}` | Per-erasure-set breakdown |
 
 Each entry in `ESHealth` contains:
-- `PoolID`, `SetID` — the pool and set indices
-- `Healthy`, `HealthyRead` — per-set health status
-- `HealthyDrives`, `HealingDrives` — drive counts for this set
-- `ReadQuorum`, `WriteQuorum` — quorum thresholds for this set
+- `Maintenance` (`bool`) — whether this set is being evaluated in maintenance mode (affects response code: 412 vs 503)
+- `PoolID`, `SetID` (`int`) — the pool and set indices
+- `Healthy`, `HealthyRead` (`bool`) — per-set health status
+- `HealthyDrives`, `HealingDrives` (`int`) — drive counts for this set
+- `ReadQuorum`, `WriteQuorum` (`int`) — quorum thresholds for this set
 
 `Source: cmd/erasure-server-pool.go:2770-2789`
 
@@ -1050,8 +1053,8 @@ The following table maps every quorum-related function to its exact location in 
 
 | Function | File:Line | Purpose |
 |---|---|---|
-| `defaultWQuorum()` | `cmd/erasure.go:85-91` | Default write quorum for the erasure set |
-| `defaultRQuorum()` | `cmd/erasure.go:94-96` | Default read quorum for the erasure set |
+| `defaultWQuorum()` | `cmd/erasure.go:84-91` | Default write quorum for the erasure set |
+| `defaultRQuorum()` | `cmd/erasure.go:93-96` | Default read quorum for the erasure set |
 | `objectQuorumFromMeta()` | `cmd/erasure-metadata.go:531-565` | Per-object quorum derived from stored metadata |
 | `reduceWriteQuorumErrs()` | `cmd/erasure-metadata-utils.go` | Aggregate per-disk errors against write quorum threshold |
 | `reduceReadQuorumErrs()` | `cmd/erasure-metadata-utils.go` | Aggregate per-disk errors against read quorum threshold |
@@ -1059,9 +1062,9 @@ The following table maps every quorum-related function to its exact location in 
 | `Encode()` | `cmd/erasure-encode.go:69-110` | Erasure-encode data and write with quorum |
 | `Health()` | `cmd/erasure-server-pool.go:2679-2816` | Cluster-wide health quorum evaluation |
 | `diskErrToDriveState()` | `cmd/erasure.go:98-119` | Map disk errors to drive state classifications |
-| `monitorDiskWritable()` | `cmd/xl-storage-disk-id-check.go:966-1060` | Active disk health monitoring with recovery |
+| `monitorDiskWritable()` | `cmd/xl-storage-disk-id-check.go:966-1072` | Active disk health monitoring with recovery |
 | `connectDisks()` | `cmd/erasure-sets.go:194-278` | Reconnect offline disks to the erasure set |
-| `healFreshDisk()` | `cmd/background-newdisks-heal-ops.go:419-557` | Full-set healing for a recovered disk |
+| `healFreshDisk()` | `cmd/background-newdisks-heal-ops.go:419-558` | Full-set healing for a recovered disk |
 | `healRoutine()` | `cmd/mrf.go:220-283` | MRF-based repair for degraded-write objects |
 
 ### 7.2 Error Constant Reference
@@ -1085,13 +1088,13 @@ The following error constants drive quorum decisions throughout the codebase:
 
 | # | Question | Answer | Key Code Reference |
 |---|---|---|---|
-| 1 | How does MinIO decide health with 4 drives? | Write quorum = 3 (data+1 when data==parity), Read quorum = 2. Health = all sets meet write quorum. | `defaultWQuorum()` in `cmd/erasure.go:85-91` |
+| 1 | How does MinIO decide health with 4 drives? | Write quorum = 3 (data+1 when data==parity), Read quorum = 2. Health = all sets meet write quorum. | `defaultWQuorum()` in `cmd/erasure.go:84-91` |
 | 2 | What happens when a directory loses permissions? | `os.IsPermission()` → `errDiskAccessDenied` → `DriveStatePermission`. Disk marked faulty, logged with path. | `cmd/xl-storage.go:276`, `cmd/erasure.go:106-107` |
 | 3 | 1 disk lost vs 2 disks lost? | 1 lost: writes succeed (3 ≥ 3). 2 lost: writes fail with `errErasureWriteQuorum` (2 < 3), reads still work (2 ≥ 2). | `cmd/erasure-object.go:1304-1308` |
 | 4 | Do logs identify failing disk by path? | Yes. Logs include `"taking drive <path> offline"`, quorum failure per pool/set, healing progress per drive. | `cmd/xl-storage-disk-id-check.go:1015` |
-| 5 | Auto-detection of returning disks? | Yes. `monitorDiskWritable` probes every 15s, `monitorDiskStatus` probes every 5s for recovery. No external trigger needed. | `cmd/xl-storage-disk-id-check.go:966-962` |
+| 5 | Auto-detection of returning disks? | Yes. `monitorDiskWritable` probes every 15s, `monitorDiskStatus` probes every 5s for recovery. No external trigger needed. | `cmd/xl-storage-disk-id-check.go:966-1072` |
 | 6 | How are degraded-write objects repaired? | MRF queue stores `PartialOperation` entries; `healRoutine()` processes them. `healFreshDisk()` handles full-set healing. | `cmd/mrf.go:220-283` |
-| 7 | What does the health endpoint show? | `/minio/health/cluster` → 200/503 based on write quorum. Headers: `X-Minio-Write-Quorum`, `X-Minio-Healing-Drives`. | `cmd/healthcheck-handler.go:56-89` |
+| 7 | What does the health endpoint show? | `/minio/health/cluster` → 200/503 based on write quorum. Headers: `X-Minio-Write-Quorum`, `X-Minio-Healing-Drives`. | `cmd/healthcheck-handler.go:56-90` |
 
 ### Design Philosophy
 
