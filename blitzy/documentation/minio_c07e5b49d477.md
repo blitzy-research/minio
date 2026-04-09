@@ -178,8 +178,8 @@ When too many drives are offline and `readQuorum` cannot be met, the error chain
 | 3. S3 API Response | `ErrSlowDownRead` | S3 Code: `"SlowDownRead"`, Description: `"Resource requested is unreadable, please reduce your request rate"`, HTTP Status: **503 Service Unavailable** | `cmd/api-errors.go:869-873` |
 
 The `InsufficientReadQuorum` struct includes a `Type` field of type `RQErrType`, which can be:
-- `RQInsufficientOnlineDrives` — Not enough drives are online. `Source: cmd/object-api-errors.go:220`
-- `RQInconsistentMeta` — Metadata is inconsistent across drives. `Source: cmd/object-api-errors.go:221-222`
+- `RQInsufficientOnlineDrives` — Not enough drives are online. `Source: cmd/object-api-errors.go:212`
+- `RQInconsistentMeta` — Metadata is inconsistent across drives. `Source: cmd/object-api-errors.go:214`
 
 The `reduceReadQuorumErrs` helper calls `reduceQuorumErrs` with `errErasureReadQuorum` as the default error returned when the quorum count is not met. `Source: cmd/erasure-metadata-utils.go:150-152`
 
@@ -189,9 +189,9 @@ When a write succeeds with quorum but not all drives receive the data (because s
 
 `Source: cmd/mrf.go:38-59`
 
-- **`PartialOperation` struct** (lines 51-59): Tracks `Bucket`, `Object`, `VersionID`, `SetIndex`, `PoolIndex`, and `Queued` timestamp for each partially-written object.
+- **`PartialOperation` struct** (lines 51-59): Tracks `Bucket`, `Object`, `VersionID`, `Versions` (encoded version data, `[]byte`), `SetIndex`, `PoolIndex`, `Queued` timestamp, and `BitrotScan` (whether to perform bitrot verification, `bool`) for each partially-written object.
 - **Queue size**: `mrfOpsQueueSize = 100000` — Up to 100,000 partial operations can be queued. `Source: cmd/mrf.go:39`
-- **Persistence directory**: `healMRFDir = bucketMetaPrefix + "/.heal/mrf"` — MRF state is persisted to disk so it survives server restarts. `Source: cmd/mrf.go:44`
+- **Persistence directory**: `healMRFDir = bucketMetaPrefix + SlashSeparator + healDir + SlashSeparator + "mrf"` (where `healDir = ".heal"` at `cmd/mrf.go:43` and `SlashSeparator = "/"`), evaluating to `bucketMetaPrefix + "/.heal/mrf"` — MRF state is persisted to disk so it survives server restarts. `Source: cmd/mrf.go:43-44`
 
 **How MRF bridges write success and healing**: When a PutObject succeeds (quorum met) but some drives missed the write, the object is enqueued as a `PartialOperation`. The MRF background worker periodically processes this queue and attempts to heal the missing copies, ensuring that the full redundancy level is eventually restored — even before a full drive-level healing cycle occurs.
 
@@ -287,19 +287,19 @@ The `shouldHealObjectOnDisk` function evaluates whether a specific object on a s
 
 `Source: cmd/erasure-healing.go:156-183`
 
-The decision tree has the following conditions, evaluated in order:
+The decision tree has the following conditions, evaluated in the order they appear in the code:
 
 1. **Missing or corrupt metadata** (line 157): If `erErr` is `errFileNotFound`, `errFileVersionNotFound`, or `errFileCorrupt` → returns `(true, erErr)`. The object's xl.meta file is missing or corrupted on this disk.
 
-2. **Unknown error** (line 182): If `erErr` is non-nil but not one of the above → returns `(false, erErr)`. Healing is **not** attempted for unrecognized errors. This is a safety measure.
+2. **Legacy XLV1 metadata** (lines 160-164): If `erErr` is nil and `meta.XLV1 == true` → returns `(true, errLegacyXLMeta)`. Legacy format metadata always triggers healing. The sentinel is `errLegacyXLMeta = errors.New("legacy XL meta")`. `Source: cmd/erasure-healing.go:148`
 
-3. **Legacy XLV1 metadata** (lines 160-164): If `erErr` is nil and `meta.XLV1 == true` → returns `(true, errLegacyXLMeta)`. Legacy format metadata always triggers healing. The sentinel is `errLegacyXLMeta = errors.New("legacy XL meta")`. `Source: cmd/erasure-healing.go:148`
+3. **Outdated metadata** (lines 166-168): If `erErr` is nil and `!latestMeta.Equals(meta)` — the disk's metadata does not match the latest known version → returns `(true, errOutdatedXLMeta)`. The sentinel is `errOutdatedXLMeta = errors.New("outdated XL meta")`. `Source: cmd/erasure-healing.go:150`
 
-4. **Outdated metadata** (lines 166-168): If `!latestMeta.Equals(meta)` — the disk's metadata does not match the latest known version → returns `(true, errOutdatedXLMeta)`. The sentinel is `errOutdatedXLMeta = errors.New("outdated XL meta")`. `Source: cmd/erasure-healing.go:150`
+4. **Missing or corrupt part files** (lines 169-178): If `erErr` is nil, xl.meta is valid and current, but individual part data files (part.N) have `checkPartFileNotFound` or `checkPartFileCorrupt` errors → returns `(true, errPartMissingOrCorrupt)`. The sentinel is `errPartMissingOrCorrupt = errors.New("part missing or corrupt")`. `Source: cmd/erasure-healing.go:152`
 
-5. **Missing or corrupt part files** (lines 169-178): If xl.meta is valid and current, but individual part data files (part.N) have `checkPartFileNotFound` or `checkPartFileCorrupt` errors → returns `(true, errPartMissingOrCorrupt)`. The sentinel is `errPartMissingOrCorrupt = errors.New("part missing or corrupt")`. `Source: cmd/erasure-healing.go:152`
+5. **No healing needed** (line 180): If `erErr` is nil and none of the above nil-path conditions match → returns `(false, nil)`. The object is healthy on this disk.
 
-6. **No healing needed** (line 180): If none of the above conditions match → returns `(false, nil)`. The object is healthy on this disk.
+6. **Unknown error — fallback** (line 182): If `erErr` is non-nil but not one of the recognized errors in condition #1 → returns `(false, erErr)`. Healing is **not** attempted for unrecognized errors. This is a safety measure and serves as the final fallback branch, reached only when `erErr` is neither nil nor a recognized file error.
 
 Note: For deleted objects (`meta.Deleted`) or tiered/remote objects (`meta.IsRemote()`), the part file check is skipped since there are no local part files to verify. `Source: cmd/erasure-healing.go:169`
 
@@ -360,7 +360,7 @@ Healing logs use two functions, both tagging output under the `"healing"` subsys
 | `healingLogEvent` | `"Healing of drive '%s' is complete, retried %d times (healed: %d, skipped: %d)."` | `cmd/background-newdisks-heal-ops.go:517-518` |
 | `healingLogEvent` | `"Healing of drive '%s' is finished (healed: %d, skipped: %d)."` | `cmd/background-newdisks-heal-ops.go:520` |
 
-**Rationale for retry messages**: The healing system attempts up to 4 retries when `tracker.ItemsFailed > 0`. `Source: cmd/background-newdisks-heal-ops.go:500` The first retry uses ordinal formatting (e.g., "1st time"), while subsequent retries use cardinal counts. After all retries are exhausted, a final "incomplete" message is logged with the total retry count. If healing succeeds (either on the first pass or after retries), a "complete" or "finished" message is logged.
+**Rationale for retry messages**: The healing system attempts up to 4 retries when `tracker.ItemsFailed > 0`. `Source: cmd/background-newdisks-heal-ops.go:500` All retry messages during the active retry loop use ordinal formatting via `humanize.Ordinal` (e.g., "1st time", "2nd time", "3rd time", "4th time"). `Source: cmd/background-newdisks-heal-ops.go:503-504` The final exhaustion message, emitted only after all retries are used and items still remain failed, uses cardinal count (`%d times`). `Source: cmd/background-newdisks-heal-ops.go:513-514` If healing succeeds (either on the first pass or after retries), a "complete" or "finished" message is logged.
 
 ---
 
@@ -445,7 +445,7 @@ These metrics are emitted per erasure set with `pool_id` and `set_id` labels.
 - `readTolerance = HealthyDrives - ReadQuorum` — `Source: cmd/metrics-v3-cluster-erasure-set.go:100`
 - `writeTolerance = HealthyDrives + HealingDrives - WriteQuorum` — `Source: cmd/metrics-v3-cluster-erasure-set.go:108`
 
-**Key insight**: Healing drives count toward `writeTolerance` (they are additive on top of `HealthyDrives`) but do **not** contribute to `readTolerance`. This is because healing drives can accept new writes but may not yet have all historical data needed for reads.
+**Key insight**: The `HealingDrives` count is an explicit additional term in the `writeTolerance` formula (additive on top of `HealthyDrives`), but is **not** an additional term in the `readTolerance` formula. However, healing drives **do** contribute to `readTolerance` indirectly through their inclusion in `HealthyDrives` — because a healing drive with `DriveStateOk` is counted as online (`HealthyDrives` includes all online drives, whether healing or not). `Source: cmd/erasure-server-pool.go:2706-2714,2785` The difference is that `writeTolerance` double-counts healing drives (once in `HealthyDrives`, once in `HealingDrives`) to reflect the fact that healing drives can reliably accept new writes, providing extra write resilience.
 
 ### 6.4 Healthcheck Endpoint Behavior
 
@@ -455,9 +455,9 @@ MinIO exposes HTTP healthcheck endpoints that complement the Prometheus metrics:
 
 `Source: cmd/healthcheck-handler.go:56-90`
 
-- Returns `X-Minio-Write-Quorum` header with the current write quorum value. `Source: cmd/healthcheck-handler.go:72`
-- Returns `X-Minio-Storage-Class-Defaults` header. `Source: cmd/healthcheck-handler.go:73`
-- Returns `X-Minio-Healing-Drives` header when drives are actively healing (value > 0). `Source: cmd/healthcheck-handler.go:75-77`
+- Returns `x-minio-write-quorum` header with the current write quorum value. `Source: cmd/healthcheck-handler.go:72`, `Source: internal/http/headers.go:193`
+- Returns `x-minio-storage-class-defaults` header. `Source: cmd/healthcheck-handler.go:73`
+- Returns `x-minio-healing-drives` header when drives are actively healing (value > 0). `Source: cmd/healthcheck-handler.go:75-77`, `Source: internal/http/headers.go:203`
 - Returns **HTTP 200** if the cluster is healthy for writes. `Source: cmd/healthcheck-handler.go:89`
 - Returns **HTTP 503** if write quorum cannot be satisfied. `Source: cmd/healthcheck-handler.go:85`
 
@@ -465,8 +465,8 @@ MinIO exposes HTTP healthcheck endpoints that complement the Prometheus metrics:
 
 `Source: cmd/healthcheck-handler.go:92-127`
 
-- Returns `X-Minio-Read-Quorum` header with the current read quorum value. `Source: cmd/healthcheck-handler.go:109`
-- Returns `X-Minio-Healing-Drives` header when drives are healing. `Source: cmd/healthcheck-handler.go:112-113`
+- Returns `x-minio-read-quorum` header with the current read quorum value. `Source: cmd/healthcheck-handler.go:109`, `Source: internal/http/headers.go:196`
+- Returns `x-minio-healing-drives` header when drives are healing. `Source: cmd/healthcheck-handler.go:112-113`, `Source: internal/http/headers.go:203`
 - Returns **HTTP 200** if the cluster is healthy for reads. `Source: cmd/healthcheck-handler.go:126`
 - Returns **HTTP 503** if read quorum cannot be satisfied. `Source: cmd/healthcheck-handler.go:122`
 
@@ -491,7 +491,7 @@ The following table shows expected metric values for a single 16-drive erasure s
 | `read_health` | 1 | 1 | 1 |
 | `write_health` | 1 | 1 | 1 |
 | `/minio/health/cluster` | 200 OK | 200 OK | 200 OK |
-| `X-Minio-Healing-Drives` | (not set) | (not set) | **1** |
+| `x-minio-healing-drives` | (not set) | (not set) | **1** |
 
 **Rationale for `write_tolerance = 5` during healing**: The formula is `HealthyDrives + HealingDrives - WriteQuorum`. When the drive returns and begins healing, it is counted in `HealthyDrives` (it is online) AND in `HealingDrives`. So `writeTolerance = 16 + 1 - 12 = 5`. This reflects the reality that a healing drive can accept new writes (it functions as a normal drive for new operations), so the cluster's write resilience is actually improved. `Source: cmd/metrics-v3-cluster-erasure-set.go:108`
 
