@@ -997,7 +997,7 @@ The parallel disk reader that handles the I/O complexity of reading from potenti
 | `errDiskNotFound` | `checkPartDiskNotFound` |
 | Any other error | `checkPartUnknown` |
 
-**`partNeedsHealing()` at line 276:** Returns `true` if any part in the array has `checkPartFileNotFound` or `checkPartFileCorrupt`. This function is used by `shouldHealObjectOnDisk()` to detect part-level damage.
+**`partNeedsHealing()` at line 276:** Returns `true` if any part in the array has ANY non-success and non-unknown status — this includes `checkPartDiskNotFound` (2), `checkPartVolumeNotFound` (3), `checkPartFileNotFound` (4), and `checkPartFileCorrupt` (5). This function is used in test assertions (`cmd/erasure-healing-common_test.go`). Note that `shouldHealObjectOnDisk()` uses a narrower inline check — `slices.Contains([]int{checkPartFileNotFound, checkPartFileCorrupt}, partErr)` — which only triggers on file-not-found or file-corrupt statuses.
 
 > *Source: `cmd/erasure-healing-common.go:276-278`*
 
@@ -1071,7 +1071,7 @@ if latestMeta.InlineData() {
 | `cmd/erasure-heal_test.go` | `erasureHealTests` (20 cases) | 29-63 |
 | | `TestErasureHeal` | 65-158 |
 | `cmd/erasure-healing_test.go` | `TestIsObjectDangling` (13 cases) | 40-310 |
-| | `TestHealing` | 313-449 |
+| | `TestHealing` | 313-464 |
 | | `TestHealingDanglingObject` | 647-849 |
 | | `TestHealObjectCorruptedParts` | 1297-1454 |
 | `cmd/erasure-healing-common_test.go` | `TestCommonTime`, `TestListOnlineDisks`, `TestDisksWithAllParts` | (full file) |
