@@ -14,7 +14,7 @@ The five investigation areas are:
 
 **Environment:**
 - MinIO server built from source: `go build -o /tmp/minio .`
-- Erasure mode: 4 disks (`data{1..4}`)
+- Erasure mode: 4 disks (`data{1...4}`)
 - Environment variables: `MINIO_ROOT_USER=minioadmin`, `MINIO_ROOT_PASSWORD=minioadmin123`, `MINIO_CI_CD=1`, `MINIO_KMS_SECRET_KEY` configured
 - MinIO Client (mc) for bucket operations, admin commands, and trace capture
 
@@ -29,6 +29,7 @@ The five investigation areas are:
 - [Investigation 3: Bit Rot Detection and Self-Healing](#investigation-3-bit-rot-detection-and-self-healing)
 - [Investigation 4: STS Session Policy Enforcement](#investigation-4-sts-session-policy-enforcement)
 - [Investigation 5: Privilege Escalation Prevention](#investigation-5-privilege-escalation-prevention)
+- [Known Vulnerabilities and Codebase Version Caveats](#known-vulnerabilities-and-codebase-version-caveats)
 - [References](#references)
 
 ---
@@ -130,8 +131,8 @@ export MINIO_CI_CD=1
 export MINIO_KMS_SECRET_KEY="my-minio-key:MjJhN2VjZjRjNGNhMTM5MjFiMjQ4MTU2NGUzNTlhN2Q="
 
 # Start MinIO in erasure mode
-mkdir -p /tmp/minio-erasure/data{1..4}
-/tmp/minio server /tmp/minio-erasure/data{1..4} --address ":9000" --console-address ":9001"
+mkdir -p /tmp/minio-erasure/data{1...4}
+/tmp/minio server /tmp/minio-erasure/data{1...4} --address ":9000" --console-address ":9001"
 
 # Configure mc
 mc alias set myminio http://localhost:9000 minioadmin minioadmin123 --api S3v4
@@ -713,6 +714,8 @@ flowchart TD
 
 MinIO enforces strict session policy intersection for STS credentials. The `isAllowedBySessionPolicy()` function at `cmd/iam.go:2381` extracts the session policy from the JWT claims (line 2386), parses it (line 2401), and evaluates it independently with `IsOwner = false` (line 2417). This last detail is critical — it means even if the parent user is the root account, the session policy restrictions still apply. The result is AND-ed with the parent user's combined policy evaluation in `IsAllowedSTS()`. This means STS credentials can ONLY perform actions that are allowed by BOTH the parent user's policy AND the session policy. The session policy can restrict but never expand the parent's permissions. The runtime test confirms this: `GetObject` on the allowed resource succeeds, but `GetObject` on a different resource and `PutObject` on the allowed resource are both denied with "Access Denied."
 
+**Known limitation — CVE-2025-62506 (service account self-creation edge case):** The session policy intersection tested above is correctly enforced for the STS `AssumeRole` scenario. However, CVE-2025-62506 (CVSS HIGH 8.1) identifies a separate edge case in `isAllowedBySessionPolicyForServiceAccount()` at `cmd/iam.go:2320`: when a service account with a restrictive session policy creates a new service account for itself, the `DenyOnly` argument (used in the `IsAllowed()` call at `cmd/admin-handlers-users.go:509`) is incorrectly relied upon during session policy validation, allowing the newly created service account to bypass the parent's session policy restrictions. This vulnerability was fixed in MinIO RELEASE.2025-10-15T17-29-55Z but is **not included** in this codebase version (November 2024). The vulnerability does not affect the standard STS `AssumeRole` flow tested in this investigation.
+
 ---
 
 ## Investigation 5: Privilege Escalation Prevention
@@ -847,7 +850,16 @@ The root cause chain is:
 
 4. **The user cannot modify their own policy mapping** because `AttachPolicyAdminAction` is itself an admin action that requires admin permissions, creating a secure recursive dependency: you need admin access to grant admin access.
 
-5. **Security guarantee:** There is no code path in MinIO that allows a non-admin user to modify IAM state. The admin API handlers consistently gate on `validateAdminReq()` or `validateAdminSignature()` + `globalIAMSys.IsAllowed()`, and the policy evaluation engine has no bypass mechanism. The authorization check is synchronous and blocking — the handler returns immediately on denial, before any state changes occur.
+5. **Security posture for the tested operations:** The standard admin API handlers (`AddUser`, `RemoveUser`, `ListUsers`, `SetUserStatus`, `AttachPolicy`, `AddUserToGroup`) consistently gate on `validateAdminReq()` or `validateAdminSignature()` + `globalIAMSys.IsAllowed()`, and the policy evaluation engine has no bypass mechanism for these operations. The authorization check is synchronous and blocking — the handler returns immediately on denial, before any state changes occur.
+
+6. **Known limitation — CVE-2024-55949 (`importIAM` endpoint):** While the standard admin handlers tested above correctly enforce per-action `IsAllowed()` checks, the `importIAM()` handler at `cmd/admin-handlers-users.go:2242` has an authorization gap in this codebase version. Specifically:
+   - Line 2251: `validateAdminSignature()` is called — this authenticates the user (verifies the request signature is valid) but does NOT authorize specific admin actions.
+   - Lines 2293-2307 (policy import path): Directly calls `globalIAMSys.SetPolicy()` and `globalIAMSys.DeletePolicy()` **without** any `IsAllowed()` check. Any authenticated user can import IAM policy definitions via this endpoint.
+   - In contrast, the user import path (lines 2360-2370) **does** include an `IsAllowed(CreateUserAdminAction)` check, demonstrating that the policy import path was inadvertently left without authorization.
+   - This vulnerability (CVE-2024-55949, CVSS 7.1 HIGH / 9.3 CRITICAL) was fixed in MinIO RELEASE.2024-12-13T22-19-12Z (commit `f246c9053`), but the fix is **not included** in this codebase's base commit (`c07e5b49d477`, dated November 26, 2024; the fix was committed December 11, 2024).
+   - **Impact:** An authenticated user with any policy (including `readonly`) could craft an IAM import payload to create or modify policies and policy mappings, potentially escalating their own privileges to `consoleAdmin`.
+
+   Source: `cmd/admin-handlers-users.go:2242-2307`, CVE-2024-55949
 
 ### Mermaid Diagram
 
@@ -871,7 +883,58 @@ flowchart TD
 
 ### Conclusion
 
-A user with `readonly` policy **CANNOT** escalate privileges through admin API calls. Every admin endpoint is guarded by `validateAdminReq()` at `cmd/admin-handler-utils.go:37` or `validateAdminSignature()`, which evaluates the user's policy against specific admin IAM actions via `globalIAMSys.IsAllowed()` at `cmd/iam.go:2437`. The `readonly` built-in policy contains only S3-level permissions (`s3:GetObject`, `s3:GetBucketLocation`) and zero admin-level permissions, so all admin operations — `CreateUser`, `DeleteUser`, `AttachPolicy`, `ListUsers`, `AddUserToGroup` — are rejected with `Access Denied`. The user's policy remains `readonly` after all attempts, confirming that MinIO's authorization model is not susceptible to privilege escalation through the admin API. The root cause is the consistent enforcement of `validateAdminReq()`/`validateAdminSignature()` as the first check in every admin handler, combined with the IAM policy engine's default-deny posture for unmatched actions.
+A user with `readonly` policy **CANNOT** escalate privileges through the standard admin API calls tested above (`AddUser`, `RemoveUser`, `AttachPolicy`, `ListUsers`, `AddUserToGroup`). These admin endpoints are guarded by `validateAdminReq()` at `cmd/admin-handler-utils.go:37` or `validateAdminSignature()` followed by `globalIAMSys.IsAllowed()` at `cmd/iam.go:2437`, which evaluates the user's policy against specific admin IAM actions. The `readonly` built-in policy contains only S3-level permissions (`s3:GetObject`, `s3:GetBucketLocation`) and zero admin-level permissions, so all tested admin operations are rejected with `Access Denied`. The user's policy remains `readonly` after all attempts, confirming that the standard admin API authorization model correctly prevents privilege escalation.
+
+**Caveat — CVE-2024-55949:** However, the `importIAM` endpoint at `cmd/admin-handlers-users.go:2242` is a known exception in this codebase version. It uses `validateAdminSignature()` for authentication only (line 2251) and performs `SetPolicy()`/`DeletePolicy()` operations without per-action `IsAllowed()` checks (lines 2293-2307). This means an authenticated user could potentially import IAM policy mappings to escalate their privileges. This vulnerability was fixed in MinIO RELEASE.2024-12-13T22-19-12Z but the fix is not included in this codebase version. See the Root Cause Analysis (point 6) above and the [Known Vulnerabilities](#known-vulnerabilities-and-codebase-version-caveats) section for details.
+
+---
+
+## Known Vulnerabilities and Codebase Version Caveats
+
+This section documents known security vulnerabilities that affect this codebase version (`minio_c07e5b49d477`, base commit dated November 26, 2024). These findings were identified through `govulncheck` analysis and CVE database review. They provide important context for the security claims made in the investigations above.
+
+### MinIO-Specific CVEs Affecting This Codebase
+
+| CVE | Severity | Affected Component | Status in This Codebase |
+|---|---|---|---|
+| CVE-2024-55949 | HIGH 7.1 / CRITICAL 9.3 | `importIAM` handler (`cmd/admin-handlers-users.go:2242`) | **NOT FIXED** — fix in RELEASE.2024-12-13T22-19-12Z (commit `f246c9053`) |
+| CVE-2025-62506 | HIGH 8.1 | `isAllowedBySessionPolicyForServiceAccount()` (`cmd/iam.go:2320`) | **NOT FIXED** — fix in RELEASE.2025-10-15T17-29-55Z |
+
+**CVE-2024-55949 — IAM Import API Privilege Escalation:** The `importIAM()` handler uses `validateAdminSignature()` (authentication only) at line 2251 and proceeds to call `globalIAMSys.SetPolicy()` / `globalIAMSys.DeletePolicy()` at lines 2293-2307 without any per-operation `IsAllowed()` authorization check. This allows any authenticated user to import IAM policy definitions and policy mappings, potentially escalating privileges. This directly affects the scope of Investigation 5 — see the Root Cause Analysis (point 6) and Conclusion for details.
+
+**CVE-2025-62506 — Session Policy Bypass in Service Account Self-Creation:** The `DenyOnly` argument in `isAllowedBySessionPolicyForServiceAccount()` at `cmd/iam.go:2320` is incorrectly relied upon during session policy validation when a service account creates a new service account for itself. This allows restricted service accounts to create unrestricted child service accounts that bypass the parent's session policy. This affects service account flows but does **not** affect the standard STS `AssumeRole` flow tested in Investigation 4.
+
+### Third-Party Dependency CVEs
+
+A `govulncheck` scan of this codebase identified 31 vulnerabilities with active code execution traces. The most security-relevant are:
+
+| Package | Version in `go.mod` | CVE | Severity | Description | Fixed In |
+|---|---|---|---|---|---|
+| `golang-jwt/jwt/v4` | v4.5.1 | CVE-2025-30204 | HIGH 7.5 | DoS via excessive memory allocation during JWT header parsing. Code trace: `openid.Config.Validate` → `jwt.Parser.ParseWithClaims` → `ParseUnverified`. This is in the authentication path. | v4.5.2 |
+| `golang.org/x/crypto` | v0.29.0 | CVE-2024-45337 | CRITICAL 9.1 | SSH authorization bypass via misuse of `PublicKeyCallback`. MinIO uses `PublicKeyCallback` at `cmd/sftp-server.go:479` for SFTP authentication. While MinIO's implementation stores credentials in the `Permissions` struct (the recommended pattern), the old library version does not enforce that the last key passed to `PublicKeyCallback` is the authenticated key. | v0.31.0 |
+| `golang.org/x/crypto` | v0.29.0 | GO-2025-3487 | MEDIUM | SSH DoS via slow key exchange algorithms. | v0.35.0 |
+| `golang.org/x/net` | v0.31.0 | GO-2025-3503 | MEDIUM | HTTP proxy bypass via IPv6 zone IDs in `httpproxy` package. | v0.36.0 |
+| `eclipse/paho.mqtt.golang` | v1.5.0 | GO-2025-4173 | MEDIUM | MQTT client vulnerability. | v1.5.1 |
+| `go.opentelemetry.io/otel/sdk` | v1.32.0 | GO-2026-4394 | LOW | OpenTelemetry SDK vulnerability. | v1.40.0 |
+
+### Go Standard Library Vulnerabilities
+
+The Go toolchain version (`go1.23.8`) used by this codebase has 27 known vulnerabilities with code execution traces, including:
+- **crypto/tls:** TLS 1.3 KeyUpdate DoS (GO-2026-4870)
+- **html/template:** XSS via template injection (GO-2026-4865)
+- **os:** `FileInfo` root path escape (GO-2026-4602)
+- **archive/tar:** Unbounded memory allocation (GO-2026-4869)
+- **crypto/x509:** Certificate chain building issues
+- **net/url:** URL parsing inconsistencies
+- **encoding/pem, encoding/asn1:** Parsing vulnerabilities
+
+These require upgrading to Go 1.25.9+ to resolve.
+
+### Impact on Investigations
+
+- **Investigation 4 (STS Session Policy):** The tested `AssumeRole` scenario is correctly enforced. CVE-2025-62506 affects only the service account self-creation path, not the STS flow.
+- **Investigation 5 (Privilege Escalation):** The tested admin API operations (`AddUser`, `RemoveUser`, `AttachPolicy`, `ListUsers`, `AddUserToGroup`) are correctly guarded. CVE-2024-55949 affects the `importIAM` endpoint specifically — an untested operation that lacks per-policy `IsAllowed()` authorization.
+- **Dependency vulnerabilities:** The JWT parsing DoS (CVE-2025-30204) and SSH authorization bypass (CVE-2024-45337) represent additional attack surface not covered by the five investigations in this document.
 
 ---
 
@@ -907,6 +970,6 @@ A user with `readonly` policy **CANNOT** escalate privileges through admin API c
 | `MINIO_ROOT_PASSWORD` | `minioadmin123` | Root credential secret key |
 | `MINIO_CI_CD` | `1` | Allows erasure mode on same-filesystem directories |
 | `MINIO_KMS_SECRET_KEY` | `my-minio-key:<base64-key>` | Built-in KMS key for SSE-S3 bucket encryption |
-| Erasure mode | 4 disks (`data{1..4}`) | Minimum erasure set for bitrot detection and healing |
+| Erasure mode | 4 disks (`data{1...4}`) | Minimum erasure set for bitrot detection and healing |
 | MinIO Client (mc) | `RELEASE.2025-08-13T08-35-41Z` | Bucket operations, admin commands, trace capture |
 | Go toolchain | `go1.23.8` | Building MinIO from source |
