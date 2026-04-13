@@ -929,3 +929,121 @@ All authentication failures, authorization denials, and security events are audi
 | `github.com/golang-jwt/jwt/v4` | v4.5.1 | JWT signing/verification for STS session tokens (Investigation 4) |
 | `github.com/minio/pkg/v3` | v3.0.22 | Policy evaluation engine — `policy.IsAllowed()` used across all IAM checks (All investigations) |
 | `golang.org/x/crypto` | v0.29.0 | Cryptographic primitives: BLAKE2b512, SHA256, constant-time comparison (Investigations 1, 3) |
+| `golang.org/x/net` | v0.31.0 | HTTP/2, proxy utilities — indirect dependency used by MQTT notification target and HTTP clients |
+
+---
+
+## Dependency Vulnerability Assessment
+
+> **Note**: This section documents known security vulnerabilities in the project's third-party dependencies as of the investigation date. Per the investigation's **read-only repository constraint** (AAP Sections 0.1.2, 0.3.3, 0.7.1), no `go.mod`, `go.sum`, or source files were modified. The vulnerabilities below require dependency version upgrades to remediate, which is outside the scope of this non-destructive investigation.
+
+### Summary
+
+| Metric | Value |
+|---|---|
+| **Packages Scanned** | 14 (12 direct investigation dependencies + `golang.org/x/net` + `go.opentelemetry.io/otel/sdk`) |
+| **Packages Clean** | 9 (`minio/sio`, `minio/kms-go/kes`, `minio/kms-go/kms`, `minio/highwayhash`, `klauspost/reedsolomon`, `minio/madmin-go/v3`, `minio/pkg/v3`, `tinylib/msgp`, `klauspost/compress`) |
+| **Packages with Known CVEs** | 5 (`golang.org/x/crypto`, `golang-jwt/jwt/v4`, `golang-jwt/jwt/v5`, `golang.org/x/net`, `go.opentelemetry.io/otel/sdk`) |
+| **Total CVEs Identified** | 5 CRITICAL/HIGH + 1 informational (OTel SDK) |
+| **Verification Method** | `govulncheck -tags kqueue ./...` + manual CVE database cross-referencing |
+
+### CVE-2024-45337 — SSH Authentication Bypass in `golang.org/x/crypto` (CRITICAL)
+
+| Field | Detail |
+|---|---|
+| **CVE ID** | CVE-2024-45337 / GO-2024-3321 |
+| **CVSS Score** | 9.1 (CRITICAL) |
+| **Affected Package** | `golang.org/x/crypto v0.29.0` (`go.mod` line 91) |
+| **Fixed In** | `golang.org/x/crypto v0.31.0` (minimum); v0.45.0+ recommended to address all SSH CVEs |
+| **Affected MinIO Code** | `cmd/sftp-server.go:479` (`PublicKeyCallback` field in `ssh.ServerConfig`) → `cmd/sftp-server.go:509` (`ssh.NewServerConn`) |
+| **Attack Vector** | An attacker can bypass SSH public key authentication on MinIO's SFTP server subsystem by exploiting a flaw in `ssh.ServerConfig.PublicKeyCallback`. The vulnerability allows authentication bypass when the callback is improperly handled. |
+| **Impact** | Unauthorized SFTP access to MinIO storage. An attacker could read, write, or delete objects through the SFTP interface without valid SSH credentials. |
+| **Remediation** | Upgrade `golang.org/x/crypto` to v0.45.0+ in `go.mod` and run `go mod tidy`. This single upgrade addresses CVE-2024-45337, CVE-2025-22869, and CVE-2025-58181 simultaneously. |
+
+### CVE-2025-30204 — JWT ParseUnverified Denial of Service in `golang-jwt` (HIGH)
+
+| Field | Detail |
+|---|---|
+| **CVE ID** | CVE-2025-30204 / GO-2025-3553 |
+| **CVSS Score** | 7.5 (HIGH) |
+| **Affected Packages** | `github.com/golang-jwt/jwt/v4 v4.5.1` (`go.mod` line 30, direct), `github.com/golang-jwt/jwt/v5 v5.2.1` (`go.mod` line 163, indirect) |
+| **Fixed In** | `golang-jwt/jwt/v4 v4.5.2`, `golang-jwt/jwt/v5 v5.2.2` |
+| **Affected MinIO Code** | `internal/config/identity/openid/jwt.go:164` → `ParseWithClaims` → `ParseUnverified` |
+| **Attack Vector** | An attacker can craft a malicious JWT token with specially constructed headers that trigger O(n) memory allocation during `ParseUnverified`. This causes excessive memory consumption on the MinIO server. |
+| **Impact** | Denial of service via memory exhaustion. Affects MinIO's OpenID Connect (OIDC) authentication flow — an attacker sending crafted JWT tokens to the OIDC verification endpoint can degrade server performance or cause out-of-memory crashes. |
+| **Remediation** | Upgrade `golang-jwt/jwt/v4` to v4.5.2 and `golang-jwt/jwt/v5` to v5.2.2 in `go.mod`, then run `go mod tidy`. |
+
+### CVE-2025-22869 — SSH Denial of Service via Slow Key Exchange in `golang.org/x/crypto` (HIGH)
+
+| Field | Detail |
+|---|---|
+| **CVE ID** | CVE-2025-22869 / GO-2025-3487 |
+| **CVSS Score** | HIGH |
+| **Affected Package** | `golang.org/x/crypto v0.29.0` (`go.mod` line 91) |
+| **Fixed In** | `golang.org/x/crypto v0.35.0` (minimum); v0.45.0+ recommended |
+| **Affected MinIO Code** | `cmd/sftp-server.go:474` (`KeyExchanges` configuration in `ssh.ServerConfig`) → `cmd/sftp-server.go:509` (`ssh.NewServerConn`, `ssh.DiscardRequests`, `ssh.Request.Reply`) |
+| **Attack Vector** | An attacker can initiate an SSH connection to MinIO's SFTP server and perform an intentionally slow key exchange, consuming server resources for an extended period. Repeated connections can exhaust the server's connection-handling capacity. |
+| **Impact** | Denial of service against the SFTP subsystem. Legitimate SFTP users may be unable to connect while the attack is active. |
+| **Remediation** | Included in the `golang.org/x/crypto` v0.45.0+ upgrade recommended for CVE-2024-45337. |
+
+### CVE-2025-58181 — SSH GSSAPI Unbounded Memory Allocation in `golang.org/x/crypto` (HIGH)
+
+| Field | Detail |
+|---|---|
+| **CVE ID** | CVE-2025-58181 |
+| **CVSS Score** | HIGH |
+| **Affected Package** | `golang.org/x/crypto v0.29.0` (`go.mod` line 91) |
+| **Fixed In** | `golang.org/x/crypto v0.45.0` |
+| **Affected MinIO Code** | `cmd/sftp-server.go:37` and `cmd/sftp-server-driver.go:38` (import `golang.org/x/crypto/ssh`) — the SSH server implementation processes GSSAPI messages |
+| **Attack Vector** | An attacker can send specially crafted GSSAPI messages during SSH handshake that cause unbounded memory allocation on the server. |
+| **Impact** | Memory exhaustion denial of service against MinIO's SFTP server subsystem. |
+| **Remediation** | Included in the `golang.org/x/crypto` v0.45.0+ upgrade recommended for CVE-2024-45337. |
+
+### GO-2025-3503 — HTTP Proxy Bypass via IPv6 Zone IDs in `golang.org/x/net` (HIGH)
+
+| Field | Detail |
+|---|---|
+| **Go Vuln ID** | GO-2025-3503 |
+| **Severity** | HIGH |
+| **Affected Package** | `golang.org/x/net v0.31.0` (`go.mod` line 256, indirect) |
+| **Fixed In** | `golang.org/x/net v0.36.0` |
+| **Affected MinIO Code** | `internal/event/target/mqtt.go` → `github.com/eclipse/paho.mqtt.golang` `Connect()` → HTTP proxy dialing via `golang.org/x/net/proxy` |
+| **Attack Vector** | An attacker can use IPv6 Zone IDs in URLs to bypass HTTP proxy restrictions configured for MinIO's MQTT notification target. |
+| **Impact** | Proxy bypass could allow MQTT notification connections to reach unintended destinations, potentially enabling server-side request forgery (SSRF) in environments that rely on proxy-based network segmentation. |
+| **Remediation** | Upgrade `golang.org/x/net` to v0.36.0+ in `go.mod`, then run `go mod tidy`. |
+
+### Consolidated Remediation Plan
+
+The following `go.mod` changes would address all five vulnerabilities in a single update cycle:
+
+| Package | Current Version | Target Version | CVEs Addressed |
+|---|---|---|---|
+| `golang.org/x/crypto` | v0.29.0 | v0.45.0+ | CVE-2024-45337, CVE-2025-22869, CVE-2025-58181 |
+| `github.com/golang-jwt/jwt/v4` | v4.5.1 | v4.5.2+ | CVE-2025-30204 |
+| `github.com/golang-jwt/jwt/v5` | v5.2.1 | v5.2.2+ | CVE-2025-30204 |
+| `golang.org/x/net` | v0.31.0 | v0.36.0+ | GO-2025-3503 |
+
+**Execution steps** (to be performed outside this read-only investigation):
+
+```bash
+# Update vulnerable dependencies
+go get golang.org/x/crypto@v0.45.0
+go get github.com/golang-jwt/jwt/v4@v4.5.2
+go get github.com/golang-jwt/jwt/v5@v5.2.2
+go get golang.org/x/net@v0.36.0
+
+# Clean up dependency graph
+go mod tidy
+
+# Verify no remaining called vulnerabilities
+govulncheck -tags kqueue ./...
+
+# Run full test suite to confirm no regressions
+MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -v -tags kqueue,dev ./...
+```
+
+### Additional Observations
+
+**Go Standard Library**: The Go compiler version (1.23.8) used to build MinIO has 26+ known vulnerabilities across `crypto/x509`, `crypto/tls`, `archive/tar`, `html/template`, `os`, `net/url`, `net/http`, and `syscall` packages. Upgrading the Go toolchain to 1.25.9+ would address all stdlib-level issues. This is outside the scope of dependency management and requires a build environment update.
+
+**OpenTelemetry SDK**: `go.opentelemetry.io/otel/sdk v1.32.0` (indirect dependency) has GO-2026-4394 — a PATH hijacking code execution vulnerability. The fix is available in v1.40.0+. While not directly called by MinIO's core security paths, it should be upgraded as part of a comprehensive dependency update.
