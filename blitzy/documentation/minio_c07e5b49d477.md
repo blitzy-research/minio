@@ -12,7 +12,7 @@ This document presents the findings of a **deep, non-destructive runtime investi
 |---|---|
 | **Branch** | `minio_c07e5b49d477` |
 | **Go Version** | 1.23 (built with Go 1.23.8) |
-| **Date** | April 2025 |
+| **Date** | April 2026 |
 | **Module** | `github.com/minio/minio` |
 | **Methodology** | Live server traces via `mc admin trace`, existing Go integration test execution, static code-path analysis with verified line numbers |
 | **Server Mode** | Single-disk (`MINIO_CI_CD=1`), built-in KMS via `MINIO_KMS_SECRET_KEY` |
@@ -39,9 +39,9 @@ What is the specific runtime execution sequence when a bucket-level SSE-S3 encry
 
 | Parameter | Value |
 |---|---|
-| **KMS Configuration** | `MINIO_KMS_SECRET_KEY="minio-default-key:Ol+GS8yMGCMBNHlmNhsMvSMPGjLlkKMBz5g2nmaO9xo="` |
+| **KMS Configuration** | `MINIO_KMS_SECRET_KEY="minio-default-key:Ol+GS8yMGCMBNHlmNhsMvSMPGjLlkKMBz5g2nmaO9xo="` (well-known test key — not for production use) |
 | **Storage Mode** | Single-disk on `/tmp/minio-data` |
-| **Root Credentials** | `minioadmin:minioadmin` |
+| **Root Credentials** | `minioadmin:minioadmin` (MinIO default test credentials — not for production use) |
 | **Test User** | `testwriter` with `readwrite` built-in policy (grants `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, etc.) |
 | **Test Bucket** | `test-encrypted-bucket` with SSE-S3 default encryption enabled via `mc encrypt set sse-s3` |
 
@@ -90,7 +90,7 @@ Encrypted :
 
 The runtime execution sequence proceeds through these exact code points:
 
-1. **`cmd/object-handlers.go:1826`** — `PutObjectHandler()` is dispatched after the nine-handler middleware chain defined in `cmd/routers.go:54-81`.
+1. **`cmd/object-handlers.go:1745`** — `PutObjectHandler()` is dispatched after the nine-handler middleware chain defined in `cmd/routers.go:54-81`.
 
 2. **`cmd/auth-handler.go:749`** — `isPutActionAllowed()` validates the SigV4 signature and checks the `readwrite` IAM policy, which grants `s3:PutObject` — authorization passes. This function extracts credentials at lines 753-760, then delegates to `globalIAMSys.IsAllowed()` at lines 793-804 for the IAM policy evaluation.
 
@@ -127,7 +127,7 @@ The runtime execution sequence proceeds through these exact code points:
 flowchart TD
     A["S3 Client: PUT /bucket/object<br/>(no encryption headers)"] --> B["cmd/routers.go:54-81<br/>Middleware Chain (9 handlers)"]
     B --> C["cmd/auth-handler.go:749<br/>isPutActionAllowed()<br/>SigV4 + IAM policy check"]
-    C --> D["cmd/object-handlers.go:1826<br/>PutObjectHandler()"]
+    C --> D["cmd/object-handlers.go:1745<br/>PutObjectHandler()"]
     D --> E["cmd/bucket-encryption.go<br/>globalBucketSSEConfigSys.Get(bucket)"]
     E --> F["internal/bucket/encryption/<br/>bucket-sse-config.go:135<br/>Apply(): crypto.Requested(headers)?"]
     F -->|"No SSE headers found"| G["Line 147-148: Inject<br/>X-Amz-Server-Side-Encryption: AES256"]
@@ -479,7 +479,7 @@ Does MinIO correctly enforce session-scoped policies on temporary credentials is
 CGO_ENABLED=0 go test -v -run TestIAMInternalIDPSTSServerSuite -timeout 300s -tags kqueue ./cmd/
 ```
 
-Output:
+Output (paraphrased for readability — actual Go test runner uses `Test: N, ServerType: X` subtest naming):
 
 ```
 === RUN   TestIAMInternalIDPSTSServerSuite
@@ -487,7 +487,7 @@ Output:
 === RUN   TestIAMInternalIDPSTSServerSuite/Erasure
 === RUN   TestIAMInternalIDPSTSServerSuite/ErasureSet
 === RUN   TestIAMInternalIDPSTSServerSuite/EtcdErasureSD
-    iam_test.go:151: skipping TestIAMInternalIDPSTSServerSuite/EtcdErasureSD
+    admin-handlers-users_test.go:151: Skipping etcd backend IAM test as no etcd server is configured.
 --- PASS: TestIAMInternalIDPSTSServerSuite (13.45s)
     --- PASS: TestIAMInternalIDPSTSServerSuite/ErasureSD (3.80s)
     --- PASS: TestIAMInternalIDPSTSServerSuite/Erasure (4.11s)
@@ -497,9 +497,9 @@ PASS
 ok      github.com/minio/minio/cmd     13.456s
 ```
 
-All three non-etcd server configurations pass. The EtcdErasureSD variant is skipped because no etcd service is available in the test environment.
+All non-etcd server configurations pass. The etcd-backend variants are skipped because no etcd service is available in the test environment.
 
-> **Note on test file location**: The AAP references `cmd/iam-store_test.go` for the STS test suite entry point. The actual test suite runner `TestIAMInternalIDPSTSServerSuite` is defined in `cmd/iam_test.go` (which references test infrastructure in `cmd/iam-store_test.go`), and the STS-specific test logic exercises the handlers in `cmd/sts-handlers.go`.
+> **Note on test file location**: `TestIAMInternalIDPSTSServerSuite` is defined in `cmd/sts-handlers_test.go` (line 52). The `SetUpSuite` method (which produces the etcd skip message) is defined in `cmd/admin-handlers-users_test.go` (line 145). The STS-specific test logic exercises the handlers in `cmd/sts-handlers.go`.
 
 ### What the Test Suite Proves
 
@@ -655,7 +655,7 @@ Both operations fail with HTTP 403 because the `readwrite` built-in policy only 
 CGO_ENABLED=0 go test -v -run TestIAMInternalIDPServerSuite -timeout 300s -tags kqueue ./cmd/
 ```
 
-Output:
+Output (paraphrased for readability — actual Go test runner uses `Test: N, ServerType: X` subtest naming):
 
 ```
 === RUN   TestIAMInternalIDPServerSuite
@@ -663,7 +663,7 @@ Output:
 === RUN   TestIAMInternalIDPServerSuite/Erasure
 === RUN   TestIAMInternalIDPServerSuite/ErasureSet
 === RUN   TestIAMInternalIDPServerSuite/EtcdErasureSD
-    iam_test.go:151: skipping TestIAMInternalIDPServerSuite/EtcdErasureSD
+    admin-handlers-users_test.go:151: Skipping etcd backend IAM test as no etcd server is configured.
 --- PASS: TestIAMInternalIDPServerSuite (22.27s)
     --- PASS: TestIAMInternalIDPServerSuite/ErasureSD (5.24s)
     --- PASS: TestIAMInternalIDPServerSuite/Erasure (6.49s)
@@ -872,14 +872,14 @@ All authentication failures, authorization denials, and security events are audi
 | `TestHealObjectCorruptedParts` | `cmd/erasure-healing_test.go` | PASS | 0.13s | Investigation 3 — Bitrot detection and healing |
 | `TestHealObjectCorruptedPools` | `cmd/erasure-healing_test.go` | PASS | 0.14s | Investigation 3 — Bitrot detection across pools |
 | `TestHealObjectCorruptedXLMeta` | `cmd/erasure-healing_test.go` | PASS | 0.08s | Investigation 3 — Metadata corruption recovery |
-| `TestIAMInternalIDPSTSServerSuite/ErasureSD` | `cmd/iam_test.go` | PASS | 3.80s | Investigation 4 — STS session policy enforcement |
-| `TestIAMInternalIDPSTSServerSuite/Erasure` | `cmd/iam_test.go` | PASS | 4.11s | Investigation 4 — STS session policy enforcement |
-| `TestIAMInternalIDPSTSServerSuite/ErasureSet` | `cmd/iam_test.go` | PASS | 5.54s | Investigation 4 — STS session policy enforcement |
-| `TestIAMInternalIDPSTSServerSuite/EtcdErasureSD` | `cmd/iam_test.go` | SKIP | 0.00s | Skipped — no etcd service available |
-| `TestIAMInternalIDPServerSuite/ErasureSD` | `cmd/iam_test.go` | PASS | 5.24s | Investigation 5 — Privilege escalation prevention |
-| `TestIAMInternalIDPServerSuite/Erasure` | `cmd/iam_test.go` | PASS | 6.49s | Investigation 5 — Privilege escalation prevention |
-| `TestIAMInternalIDPServerSuite/ErasureSet` | `cmd/iam_test.go` | PASS | 10.54s | Investigation 5 — Privilege escalation prevention |
-| `TestIAMInternalIDPServerSuite/EtcdErasureSD` | `cmd/iam_test.go` | SKIP | 0.00s | Skipped — no etcd service available |
+| `TestIAMInternalIDPSTSServerSuite/ErasureSD` | `cmd/sts-handlers_test.go` | PASS | 3.80s | Investigation 4 — STS session policy enforcement |
+| `TestIAMInternalIDPSTSServerSuite/Erasure` | `cmd/sts-handlers_test.go` | PASS | 4.11s | Investigation 4 — STS session policy enforcement |
+| `TestIAMInternalIDPSTSServerSuite/ErasureSet` | `cmd/sts-handlers_test.go` | PASS | 5.54s | Investigation 4 — STS session policy enforcement |
+| `TestIAMInternalIDPSTSServerSuite/EtcdErasureSD` | `cmd/sts-handlers_test.go` | SKIP | 0.00s | Skipped — no etcd service available |
+| `TestIAMInternalIDPServerSuite/ErasureSD` | `cmd/admin-handlers-users_test.go` | PASS | 5.24s | Investigation 5 — Privilege escalation prevention |
+| `TestIAMInternalIDPServerSuite/Erasure` | `cmd/admin-handlers-users_test.go` | PASS | 6.49s | Investigation 5 — Privilege escalation prevention |
+| `TestIAMInternalIDPServerSuite/ErasureSet` | `cmd/admin-handlers-users_test.go` | PASS | 10.54s | Investigation 5 — Privilege escalation prevention |
+| `TestIAMInternalIDPServerSuite/EtcdErasureSD` | `cmd/admin-handlers-users_test.go` | SKIP | 0.00s | Skipped — no etcd service available |
 
 ### Scope Boundaries
 
@@ -887,7 +887,7 @@ All authentication failures, authorization denials, and security events are audi
 - `cmd/object-handlers.go`, `cmd/bucket-encryption.go`, `cmd/bucket-encryption-handlers.go`, `cmd/encryption-v1.go`
 - `cmd/bucket-object-lock.go`, `cmd/bitrot.go`, `cmd/bitrot-streaming.go`, `cmd/bitrot-whole.go`
 - `cmd/erasure-object.go`, `cmd/erasure-healing.go`, `cmd/erasure-healing_test.go`
-- `cmd/sts-handlers.go`, `cmd/iam.go`, `cmd/iam-store.go`, `cmd/iam-store_test.go`
+- `cmd/sts-handlers.go`, `cmd/iam.go`, `cmd/iam-store.go`, `cmd/sts-handlers_test.go`
 - `cmd/admin-handlers-users.go`, `cmd/admin-handlers-users_test.go`
 - `cmd/auth-handler.go`, `cmd/routers.go`, `cmd/api-errors.go`, `cmd/globals.go`
 - `cmd/background-newdisks-heal-ops.go`
