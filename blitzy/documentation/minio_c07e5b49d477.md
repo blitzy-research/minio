@@ -15,8 +15,8 @@
 
 1. [Erasure Coding Context for a 4-Disk Setup](#1-erasure-coding-context-for-a-4-disk-setup)
 2. [Complete Healing Decision Flow](#2-complete-healing-decision-flow)
-   - 2.1 [Entry Point — `HealObject`](#21-entry-point--healobject)
-   - 2.2 [Core Healing — `healObject`](#22-core-healing--healobject)
+   - 2.1 [Entry Point — `(er erasureObjects).HealObject`](#21-entry-point--er-erasureobjectshealobject)
+   - 2.2 [Core Healing — `(er *erasureObjects).healObject`](#22-core-healing--er-erasureobjectshealobject)
    - 2.3 [Disk Classification — `shouldHealObjectOnDisk`](#23-disk-classification--shouldhealobjectonDisk)
    - 2.4 [Online Disk Selection — `listOnlineDisks`](#24-online-disk-selection--listonlinedisks)
    - 2.5 [Part Integrity Verification — `disksWithAllParts`](#25-part-integrity-verification--diskswithallparts)
@@ -24,12 +24,12 @@
    - 2.7 [The `cannotHeal` Threshold](#27-the-cannotheal-threshold)
 3. [Dangling Object Detection](#3-dangling-object-detection)
    - 3.1 [`isObjectDangling` — The Five Decision Paths](#31-isobjectdangling--the-five-decision-paths)
-   - 3.2 [`deleteIfDangling` — Audit and Purge](#32-deleteifDangling--audit-and-purge)
+   - 3.2 [`(er erasureObjects).deleteIfDangling` — Audit and Purge](#32-er-erasureobjectsdeleteifdangling--audit-and-purge)
    - 3.3 [Test Evidence — `TestIsObjectDangling`](#33-test-evidence--testisObjectDangling)
 4. [Healing Output Artifacts](#4-healing-output-artifacts)
    - 4.1 [`HealResultItem` Structure](#41-healresultitem-structure)
    - 4.2 [`healTrace` — Trace Emission](#42-healtrace--trace-emission)
-   - 4.3 [`auditHealObject` — Audit Logging](#43-audithealobject--audit-logging)
+   - 4.3 [`(er *erasureObjects).auditHealObject` — Audit Logging](#43-er-erasureobjectsaudithealobject--audit-logging)
 5. [Boundary Conditions](#5-boundary-conditions)
    - 5.1 [Minimum Shard Threshold](#51-minimum-shard-threshold)
    - 5.2 [Error Messages](#52-error-messages)
@@ -145,7 +145,7 @@ This section traces the complete code path from the public `HealObject` entry po
 
 ### 2.1 Entry Point — `(er erasureObjects).HealObject`
 
-**File**: `cmd/erasure-healing.go:1038`
+**File**: `cmd/erasure-healing.go:1039`
 
 ```go
 func (er erasureObjects) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (hr madmin.HealResultItem, err error)
@@ -173,7 +173,7 @@ This is the heart of the healing subsystem. Every step is documented below with 
 
 ```mermaid
 flowchart TD
-    A["HealObject() entry — line 1038"] --> B{"Is path a directory?<br/>line 1052"}
+    A["HealObject() entry — line 1039"] --> B{"Is path a directory?<br/>line 1052"}
     B -- Yes --> C["healObjectDir()<br/>line 1053"]
     B -- No --> D["Quick unlocked read<br/>line 1067"]
     D --> E{"isAllNotFound(errs)?"}
@@ -561,7 +561,7 @@ For a **4-disk EC:2** setup, both thresholds evaluate to 2, so there is no pract
 
 In this case, a data object would be declared dangling much more easily (>1 missing disk) than a delete marker (>3 missing disks). This makes delete markers **less** aggressively cleaned up in asymmetric configurations, contrary to what one might expect. The reason is defensive: delete markers use the conservative `(N+1)/2` formula because they cannot validate against stored parity information in the same way.
 
-### 3.2 `deleteIfDangling` — Audit and Purge
+### 3.2 `(er erasureObjects).deleteIfDangling` — Audit and Purge
 
 **File**: `cmd/erasure-object.go:482-562`
 
@@ -618,13 +618,13 @@ This test function validates `isObjectDangling` across 13 distinct scenarios. Th
 | 4 | `FileInfoUndecided-case2` | 0 valid (empty slice) | `[notFound, diskNotFound, diskNotFound, notFound]` | `nil` | **false** | No valid meta → Path 1; `diskNotFound` is non-actionable; `notFoundPartsErrs` = 0, not > `dataBlocks` (2) |
 | 5 | `FileInfoUndecided-case3(file deleted)` | 0 valid (empty slice) | `[notFound, notFound, notFound, notFound]` | `nil` | **false** | No valid meta → Path 1; `notFoundPartsErrs` = 0 (no part errors), not > `dataBlocks`; "leave it as is" |
 | 6 | `FileInfoUnDecided-case4` | 1 valid inline `ifi`, 3 empty | `[notFound, fileCorrupt, fileCorrupt, nil]` | `nil` | **false** | `fileCorrupt` counted as non-actionable → Path 2 fires |
-| 7 | `FileInfoUnDecided-case5` | 1 valid `fi`, 3 empty | `[notFound, fileCorrupt, nil, nil]` | Part 0: `[corrupt, notFound, success, corrupt]` | **false** | `fileCorrupt` in meta errs is non-actionable → Path 2; also `checkPartFileCorrupt` in parts is non-actionable |
-| 8 | `FileInfoUnDecided-case6` | 1 valid `fi`, 3 empty | `[notFound, notFound, notFound, nil]` | Part 0: `[notFound, corrupt, success, success]` | **false** | `notFoundMetaErrs` = 3 > `parityBlocks` (2) would trigger Path 4, BUT `checkPartFileCorrupt` is a non-actionable part error → Path 2 catches first |
+| 7 | `FileInfoUnDecided-case5-(ignore errFileCorrupt error)` | 1 valid `fi`, 3 empty | `[notFound, fileCorrupt, nil, nil]` | Part 0: `[corrupt, notFound, success, corrupt]` | **false** | `fileCorrupt` in meta errs is non-actionable → Path 2; also `checkPartFileCorrupt` in parts is non-actionable |
+| 8 | `FileInfoUnDecided-case6-(data-dir intact)` | 1 valid `fi`, 3 empty | `[notFound, notFound, notFound, nil]` | Part 0: `[notFound, corrupt, success, success]` | **false** | `notFoundMetaErrs` = 3 > `parityBlocks` (2) would trigger Path 4, BUT `checkPartFileCorrupt` is a non-actionable part error → Path 2 catches first |
 | 9 | `FileInfoDecided-case1` | 1 valid inline `ifi`, 3 empty | `[notFound, notFound, notFound, nil]` | `nil` | **true** | `notFoundMetaErrs` = 3 > `parityBlocks` (2) → Path 4; no non-actionable errors; inline data so no part checks |
 | 10 | `FileInfoDecided-case2-delete-marker` | 1 `{Deleted:true}`, 3 empty | `[notFound, notFound, notFound, nil]` | `nil` | **true** | Delete marker → Path 3; `notFoundMetaErrs` = 3 > `dataBlocks` (2) |
 | 11 | `FileInfoDecided-case3-(enough data-dir missing)` | 1 valid `fi`, 3 empty | `[notFound, notFound, nil, nil]` | Part 0: `[notFound, notFound, success, notFound]` | **true** | `notFoundPartsErrs` = 3 > `parityBlocks` (2) → Path 5 |
 | 12 | `FileInfoDecided-case4-(missing data-dir for part 2)` | 1 valid `fi`, 3 empty | `[notFound, notFound, nil, nil]` | Part 0: `[success×4]`, Part 1: `[success, notFound, notFound, notFound]` | **true** | Per-part max: Part 1 has 3 `notFoundPartsErrs` > `parityBlocks` (2) → Path 5 |
-| 13 | `FileInfoDecided-case4-(enough data-dir existing)` | 1 valid `fi`, 3 empty | `[notFound, notFound, nil, nil]` | Parts 0–3: each has exactly 1 `notFound` | **false** | Per-part max: 1 `notFoundPartsErrs` ≤ `parityBlocks` (2); each part individually is recoverable |
+| 13 | `FileInfoDecided-case4-(enough data-dir existing for each part)` | 1 valid `fi`, 3 empty | `[notFound, notFound, nil, nil]` | Parts 0–3: each has exactly 1 `notFound` | **false** | Per-part max: 1 `notFoundPartsErrs` ≤ `parityBlocks` (2); each part individually is recoverable |
 
 ---
 
@@ -687,7 +687,7 @@ After (successful heal):
 
 ### 4.2 `healTrace` — Trace Emission
 
-**File**: `cmd/erasure-healing.go:1089-1116`
+**File**: `cmd/erasure-healing.go:1090-1116`
 
 ```go
 func healTrace(funcName healingMetric, startTime time.Time, bucket, object string, opts *madmin.HealOpts, err error, result *madmin.HealResultItem)
@@ -735,7 +735,7 @@ Additional fields:
 
 Published via `globalTrace.Publish(tr)` (line 1115).
 
-### 4.3 `auditHealObject` — Audit Logging
+### 4.3 `(er *erasureObjects).auditHealObject` — Audit Logging
 
 **File**: `cmd/erasure-healing.go:221-254`
 
