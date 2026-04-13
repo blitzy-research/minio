@@ -942,7 +942,7 @@ func (m *mrfState) addPartialOp(op PartialOperation) {
 3. Closes the channel (line 105).
 4. Serializes remaining entries to disk (lines 112–152):
    - Format: 4-byte header (2-byte format + 2-byte version) + msgpack-encoded `PartialOperation` entries.
-   - Location: `.minio.sys/.heal/mrf/list.bin` on any available local drive.
+   - Location: `.minio.sys/buckets/.heal/mrf/list.bin` on any available local drive.
    - Uses `msgp.NewWriter` for efficient serialization.
 
 **Startup** — `(m *mrfState).startMRFPersistence()` (line 155):
