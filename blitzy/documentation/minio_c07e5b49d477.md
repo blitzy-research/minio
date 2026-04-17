@@ -64,9 +64,9 @@ All state is ephemeral; `/tmp/minio-heal-experiments` is destroyed after experim
 
 | Outcome | Trigger | Result | Evidence |
 |---|---|---|---|
-| **Green (no-op)** | All parts on all disks are intact | `errNoHealRequired`; `before == after == all ok` | [§12.1](#121-scenario-a--one-disk-missing) baseline probe |
-| **Reconstruct** | `disksToHealCount ≤ ParityBlocks` | Missing/corrupt shards rebuilt via Reed-Solomon; `before: {missing, ok, ok, ok}` → `after: {ok, ok, ok, ok}` | [§12.1–12.2](#121-scenario-a--one-disk-missing), [§12.4–12.5](#124-scenario-d--corrupted-part-file-size-mismatch) |
-| **Dangling purge** | `cannotHeal==true` AND `isObjectDangling` returns `true` | Object permanently removed from all disks; subsequent GETs return `NoSuchKey` | [§12.3](#123-scenario-c--three-disks-missing-beyond-parity), [§12.6](#126-scenario-e--dangling-metadata) |
+| **Green (no-op)** | All parts on all disks are intact | `errNoHealRequired`; `before == after == all ok` | [§12.1](#121-scenario-a--one-disk-missing-yellow--green) baseline probe |
+| **Reconstruct** | `disksToHealCount ≤ ParityBlocks` | Missing/corrupt shards rebuilt via Reed-Solomon; `before: {missing, ok, ok, ok}` → `after: {ok, ok, ok, ok}` | [§12.1–12.2](#121-scenario-a--one-disk-missing-yellow--green), [§12.4–12.5](#124-scenario-d--corrupted-part-file-size-mismatch) |
+| **Dangling purge** | `cannotHeal==true` AND `isObjectDangling` returns `true` | Object permanently removed from all disks; subsequent GETs return `NoSuchKey` | [§12.3](#123-scenario-c--three-disks-missing-beyond-parity-dangling-purge), [§12.6](#126-scenario-e--dangling-metadata) |
 | **Leave degraded** | `cannotHeal==true` BUT `isObjectDangling` returns `false` (non-actionable errors, missing valid meta, etc.) | Object stays as-is on the drives that have it; no purge, no reconstruction | `cmd/erasure-healing.go:1008-1010` (non-actionable override) |
 | **ETag override** | Even with `disksToHealCount > ParityBlocks`, all readable `xl.meta` agree on ETag | Re-flip `cannotHeal=false` and proceed to reconstruct | `cmd/erasure-healing.go:429-434` |
 
@@ -228,7 +228,7 @@ Two key facts:
 
 ### 5.7 Healing Decision Cascade
 
-```
+```text
                     ┌────────────────────────────────────────┐
                     │         HealObject(bucket, object)     │
                     └──────────────────┬─────────────────────┘
@@ -384,15 +384,23 @@ Defined in `madmin-go/v3` (`github.com/minio/madmin-go/v3/heal-commands.go`). St
 
 ### 8.2 Per-Drive State Semantics
 
-| `state` | Meaning in Before | Meaning in After |
-|---|---|---|
-| `ok` | Disk had the correct version with intact parts | Reconstruction succeeded; disk now has the correct content |
-| `missing` | `xl.meta` missing, outdated, or parts missing/corrupt-by-size | Not yet healed — the heal session didn't address this disk, or the healer wasn't invoked |
-| `corrupt` | `xl.meta` unreadable with non-actionable error | Still corrupt; heal couldn't proceed |
-| `offline` | Disk unreachable (`errDiskNotFound`) | Still offline — heal has no way to write there |
-| `permission-denied` / `faulty` | Filesystem-level fault | Cleared to `ok` only if the fault self-resolved mid-heal |
+The `state` field in each `HealDriveInfo` is populated from the nine `DriveState*` string constants defined at `madmin-go/v3/heal-commands.go:120-129`. Four of them (`"ok"`, `"offline"`, `"missing"`, `"corrupt"`) are produced by the heal code path at `cmd/erasure-healing.go:382-393`; the remaining five (`"permission-denied"`, `"faulty"`, `"root-mount"`, `"unknown"`, `"unformatted"`) surface only through adjacent subsystems (disk-formatting, health probe, mount-type detection).
 
-`Before.Drives` is initialized at `cmd/erasure-healing.go:395-399` by appending one `HealDriveInfo` per physical disk; `After.Drives` is initialized in the **same loop** at `cmd/erasure-healing.go:400-404` to the identical initial values. Only successful per-disk reconstruction mutates `After.Drives[i].State` to `ok` at `cmd/erasure-healing.go:651`.
+| `state` constant | Literal | Meaning in Before | Meaning in After | Source |
+|---|---|---|---|---|
+| `DriveStateOk` | `"ok"` | Disk had the correct version with intact parts | Reconstruction succeeded; disk now has the correct content | `cmd/erasure-healing.go:386` (`reason == nil` branch) |
+| `DriveStateMissing` | `"missing"` | `xl.meta` missing, outdated, or parts missing/corrupt-by-size (`errFileNotFound`, `errFileVersionNotFound`, `errVolumeNotFound`, `errPartMissingOrCorrupt`, `errOutdatedXLMeta`, `errLegacyXLMeta`) | Not yet healed — heal didn't address this disk, or the healer wasn't invoked | `cmd/erasure-healing.go:389` |
+| `DriveStateCorrupt` | `"corrupt"` | `xl.meta` unreadable with non-actionable error (the `default` branch of the switch) | Still `"corrupt"`; heal couldn't proceed | `cmd/erasure-healing.go:392` |
+| `DriveStateOffline` | `"offline"` | Disk unreachable (`errDiskNotFound`) | Still `"offline"` — heal has no way to write there | `cmd/erasure-healing.go:388` |
+| `DriveStatePermission` | `"permission-denied"` | Filesystem returned EACCES on `xl.meta` read — classified as non-actionable (criterion #3 dangling safety valve) | Cleared to `"ok"` only if the fault self-resolved mid-heal | `madmin-go/v3/heal-commands.go:124`; set by storage layer when a `StorageAPI` call surfaces a permission error |
+| `DriveStateFaulty` | `"faulty"` | Disk marked faulty by the health-check probe (I/O error floor exceeded) | Still `"faulty"` until operator replaces the disk | `madmin-go/v3/heal-commands.go:125`; set by `cmd/storage-rest-common.go` health cycle |
+| `DriveStateRootMount` | `"root-mount"` | Drive is the OS root filesystem — disallowed for object storage per `cmd/xl-storage.go` root-disk guard | Never transitions during heal; operator must remount on a dedicated block device | `madmin-go/v3/heal-commands.go:126` |
+| `DriveStateUnknown` | `"unknown"` | State could not be determined (e.g., RPC timeout from a peer) | Same — never resolved by heal alone | `madmin-go/v3/heal-commands.go:127` |
+| `DriveStateUnformatted` | `"unformatted"` | Disk present but has no `format.json` yet — newly added, awaiting format | Transitions to `"ok"` once `initBackgroundHealing` plus `format.json` write complete | `madmin-go/v3/heal-commands.go:128` (comment: "only returned by disk") |
+
+`Before.Drives` is initialized at `cmd/erasure-healing.go:395-399` by appending one `HealDriveInfo` per physical disk; `After.Drives` is initialized in the **same loop** at `cmd/erasure-healing.go:400-404` to the identical initial values. Only successful per-disk reconstruction mutates `After.Drives[i].State` to `"ok"` at `cmd/erasure-healing.go:651`.
+
+In a live 4-disk EC(2,2) cluster under normal healing the three most common literals are `"ok"`, `"missing"`, and `"offline"` (observed in every runtime scenario in §12). The other six — `"corrupt"`, `"permission-denied"`, `"faulty"`, `"root-mount"`, `"unknown"`, `"unformatted"` — appear only under degraded or setup-time conditions, but every operator should recognize all nine literals when parsing `HealResultItem` JSON.
 
 ### 8.3 Aggregate Color Logic
 
@@ -458,7 +466,7 @@ The audit record includes the bucket, object, version, and the exact caller `fil
 
 `cmd/erasure-healing.go:477, :487, :497` each invoke `healingLogOnceIf` with a distinct log-once key but the **same log-message template**:
 
-```
+```text
 unexpected file distribution (%v) from <X> (%v), looks like backend disks
 have been manually modified refusing to heal <bucket>/<object>(<versionID>)
 ```
@@ -933,6 +941,19 @@ const (
 | Concurrency | `DriveWorkers` from `internal/config/heal/heal.go` (default = drive count) |
 | Rate limiting | `waitForLowIO` in `cmd/background-heal-ops.go` |
 
+### 13.8 `cmd/erasure-heal_test.go` Representative Test Matrix
+
+The low-level `TestErasureHeal` function at `cmd/erasure-heal_test.go:65-157` iterates a 20-entry table (`erasureHealTests` defined at `cmd/erasure-heal_test.go:29-63`) that parameterizes the Reed-Solomon heal primitive (`Erasure.Heal` at `cmd/erasure-decode.go:317`) across varying combinations of `dataBlocks`, `disks`, `offDisks`, `badDisks`, `badStaleDisks`, `blocksize`, `size`, and `BitrotAlgorithm`. The four rows below are the EC(2,2) cases — identical to the 4-disk layout used throughout this document — plus one boundary-failure case (row 11) that demonstrates exactly when reconstruction returns a non-nil error.
+
+| Row | dataBlocks | disks | offDisks | badDisks | badStaleDisks | blocksize | size | algorithm | shouldFail | Interpretation |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 2 | 4 | 1 | 0 | 0 | `blockSizeV2` | 1 MiB | `SHA256` | false | Baseline EC(2,2) heal: 1 offline disk, no bad readers, no bad stale targets → Reed-Solomon succeeds, heal writes the reconstructed shard to the stale slot. Matches Scenario A (§12.1). |
+| 11 | 2 | 4 | 1 | 0 | 1 | `blockSizeV2` | 1 MiB | `DefaultBitrotAlgorithm` | **true** | EC(2,2) with 1 offline + 1 **bad stale** write target. The stale writer (the slot being healed into) errors on `Write`, so `Erasure.Heal` cannot land the reconstructed shard → returns `derr != nil`. The closest failure mode to `errErasureWriteQuorum` in the unit-test layer. |
+| 16 | 2 | 4 | 1 | 0 | 0 | `blockSizeV2` | 1 MiB | `DefaultBitrotAlgorithm` | false | Same shape as row 0 but with the default (HighwayHash-256) bitrot algorithm — proves algorithm selection does not alter the heal success boundary when inputs are clean. |
+| 19 | 2 | 4 | 1 | 0 | 0 | `blockSizeV2` | 64 MiB | `SHA256` | false | Large-object EC(2,2) heal — `size=64 MiB` (64× row 0). Confirms the decode/heal pipeline streams correctly across many block boundaries; same decision logic, same success outcome. |
+
+All four rows terminate at `cmd/erasure-heal_test.go:135` (`err = erasure.Heal(...)`) — rows 0, 16, and 19 produce `err == nil` (and the post-heal bitrot-checksum equality check at lines 147-154 passes), while row 11 produces `err != nil` because the bad-stale writer's I/O fails. The test asserts `shouldFail == (err != nil)` at lines 138-143, verifying the decision boundary empirically at the Reed-Solomon layer — the same boundary that `cannotHeal` at `cmd/erasure-healing.go:428` enforces at the object layer.
+
 ---
 
 ## 14. Partial Write vs Partial Delete — Structural Comparison
@@ -948,11 +969,13 @@ const (
 | Consumer | `healRoutine` at `cmd/mrf.go:220` | `healRoutine` at `cmd/mrf.go:220` (same) |
 | `HealObject` decision | reconstructs live object | propagates delete marker |
 | `isObjectDangling` criterion if majority-missing | #6 (`notFoundPartsErrs > ParityBlocks`) | #4 (`notFoundMetaErrs > dataBlocks`) |
+| Audit-log caller | `runtime.Caller(1)` captured in `deleteIfDangling` at `cmd/erasure-object.go:526`; deferred `auditDanglingObjectDeletion` at `cmd/erasure-object.go:531` | Same caller mechanism — `runtime.Caller(1)` at `cmd/erasure-object.go:526` and deferred `auditDanglingObjectDeletion` at `cmd/erasure-object.go:531` (only fires on a dangling purge, not on a clean partial-delete heal) |
+| Typical before→after | `{missing, ok, ok, ok} → {ok, ok, ok, ok}` (reconstruction via Reed-Solomon; see §12.1) | `{ok, ok, ok, missing} → {ok, ok, ok, deleted-marker}` for a live delete marker being propagated; `{deleted-marker, ok, ok, ok} → {deleted-marker, deleted-marker, deleted-marker, deleted-marker}` once heal completes; dangling-purge path yields `{missing, missing, missing, missing}` on all disks |
 | Final terminal state | all disks → live object OR dangling purge | all disks → delete marker OR dangling purge |
 
 ### 14.2 Unified Pipeline Diagram
 
-```
+```text
  Partial write site (erasure-object.go:1578)  ─┐
  Partial delete site (erasure-object.go:2113) ─┼──→ globalMRFState.addPartialOp()
  Read-repair site (erasure-object.go:400)     ─┤    (cmd/mrf.go:78)
@@ -1081,7 +1104,7 @@ Paths are relative to the repository root. All citations target commit `c07e5b49
 | `cmd/data-scanner.go` | `healDeleteDangling=true` (:60); `healObjectSelectProb=1024` |
 | `cmd/erasure-decode.go` | `Erasure.Heal` (:317-364); `multiWriter{writeQuorum:1}` at :352-354 |
 | `cmd/erasure-errors.go` | `errErasureReadQuorum` (:23); `errErasureWriteQuorum` (:26); `errNoHealRequired` (:29) |
-| `cmd/erasure-heal_test.go` | 20-row test matrix across `(dataBlocks, disks, offDisks, badDisks, badStaleDisks)` |
+| `cmd/erasure-heal_test.go` | `erasureHealTests` table (:29-63, 20 rows across `dataBlocks`, `disks`, `offDisks`, `badDisks`, `badStaleDisks`, `blocksize`, `size`, `algorithm`, `shouldFail`); `TestErasureHeal` driver (:65-157); representative EC(2,2) rows 0, 11, 16, 19 enumerated in [§13.8](#138-cmderasure-heal_testgo-representative-test-matrix) |
 | `cmd/erasure-healing-common.go` | `listOnlineDisks` (:219) with narrow ETag fallback; `disksWithAllParts` (:291); 5-state disk taxonomy |
 | `cmd/erasure-healing-common_test.go` | `TestListOnlineDisks`, `TestDisksWithAllParts`, `TestCommonParities` |
 | `cmd/erasure-healing.go` | `shouldHealObjectOnDisk` (:156); `auditHealObject` (:221); `healObject` (:258); drive-state mapping (:382-393); `Before.Drives` append (:395-399); `After.Drives` append (:400-404); `cannotHeal` check (:428); cannot-heal branch (:435-456); `After.Drives[i].State = ok` (:651); `checkAbandonedParts` (:659+); `healObjectDir` (:696); `defaultHealResult` (:744+); `healingLogOnceIf` sites (:477, :487, :497); `isObjectDangling` standalone function (:968-1033); `HealObject` public API (:1039); deep-scan auto-escalation (:1080-1085); `healTrace` (:1090-1115) |
@@ -1122,7 +1145,7 @@ Every JSON block in [§12](#12-six-scenarios-with-runtime-json) is a captured em
 
 ## Appendix A — Full Decision-Tree Diagram
 
-```
+```text
                     ┌───────────────────────────────────────────┐
                     │  HealObject(bucket, object, versionID,    │
                     │            opts{ScanMode, DryRun, Remove}) │
