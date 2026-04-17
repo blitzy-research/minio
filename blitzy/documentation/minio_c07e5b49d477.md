@@ -96,7 +96,7 @@ MRF-driven: `healRoutine` (`cmd/mrf.go:220`) drains the `opCh` channel (capacity
 4. Classify disks by freshness via `listOnlineDisks` (`cmd/erasure-healing-common.go:219`) — see [§5.3](#53-listonlinedisks-and-the-etag-fallback).
 5. Classify disks by part integrity via `disksWithAllParts` (`cmd/erasure-healing-common.go:291`). This builds `dataErrsByDisk[diskIdx][partIdx]` and `dataErrsByPart[partIdx][diskIdx]`, each entry one of the six `checkPart*` codes at `cmd/storage-datatypes.go:536-544`.
 6. For each disk, call `shouldHealObjectOnDisk` (`cmd/erasure-healing.go:156`); record `outDatedDisks[i]` non-nil if the disk needs healing and set the reason in `result.Before.Drives[i].State`.
-7. Compute `disksToHealCount := len(outDatedDisks) + numUnhealthyDisks + numAbandonedParts` (`cmd/erasure-healing.go:412-420`).
+7. Accumulate `disksToHealCount` — the variable is declared as `disksToHealCount := 0` at `cmd/erasure-healing.go:374`, incremented by one (`disksToHealCount++` at `cmd/erasure-healing.go:379`) inside the per-disk loop for every disk where `shouldHealObjectOnDisk` returns `(true, reason)`, and may later be decremented (`disksToHealCount--` at `cmd/erasure-healing.go:599`) when a subsequent write-target disk fails mid-heal. It is a running counter of disks flagged for reconstruction, **not** a sum of separately-computed categories. Adjacent checks at `cmd/erasure-healing.go:407-420` handle two early-return cases: `isAllNotFound` (tombstone short-circuit, lines 407-415) and `disksToHealCount == 0` (heal-not-required short-circuit, lines 417-420).
 8. Append `madmin.HealDriveInfo` to `result.Before.Drives` and `result.After.Drives` at `cmd/erasure-healing.go:395-404` — the two slices start identical.
 9. Apply the `cannotHeal` check at `cmd/erasure-healing.go:428-456`. If it fires, delegate to `deleteIfDangling` (see [§5.5](#55-dangling-criteria-and-deleteifdangling)); otherwise proceed to reconstruction.
 10. For live objects (non-delete-marker), iterate parts and invoke `Erasure.Heal` (`cmd/erasure-decode.go:317`) to reconstruct.
@@ -115,31 +115,42 @@ This matters because the `cannotHeal` escape hatch at `cmd/erasure-healing.go:42
 `shouldHealObjectOnDisk` at `cmd/erasure-healing.go:156` is the gate that decides whether a given disk needs healing for a given object:
 
 ```go
-func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo,
-                            latestMeta FileInfo) (bool, madmin.HealItemType, error) {
-    switch {
-    case errors.Is(erErr, errFileNotFound),
-         errors.Is(erErr, errFileVersionNotFound):
-        return true, madmin.HealItemObject, erErr
-    case errors.Is(erErr, errFileCorrupt):
-        return true, madmin.HealItemObject, erErr
+// Verbatim from cmd/erasure-healing.go:156-183
+func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestMeta FileInfo) (bool, error) {
+    if errors.Is(erErr, errFileNotFound) || errors.Is(erErr, errFileVersionNotFound) || errors.Is(erErr, errFileCorrupt) {
+        return true, erErr
     }
     if erErr == nil {
-        if meta.XLV1 { return true, madmin.HealItemObject, errLegacyXLMeta }
+        if meta.XLV1 {
+            return true, errLegacyXLMeta
+        }
+        if !latestMeta.Equals(meta) {
+            return true, errOutdatedXLMeta
+        }
         if !meta.Deleted && !meta.IsRemote() {
-            if !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir {
-                return true, madmin.HealItemObject, errOutdatedXLMeta
+            for _, partErr := range partsErrs {
+                if slices.Contains([]int{
+                    checkPartFileNotFound,
+                    checkPartFileCorrupt,
+                }, partErr) {
+                    return true, errPartMissingOrCorrupt
+                }
             }
         }
-        for _, partErr := range partsErrs {
-            if partErr != checkPartSuccess && partErr != checkPartUnknown {
-                return true, madmin.HealItemObject, errPartMissingOrCorrupt
-            }
-        }
+        return false, nil
     }
-    return false, madmin.HealItemObject, nil
+    return false, erErr
 }
 ```
+
+Key structural notes on the actual code versus what a casual reader might expect:
+
+- **Return arity is two, not three.** The function returns `(bool, error)`. There is no `madmin.HealItemType` return value — the heal-item type is set separately by callers that build `HealResultItem` values (e.g., `pushHealResultItem` at `cmd/admin-heal-ops.go:618`).
+- **`errFileNotFound`, `errFileVersionNotFound`, and `errFileCorrupt` are combined in a single `errors.Is || ... || ...` expression** (line 158), not split across a `switch` with separate cases.
+- **Metadata equivalence uses a single method call** `!latestMeta.Equals(meta)` (line 167) rather than a two-field `ModTime` + `DataDir` comparison. `FileInfo.Equals` (`cmd/storage-datatypes.go`) compares the full metadata including versioning, parity layout, and the `DataDir`.
+- **Part-error screening is an inclusion list, not an exclusion list** (lines 172-175). Only `checkPartFileNotFound` (= 4) and `checkPartFileCorrupt` (= 5) trigger a heal; `checkPartDiskNotFound` (= 2) and `checkPartVolumeNotFound` (= 3) are treated as disk-level issues that do not by themselves flag a single object part as needing reconstruction, and `checkPartUnknown` (= 0) / `checkPartSuccess` (= 1) naturally do not trigger healing either.
+- **`meta.XLV1` short-circuits legacy detection** *before* the `Equals` check; legacy XLv1 objects are always rewritten to XLv2 form regardless of metadata parity.
+- **Closing `return false, erErr`** at the bottom preserves non-nil, non-matched read errors for the caller to record as a disk-level failure, rather than silently coercing to `nil`.
 
 The returned error is mapped to a user-visible drive state at `cmd/erasure-healing.go:382-393`:
 
@@ -248,8 +259,9 @@ Two key facts:
                      errErasureReadQuorum  continue
                                            │
                        ┌───────────────────▼──────────────────┐
-                       │ disksToHealCount = outdated +         │
-                       │ unhealthy + abandonedParts            │
+                       │ disksToHealCount: loop counter        │
+                       │ ++ per shouldHealObjectOnDisk==true   │
+                       │ (:374 init, :379 ++, :599 --)         │
                        └───────────────────┬──────────────────┘
                                            │
                               ┌────────────▼───────────┐
@@ -348,28 +360,28 @@ There are exactly three terminal outcomes after the quorum check succeeds:
 
 ## 8. Q3 — What `HealResultItem` Reveals
 
-### 8.1 The Emitted Structure
+### 8.1 Two Distinct JSON Formats
 
-Defined in `madmin-go/v3` (`github.com/minio/madmin-go/v3/heal-commands.go`). Streaming format from `mc admin heal --json` — one JSON object per line.
+The healing output visible to the operator depends on *which* surface they are reading. There are two subtly different JSON shapes in play, and conflating them leads to broken log-parsing scripts. Both are documented here so operators can target whichever format their tooling consumes.
+
+**Format A — Raw `madmin-go/v3` `HealResultItem` (server-side, library-serialized).**
+
+This is what the server emits over the admin heal HTTP stream and what Go programs that link against `madmin-go/v3` decode directly. It is defined by the `HealResultItem` struct at `github.com/minio/madmin-go/v3/heal-commands.go`. The `Before`/`After` aggregate contains only a `Drives` array — there are **no** aggregated counts or colour fields baked into the raw struct.
 
 ```jsonc
+// Raw HealResultItem (madmin-go serialization)
 {
-  "resultId": 0,
-  "type": "object",
-  "bucket": "heal-test",
-  "object": "heal-test-obj1",
-  "versionId": "",
-  "detail": "",                // populated for dangling/skip/error cases
+  "resultId":     0,
+  "type":         "object",
+  "bucket":       "heal-test",
+  "object":       "heal-test-obj1",
+  "versionId":    "",
+  "detail":       "",            // populated for dangling/skip/error cases
   "parityBlocks": 2,
-  "dataBlocks": 2,
-  "diskCount": 4,
-  "setCount": 1,
+  "dataBlocks":   2,
+  "diskCount":    4,
+  "setCount":     1,
   "before": {
-    "color": "yellow",         // green | yellow | red | grey
-    "offline": 0,
-    "online": 4,               // *reachability*, not *freshness*
-    "missing": 1,              // non-zero = heal needed
-    "corrupted": 0,
     "drives": [
       { "uuid": "...", "endpoint": "/tmp/.../disk1", "state": "missing" },
       { "uuid": "...", "endpoint": "/tmp/.../disk2", "state": "ok" },
@@ -377,10 +389,38 @@ Defined in `madmin-go/v3` (`github.com/minio/madmin-go/v3/heal-commands.go`). St
       { "uuid": "...", "endpoint": "/tmp/.../disk4", "state": "ok" }
     ]
   },
-  "after": { /* same shape; reconstruction result encoded in drive states */ },
+  "after": { "drives": [ /* same shape; reconstruction result encoded per drive */ ] },
   "objectSize": 1048576
 }
 ```
+
+**Format B — `mc admin heal --json` wrapper (client-side, `healRec`).**
+
+When the operator runs the `mc admin heal --json` CLI, the client wraps each `HealResultItem` in a `healRec` struct (`mc/cmd/admin-heal-ui.go`) and derives aggregate counts (`online`, `offline`, `missing`, `corrupted`) and a `color` field (`green`/`yellow`/`red`/`grey`) from the per-drive `State` values via `HealDriveInfo` helpers `GetOnlineCounts`, `GetOfflineCounts`, `GetMissingCounts`, `GetCorruptedCounts`. The wrapper strips the raw `HealResultItem` identity fields (`resultId`, `bucket`, `object`, `versionId`, `detail`, `parityBlocks`, `dataBlocks`, `diskCount`, `setCount`, `objectSize`) — they are not part of the wrapper JSON.
+
+```jsonc
+// mc admin heal --json wrapper (healRec serialization)
+{
+  "before": {
+    "color":     "yellow",       // green | yellow | red | grey (derived by mc)
+    "offline":   0,              // count derived by HealDriveInfo.GetOfflineCounts
+    "online":    4,              // count derived by HealDriveInfo.GetOnlineCounts
+    "missing":   1,              // count derived by HealDriveInfo.GetMissingCounts
+    "corrupted": 0,              // count derived by HealDriveInfo.GetCorruptedCounts
+    "drives": [
+      { "uuid": "...", "endpoint": "/tmp/.../disk1", "state": "missing" },
+      { "uuid": "...", "endpoint": "/tmp/.../disk2", "state": "ok" },
+      { "uuid": "...", "endpoint": "/tmp/.../disk3", "state": "ok" },
+      { "uuid": "...", "endpoint": "/tmp/.../disk4", "state": "ok" }
+    ]
+  },
+  "after": { /* same wrapper shape; color/counts recomputed from drive states */ }
+}
+```
+
+**Choose your consumer carefully.** Scripts that parse the admin HTTP stream or use `madmin-go` directly will see Format A. Scripts that parse `mc admin heal --json` stdout will see Format B. The two are not interchangeable, and the field sets only partially overlap (both contain `before.drives`/`after.drives` with identical `HealDriveInfo` shape; everything else differs).
+
+In the scenario captures in [§12](#12-six-scenarios-with-runtime-json) that include `color`/`online`/`offline`/`missing`/`corrupted`, the JSON shown corresponds to Format B (`mc admin heal --json`); the identity and layout fields shown there (`resultId`, `bucket`, etc.) are presented for clarity alongside the wrapper output and are *not* part of the raw `healRec` payload.
 
 ### 8.2 Per-Drive State Semantics
 
@@ -393,7 +433,7 @@ The `state` field in each `HealDriveInfo` is populated from the nine `DriveState
 | `DriveStateCorrupt` | `"corrupt"` | `xl.meta` unreadable with non-actionable error (the `default` branch of the switch) | Still `"corrupt"`; heal couldn't proceed | `cmd/erasure-healing.go:392` |
 | `DriveStateOffline` | `"offline"` | Disk unreachable (`errDiskNotFound`) | Still `"offline"` — heal has no way to write there | `cmd/erasure-healing.go:388` |
 | `DriveStatePermission` | `"permission-denied"` | Filesystem returned EACCES on `xl.meta` read — classified as non-actionable (criterion #3 dangling safety valve) | Cleared to `"ok"` only if the fault self-resolved mid-heal | `madmin-go/v3/heal-commands.go:124`; set by storage layer when a `StorageAPI` call surfaces a permission error |
-| `DriveStateFaulty` | `"faulty"` | Disk marked faulty by the health-check probe (I/O error floor exceeded) | Still `"faulty"` until operator replaces the disk | `madmin-go/v3/heal-commands.go:125`; set by `cmd/storage-rest-common.go` health cycle |
+| `DriveStateFaulty` | `"faulty"` | Disk marked faulty by the health-check probe (I/O error floor exceeded) | Still `"faulty"` until operator replaces the disk | `madmin-go/v3/heal-commands.go:125`; set by `cmd/erasure.go:109` (`diskErrToDriveState` `case errors.Is(err, errFaultyDisk)`) when a disk health check surfaces `errFaultyDisk` |
 | `DriveStateRootMount` | `"root-mount"` | Drive is the OS root filesystem — disallowed for object storage per `cmd/xl-storage.go` root-disk guard | Never transitions during heal; operator must remount on a dedicated block device | `madmin-go/v3/heal-commands.go:126` |
 | `DriveStateUnknown` | `"unknown"` | State could not be determined (e.g., RPC timeout from a peer) | Same — never resolved by heal alone | `madmin-go/v3/heal-commands.go:127` |
 | `DriveStateUnformatted` | `"unformatted"` | Disk present but has no `format.json` yet — newly added, awaiting format | Transitions to `"ok"` once `initBackgroundHealing` plus `format.json` write complete | `madmin-go/v3/heal-commands.go:128` (comment: "only returned by disk") |
@@ -415,7 +455,7 @@ The transition `before.color=yellow → after.color=green` is the unambiguous "h
 
 ### 8.4 Dangling-Purge JSON Signature
 
-When the healer purges a dangling object, the returned `HealResultItem` is crafted by `defaultHealResult` (`cmd/erasure-healing.go:744`) with `After.Drives[i].State = missing` on all disks (the data is gone from each) and `detail` populated by the error message. For a three-of-four metadata loss with a live object:
+When the healer purges a dangling object, the returned `HealResultItem` is crafted by `defaultHealResult` (`cmd/erasure-healing.go:787`) with `After.Drives[i].State = missing` on all disks (the data is gone from each) and `detail` populated by the error message. For a three-of-four metadata loss with a live object:
 
 ```jsonc
 {
@@ -533,8 +573,8 @@ Four errors can appear when healing cannot recover:
 |---|---|---|---|
 | `errErasureReadQuorum` | `cmd/erasure-errors.go:23` | `"Read failed. Insufficient number of drives online"` | Metadata quorum lost — can't even start |
 | `errErasureWriteQuorum` | `cmd/erasure-errors.go:26` | `"Write failed. Insufficient number of drives online"` | Reconstruction started but can't land writes on enough disks |
-| `errFileNotFound` → surfaced as `NoSuchKey` | `cmd/errors.go` via `toObjectErr` | `"The specified key does not exist"` | Post-dangling purge: object was deleted by the healer |
-| `errNoHealRequired` | `cmd/erasure-errors.go:29` | `"no heal required"` | No-op: object is already green |
+| `errFileNotFound` → surfaced as `NoSuchKey` | `cmd/object-api-errors.go:30` via `toObjectErr` (matches `errFileNotFound.Error()` at `cmd/object-api-errors.go:104`) | `"The specified key does not exist"` | Post-dangling purge: object was deleted by the healer |
+| `errNoHealRequired` | `cmd/erasure-errors.go:29` | `"No healing is required"` | No-op: object is already green |
 
 For EC(2,2), losing 3-of-4 disks produces `errErasureReadQuorum` on the failing-to-reconstruct path, and post-purge the object returns `NoSuchKey` on subsequent GETs.
 
@@ -589,7 +629,7 @@ Note: no `OperationType` field. The struct is agnostic to whether the original a
 | Property | Value | Source |
 |---|---|---|
 | Channel capacity | 100,000 | `cmd/mrf.go:39` (`mrfOpsQueueSize`) |
-| Type | `chan PartialOperation` | `cmd/mrf.go:72` (`opCh` field on `mrfState`) |
+| Type | `chan PartialOperation` | `cmd/mrf.go:64` (`opCh` field on `mrfState`) |
 | Enqueue behavior | Non-blocking (`select { case opCh <- op: default: }`) | `cmd/mrf.go:95-98` |
 | Persistence on shutdown | msgpack-serialized to `<minioMetaBucket>/.heal/mrf/list.bin` | `cmd/mrf.go:102` (`shutdown`) |
 | Load on startup | Yes, via `startMRFPersistence` | `cmd/mrf.go:155` |
@@ -598,22 +638,77 @@ Note: no `OperationType` field. The struct is agnostic to whether the original a
 
 ### 11.4 Consumer Dispatch
 
-`healRoutine` (`cmd/mrf.go:220`) drains `opCh` and invokes `HealObject` for each entry. A key branch inside:
+`healRoutine` (`cmd/mrf.go:220`) drains `opCh` and dispatches heal work. The actual body is more elaborate than a naked `HealObject` call — it performs path filtering, a reconnect delay, and rate-limited scan-mode dispatch before branching on operation kind.
+
+Verbatim structure (`cmd/mrf.go:220-283`):
 
 ```go
-if len(op.Versions) > 0 {
-    // multi-version operation — heal each version in the Versions blob
-} else if op.VersionID != "" {
-    // single specific version
-} else {
-    // unversioned heal
+func (m *mrfState) healRoutine(z *erasureServerPools) {
+    for {
+        select {
+        case <-GlobalContext.Done():
+            return
+        case u, ok := <-m.opCh:
+            if !ok {
+                return
+            }
+
+            // 1) .minio.sys internal-path filter — skip ephemeral scratch
+            if u.Bucket == minioMetaBucket {
+                if wildcard.Match("buckets/*/.metacache/*", u.Object) { continue }
+                if wildcard.Match("tmp/*",                u.Object) { continue }
+                if wildcard.Match("multipart/*",          u.Object) { continue }
+                if wildcard.Match("tmp-old/*",            u.Object) { continue }
+            }
+
+            // 2) Reconnect grace: if this op was queued <1s ago, sleep 1s
+            now := time.Now()
+            if now.Sub(u.Queued) < time.Second {
+                time.Sleep(time.Second)
+            }
+
+            // 3) Rate limiting from healSleeper (cmd/background-heal-ops.go)
+            wait := healSleeper.Timer(context.Background())
+
+            // 4) Scan mode: deep if the queuer asked for bitrot scan
+            scan := madmin.HealNormalScan
+            if u.BitrotScan {
+                scan = madmin.HealDeepScan
+            }
+
+            // 5) Three-way dispatch based on PartialOperation shape
+            if u.Object == "" {
+                healBucket(u.Bucket, scan)                                       // (a) bucket-level heal
+            } else {
+                if len(u.Versions) > 0 {
+                    vers := len(u.Versions) / 16
+                    if vers > 0 {
+                        for i := 0; i < vers; i++ {
+                            healObject(u.Bucket, u.Object,
+                                uuid.UUID(u.Versions[16*i:]).String(), scan)    // (b) multi-version heal
+                        }
+                    }
+                } else {
+                    healObject(u.Bucket, u.Object, u.VersionID, scan)           // (c) single heal, VersionID may be ""
+                }
+            }
+
+            wait()
+        }
+    }
 }
 ```
 
-The consumer does not distinguish PUT-origin from DELETE-origin entries. It just invokes `HealObject`, and the state of the surviving `xl.meta` at that moment dictates what convergence looks like:
+Key dispatch facts (often misread):
 
-- If the surviving meta has `Deleted=false` (live object) — `HealObject` converges to "reconstruct data on the lagging disks".
-- If the surviving meta has `Deleted=true` (delete marker) — `HealObject` converges to "propagate delete marker to all disks".
+- **Branch (a) — bucket healing** fires when `u.Object == ""`. The partial operation was queued for a bucket-level fault (e.g., `MakeBucket` that failed on one pool). There is no `Object` involved, and `healBucket` rebuilds bucket metadata across disks. This branch is completely absent from any naïve two-way `VersionID != ""` dispatch diagram.
+- **Branch (b) — multi-version heal** fires when `len(u.Versions) > 0`. `Versions` is a packed 16-byte-per-UUID blob (used by multi-delete partial operations). The loop divides the length by 16 to extract each UUID and calls `healObject` per version. `u.VersionID` is **not** consulted in this branch.
+- **Branch (c) — single heal** fires otherwise. It calls `healObject(u.Bucket, u.Object, u.VersionID, scan)` **unconditionally** — there is no `u.VersionID != ""` guard. An empty `VersionID` here means "heal the unversioned/latest view of the object", which is the correct semantics for bucket-unversioned workloads.
+
+The consumer does not distinguish PUT-origin from DELETE-origin entries. It just invokes `healObject`/`healBucket`, and the state of the surviving `xl.meta` at that moment dictates what convergence looks like:
+
+- If the surviving meta has `Deleted=false` (live object) — `healObject` converges to "reconstruct data on the lagging disks".
+- If the surviving meta has `Deleted=true` (delete marker) — `healObject` converges to "propagate delete marker to all disks".
 - If `isObjectDangling` returns `true` — purge from all disks.
 
 ### 11.5 Where Write vs Delete Diverges (Inside `isObjectDangling`)
@@ -903,7 +998,7 @@ See [§5.5](#55-dangling-criteria-and-deleteifdangling) for the full table. Summ
 
 | Outcome | Sentinel | Line | Surface message |
 |---|---|---|---|
-| No damage | `errNoHealRequired` | `cmd/erasure-errors.go:29` | `"no heal required"` |
+| No damage | `errNoHealRequired` | `cmd/erasure-errors.go:29` | `"No healing is required"` |
 | Can't meet read quorum | `errErasureReadQuorum` | `cmd/erasure-errors.go:23` | `"Read failed. Insufficient number of drives online"` |
 | Can't meet write quorum | `errErasureWriteQuorum` | `cmd/erasure-errors.go:26` | `"Write failed. Insufficient number of drives online"` |
 | Post-purge GET | via `toObjectErr(errFileNotFound, ...)` | — | `NoSuchKey` / 404 |
@@ -1107,13 +1202,13 @@ Paths are relative to the repository root. All citations target commit `c07e5b49
 | `cmd/erasure-heal_test.go` | `erasureHealTests` table (:29-63, 20 rows across `dataBlocks`, `disks`, `offDisks`, `badDisks`, `badStaleDisks`, `blocksize`, `size`, `algorithm`, `shouldFail`); `TestErasureHeal` driver (:65-157); representative EC(2,2) rows 0, 11, 16, 19 enumerated in [§13.8](#138-cmderasure-heal_testgo-representative-test-matrix) |
 | `cmd/erasure-healing-common.go` | `listOnlineDisks` (:219) with narrow ETag fallback; `disksWithAllParts` (:291); 5-state disk taxonomy |
 | `cmd/erasure-healing-common_test.go` | `TestListOnlineDisks`, `TestDisksWithAllParts`, `TestCommonParities` |
-| `cmd/erasure-healing.go` | `shouldHealObjectOnDisk` (:156); `auditHealObject` (:221); `healObject` (:258); drive-state mapping (:382-393); `Before.Drives` append (:395-399); `After.Drives` append (:400-404); `cannotHeal` check (:428); cannot-heal branch (:435-456); `After.Drives[i].State = ok` (:651); `checkAbandonedParts` (:659+); `healObjectDir` (:696); `defaultHealResult` (:744+); `healingLogOnceIf` sites (:477, :487, :497); `isObjectDangling` standalone function (:968-1033); `HealObject` public API (:1039); deep-scan auto-escalation (:1080-1085); `healTrace` (:1090-1115) |
+| `cmd/erasure-healing.go` | `shouldHealObjectOnDisk` (:156); `auditHealObject` (:221); `healObject` (:258); drive-state mapping (:382-393); `Before.Drives` append (:395-399); `After.Drives` append (:400-404); `cannotHeal` check (:428); cannot-heal branch (:435-456); `After.Drives[i].State = ok` (:651); `checkAbandonedParts` (:659+); `healObjectDir` (:696); `defaultHealResult` (:787); `healingLogOnceIf` sites (:477, :487, :497); `isObjectDangling` standalone function (:968-1033); `HealObject` public API (:1039); deep-scan auto-escalation (:1080-1085); `healTrace` (:1090-1115) |
 | `cmd/erasure-healing_test.go` | `TestIsObjectDangling` with 12+ sub-tests covering criteria 1–6 |
 | `cmd/erasure-metadata-utils.go` | `reduceErrs`, `reduceQuorumErrs`, `reduceReadQuorumErrs`, `reduceWriteQuorumErrs`, `readAllFileInfo`, `shuffleDisksAndPartsMetadataByIndex` |
 | `cmd/erasure-metadata.go` | `pickValidFileInfo`; `findFileInfoInQuorum`; `commonParity`; `objectQuorumFromMeta` (:531) |
 | `cmd/erasure-object.go` | MRF enqueue sites (:400 read-repair, :805 GetObjectInfo, :1578 PutObject, :2113 DeleteObject); `deleteIfDangling` method (:482); call site from `cannotHeal` branch (at healing.go:438); `runtime.Caller(1)` (:526); deferred `auditDanglingObjectDeletion` (:531); `isObjectDangling` call (:483) |
 | `cmd/global-heal.go` | `newBgHealSequence` with `Remove: healDeleteDangling`; `healErasureSet` (:152); parallel orchestration |
-| `cmd/mrf.go` | `mrfOpsQueueSize=100000` (:39); `PartialOperation` struct (:51-63); `opCh` field (:72); `addPartialOp` (:78); `shutdown` msgpack persistence (:102); `startMRFPersistence` (:155); `healRoutine` consumer (:220) |
+| `cmd/mrf.go` | `mrfOpsQueueSize=100000` (:39); `PartialOperation` struct (:51-63); `opCh` field on `mrfState` (:64); `addPartialOp` (:78); `shutdown` msgpack persistence (:102); `startMRFPersistence` (:155); `healRoutine` consumer (:220) |
 | `cmd/storage-datatypes.go` | `checkPart*` constants (:536-544): `checkPartUnknown=0, checkPartSuccess=1, checkPartDiskNotFound=2, checkPartVolumeNotFound=3, checkPartFileNotFound=4, checkPartFileCorrupt=5` |
 | `cmd/xl-storage.go` | `CheckParts` (:2406, size-only normal-scan check); `VerifyFile` (:3097, deep-scan HighwayHash bitrot verification) |
 | `go.mod` | `go 1.23`; `madmin-go/v3 v3.0.77`; `minio-go/v7 v7.0.80`; `reedsolomon v1.12.4`; `highwayhash v1.0.3` |
@@ -1195,9 +1290,10 @@ Every JSON block in [§12](#12-six-scenarios-with-runtime-json) is a captured em
                                     (cmd/erasure-healing.go:156)
                                                │
                                                ▼
-                              disksToHealCount = outdated
-                                                 + unhealthy
-                                                 + abandonedParts
+                              disksToHealCount: counter
+                                                 ++ per disk where
+                                                 shouldHealObjectOnDisk
+                                                 returned true (:374,:379)
                                                │
                                                ▼
                                ┌─────────────────────────────┐
@@ -1374,7 +1470,7 @@ The default is normal scan. Silent bitrot — same size, different content — i
 
 ### D.5. The Same Queue Handles Write Failures and Delete Failures
 
-`globalMRFState.opCh` at `cmd/mrf.go:72` is a unified channel. `PartialOperation` has no `OperationType` field. The only "hint" about the original intent is `validMeta.Deleted` on the surviving xl.meta, which `isObjectDangling` uses (criterion #4 at `cmd/erasure-healing.go:1012-1017`) to choose between meta-republish convergence (delete marker) and data-rebuild convergence (live object).
+`globalMRFState.opCh` at `cmd/mrf.go:64` is a unified channel. `PartialOperation` has no `OperationType` field. The only "hint" about the original intent is `validMeta.Deleted` on the surviving xl.meta, which `isObjectDangling` uses (criterion #4 at `cmd/erasure-healing.go:1012-1017`) to choose between meta-republish convergence (delete marker) and data-rebuild convergence (live object).
 
 ### D.6. `After.Drives` Reflects Terminal State, Not Intermediate Steps
 
