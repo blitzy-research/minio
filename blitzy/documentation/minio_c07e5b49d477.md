@@ -403,10 +403,10 @@ When the operator runs the `mc admin heal --json` CLI, the client wraps each `He
 {
   "before": {
     "color":     "yellow",       // green | yellow | red | grey (derived by mc)
-    "offline":   0,              // count derived by HealDriveInfo.GetOfflineCounts
-    "online":    4,              // count derived by HealDriveInfo.GetOnlineCounts
-    "missing":   1,              // count derived by HealDriveInfo.GetMissingCounts
-    "corrupted": 0,              // count derived by HealDriveInfo.GetCorruptedCounts
+    "offline":   0,              // count of drives with state=="offline" (GetOfflineCounts)
+    "online":    3,              // count of drives with state=="ok" ONLY (GetOnlineCounts)
+    "missing":   1,              // count of drives with state=="missing" (GetMissingCounts)
+    "corrupted": 0,              // count of drives with state=="corrupt" (GetCorruptedCounts)
     "drives": [
       { "uuid": "...", "endpoint": "/tmp/.../disk1", "state": "missing" },
       { "uuid": "...", "endpoint": "/tmp/.../disk2", "state": "ok" },
@@ -417,6 +417,8 @@ When the operator runs the `mc admin heal --json` CLI, the client wraps each `He
   "after": { /* same wrapper shape; color/counts recomputed from drive states */ }
 }
 ```
+
+**Important:** Each aggregate is the count of drives whose `state` equals that single state string — `online` counts only `ok`, `missing` counts only `missing`, etc. `online + missing + offline + corrupted` does **not** necessarily equal `diskCount`; the five additional states (`permission-denied`, `faulty`, `root-mount`, `unknown`, `unformatted`) contribute to none of the four aggregates. Tooling that assumes `online + missing + offline + corrupted == diskCount` will break on drives that enter those edge-case states. In the example above, 3 drives are `ok` → `online == 3`, 1 drive is `missing` → `missing == 1`, nothing else → `offline == 0`, `corrupted == 0`; the sum happens to be `4 == diskCount` because no edge-case states are in play.
 
 **Choose your consumer carefully.** Scripts that parse the admin HTTP stream or use `madmin-go` directly will see Format A. Scripts that parse `mc admin heal --json` stdout will see Format B. The two are not interchangeable, and the field sets only partially overlap (both contain `before.drives`/`after.drives` with identical `HealDriveInfo` shape; everything else differs).
 
@@ -451,13 +453,20 @@ The `color` field summarizes the 4-drive state:
 - `red` — more than `ParityBlocks` disks in non-ok state (dangling territory)
 - `grey` — heal result is a skip/no-op
 
-The transition `before.color=yellow → after.color=green` is the unambiguous "healing worked" signature. `red → green` is "barely healed — all 4 disks came back". `red → red` + `detail: "object is dangling"` is the purge signature.
+The transition `before.color=yellow → after.color=green` is the unambiguous "healing worked" signature. `red → green` is "barely healed — all 4 disks came back". The **purge signature** differs by consumer:
+
+- **Format A (server-side)**: `before.color=red` → `after.color=red` with `detail` carrying the `toObjectErr`-translated sentinel text (e.g., `"Read failed. Insufficient number of drives online"`). See the conceptual example in [§8.4](#84-dangling-purge-json-signature).
+- **Format B (mc stdout)**: The **null-drives** pattern — `drives: null`, `color: ""`, all counts zero, `name: "/"`, `error: "Invalid parity shard count/surplus shard count given: ..."`, `detail: "Object not found: <bucket>/<object>"`. See [§12.3](#123-scenario-c--three-disks-missing-beyond-parity-dangling-purge) for the captured NDJSON.
+
+No literal string `"object is dangling"` is emitted in either form — the dangling decision is inferred from the aggregate shape, not a dedicated marker.
 
 ### 8.4 Dangling-Purge JSON Signature
 
-When the healer purges a dangling object, the returned `HealResultItem` is crafted by `defaultHealResult` (`cmd/erasure-healing.go:787`) with `After.Drives[i].State = missing` on all disks (the data is gone from each) and `detail` populated by the error message. For a three-of-four metadata loss with a live object:
+When the healer purges a dangling object, the server-side `HealResultItem` is crafted by `defaultHealResult` (`cmd/erasure-healing.go:787-800`) with `After.Drives[i].State = missing` on all disks (the data is gone from each) and `detail` populated by the internal error message. For a three-of-four metadata loss with a live object, the conceptual server-side (Format A) view is:
 
 ```jsonc
+// Conceptual Format A (server-side madmin-go view, NOT mc stdout).
+// This is what a direct admin-API client observes pre-purge.
 {
   "type": "object",
   "detail": "Read failed. Insufficient number of drives online",
@@ -465,6 +474,8 @@ When the healer purges a dangling object, the returned `HealResultItem` is craft
   "after":  { "color": "red", "missing": 3, ... }   // no reconstruction occurred
 }
 ```
+
+The string `"Read failed. Insufficient number of drives online"` is the human-readable form of the server sentinel `errErasureReadQuorum` at `cmd/erasure-errors.go:23`. **It does not surface in `mc admin heal --json` stdout.** When mc is the consumer, the same dangling-purge decision is signaled via the **null-drives Format B signature**: a zeroed `HealResultItem` is passed through mc's `getObjectHCCChange` → `getHColCode` formatter (at `cmd/admin-heal-result-item.go:42-48` and `cmd/admin-heal-ui.go:55`), which emits the pair `{"error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0", "detail":"Object not found: <bucket>/<object>"}` with `drives: null`, `color: ""`, all counts zero, and `name: "/"`. See §12.3 for the verbatim mc output and step-by-step mechanics. The server-side JSON above and the mc NDJSON in §12.3 are two presentations of the same underlying decision.
 
 If the scan is followed by a `ListObjects`, the purged object is absent — the dangling logic deleted it on all disks.
 
@@ -490,7 +501,13 @@ Healer decisions surface on **five log channels**:
 
 ### 9.1 The Admin Heal Stream (Primary Signal)
 
-This is the emission captured in [§12](#12-six-scenarios-with-runtime-json). The `detail` string is populated from `toObjectErr` conversions and becomes human-readable for terminal failures (`"Read failed. Insufficient number of drives online"`, `"Write failed. Insufficient number of drives online"`, etc.).
+This is the channel whose output is rendered in [§12](#12-six-scenarios-with-runtime-json). Two distinct string fields appear on failure paths, and it is essential to distinguish them:
+
+- **Server-side `toObjectErr` translations.** Internally, `cmd/api-errors.go:toObjectErr` converts low-level error sentinels into human-readable messages such as `"Read failed. Insufficient number of drives online"` (from `errErasureReadQuorum`) and `"Write failed. Insufficient number of drives online"` (from `errErasureWriteQuorum`). These strings are embedded in the `APIError` structure returned from the admin handler.
+- **mc-side `detail` / `error` strings.** When `mc admin heal --json` receives such an API error for an irrecoverable object (see [§12.3](#123-scenario-c--three-disks-missing-beyond-parity-dangling-purge)), the body mc prints to stdout contains `"Object not found: <bucket>/<object>"` in `detail` and `"Invalid parity shard count/surplus shard count given: ..."` in `error`. The `errErasureReadQuorum` sentinel does **not** surface verbatim through the mc path for dangling-purge terminals.
+- **For healable objects**, mc's emission carries `detail: ""` (empty) and no `error` field at all — the `before`/`after` aggregates and per-drive `state` strings are the only decision evidence (see [§12.1](#121-scenario-a--one-disk-missing-yellow--green)).
+
+The `detail` string is therefore a server-side concept. Whether it reaches the mc stdout verbatim depends on both the terminal nature of the error and the mc renderer's own error-formatting pipeline. Operators who want to see `"Read failed. Insufficient..."` verbatim must either (a) query the admin API directly with a Go client that parses the raw `APIError`, or (b) consult the admin session log (`mc admin trace`) or the MinIO server log.
 
 ### 9.2 Dangling Deletion Audit
 
@@ -530,7 +547,7 @@ All three sites return the same error, refuse to heal, and log via `healingLogOn
 MinIO does **not** ship a per-decision explanatory log (e.g., "criterion #5 matched because notFoundMetaErrs=3 > ParityBlocks=2"). Operators must reconstruct the decision from:
 
 1. `before`/`after` drive states in the heal JSON ([§8](#8-q3--what-healresultitem-reveals))
-2. The `detail` string on failures
+2. The `detail`/`error` strings on failures — noting the server-side vs mc-side distinction explained in [§9.1](#91-the-admin-heal-stream-primary-signal)
 3. The audit defer (for purges)
 4. The internal error-path log (for manual-tampering detection)
 
@@ -753,6 +770,14 @@ All scenarios use a 4-disk EC(2,2) single-set MinIO at commit `c07e5b49d477`. Th
 6. Invoke heal: `mc admin heal --json --recursive local/heal-test`
 7. Capture `HealResultItem` lines
 
+> **Reading guide for the JSON in this section.**
+>
+> 1. **Streamed NDJSON.** Every `mc admin heal --json` invocation emits a stream of newline-delimited JSON records: one record with `"type": "bucket"` (the bucket-level entry), one record per object or object version with `"type": "object"`, and a final record with `"type": "summary"`. The blocks below show the **object-level record only** (the diagnostic line); the bucket and summary records are elided except where noted (e.g. §12.3).
+> 2. **Format B is the mc wrapper.** The `{type, name, size}` / `{before, after}` / `{color, online, offline, missing, corrupted, drives}` shape is the **mc wrapper (Format B)** defined in §8.1. Direct callers of the server-side admin API receive the underlying `madmin-go` `HealResultItem` (Format A) directly; Format A has `{bucket, object, parityBlocks, dataBlocks, diskCount, setCount, objectSize, versionId}` identity fields that mc does not forward.
+> 3. **Hybrid presentation.** For pedagogical continuity — so that a reader can see in one block both *what mc prints* and *which object it refers to* — some blocks below augment the literal mc Format B output with Format A identity fields (`bucket`, `object`, `parityBlocks`, `dataBlocks`, `diskCount`, `setCount`, `objectSize`, `versionId`, `resultId`). Any field in that list is **not** part of mc's NDJSON stream; it is inserted here for clarity (see §16.4 for provenance). Conversely, `name`, `size`, and the Format B `color`/`online`/`missing`/`corrupted`/`offline` aggregates at the `before`/`after` level **are** mc-emitted exactly as shown.
+> 4. **Drive entry abbreviation.** Drive-array entries may be shown as `{ "state": "ok" }` or `{ "endpoint": ".../diskN", "state": "ok" }` for brevity. In the actual stream each element also carries `"uuid": ""` (empty in standalone mode) and a fully-qualified `endpoint` path (e.g. `"/tmp/minio-heal-experiments/disk1"`). Abbreviation is cosmetic; the decision logic is unaffected.
+> 5. **Aggregate counts are state-filtered.** `online` counts drives with `state=="ok"` only. `missing`, `offline`, `corrupted` each count their respective states only. The four aggregates need not sum to `diskCount`; states like `permission-denied`, `faulty`, `root-mount`, `unknown`, `unformatted` count against none of them. See `madmin-go/v3/heal-commands.go` functions `GetOnlineCounts`, `GetMissingCounts`, `GetOfflineCounts`, `GetCorruptedCounts`.
+
 ### 12.1 Scenario A — One Disk Missing (yellow → green)
 
 **Setup:** Delete `disk1/heal-test/heal-test-obj1/` entirely. 3/4 disks intact.
@@ -763,7 +788,7 @@ All scenarios use a 4-disk EC(2,2) single-set MinIO at commit `c07e5b49d477`. Th
   "bucket": "heal-test", "object": "heal-test-obj1",
   "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
   "before": {
-    "color": "yellow", "offline": 0, "online": 4, "missing": 1, "corrupted": 0,
+    "color": "yellow", "offline": 0, "online": 3, "missing": 1, "corrupted": 0,
     "drives": [
       { "endpoint": ".../disk1", "state": "missing" },
       { "endpoint": ".../disk2", "state": "ok" },
@@ -784,7 +809,7 @@ All scenarios use a 4-disk EC(2,2) single-set MinIO at commit `c07e5b49d477`. Th
 }
 ```
 
-**Analysis:** `disksToHealCount=1 ≤ 2=ParityBlocks` → reconstruct. Reed-Solomon uses the 3 intact shards to compute the missing one; `RenameData` promotes it on disk1; `After.Drives[0].State` is flipped to `ok` at `cmd/erasure-healing.go:651`. Aggregate color transitions yellow→green.
+**Analysis:** `disksToHealCount=1 ≤ 2=ParityBlocks` → reconstruct. Reed-Solomon uses the 3 intact shards to compute the missing one; `RenameData` promotes it on disk1; `After.Drives[0].State` is flipped to `ok` at `cmd/erasure-healing.go:651`. Aggregate color transitions yellow→green. The `before.online` count is `3`, not `4`, because `online` filters to `state=="ok"` only (see `madmin-go/v3/heal-commands.go:222-230`, function `GetOnlineCounts`), and one drive is in state `"missing"` before heal.
 
 ### 12.2 Scenario B — Two Disks Missing (at Parity Boundary, red → green)
 
@@ -796,7 +821,7 @@ All scenarios use a 4-disk EC(2,2) single-set MinIO at commit `c07e5b49d477`. Th
   "bucket": "heal-test", "object": "heal-test-obj2",
   "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
   "before": {
-    "color": "red", "offline": 0, "online": 4, "missing": 2, "corrupted": 0,
+    "color": "red", "offline": 0, "online": 2, "missing": 2, "corrupted": 0,
     "drives": [
       { "endpoint": ".../disk1", "state": "missing" },
       { "endpoint": ".../disk2", "state": "missing" },
@@ -812,51 +837,80 @@ All scenarios use a 4-disk EC(2,2) single-set MinIO at commit `c07e5b49d477`. Th
       { "endpoint": ".../disk3", "state": "ok" },
       { "endpoint": ".../disk4", "state": "ok" }
     ]
-  }
+  },
+  "objectSize": 1048576
 }
 ```
 
-**Analysis:** `disksToHealCount=2 ≤ 2=ParityBlocks` (equality is OK). Reed-Solomon has exactly `k=2` shards — the minimum. Reconstruction succeeds. Before-color `red` because `missing > ParityBlocks` is the aggregate-color threshold — but the decision-layer threshold is `>`, not `≥`, so reconstruction still proceeds. The `red → green` transition is the diagnostic "at the floor, fully recovered" signature.
+**Analysis:** `disksToHealCount=2 ≤ 2=ParityBlocks` (equality is OK). Reed-Solomon has exactly `k=2` shards — the minimum. Reconstruction succeeds. Before-color `red` because `missing > ParityBlocks` is the aggregate-color threshold — but the decision-layer threshold is `>`, not `≥`, so reconstruction still proceeds. The `red → green` transition is the diagnostic "at the floor, fully recovered" signature. Before-aggregate `online=2` reflects the two remaining `ok` drives (disk3, disk4); `missing=2` captures disk1 and disk2.
 
 ### 12.3 Scenario C — Three Disks Missing (Beyond Parity, Dangling Purge)
 
 **Setup:** Delete `disk1`, `disk2`, `disk3` copies of `heal-test-obj3`. 1/4 disks intact.
 
-```jsonc
-{
-  "resultId": 3, "type": "object",
-  "bucket": "heal-test", "object": "heal-test-obj3",
-  "detail": "Read failed. Insufficient number of drives online",
-  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
-  "before": {
-    "color": "red", "offline": 0, "online": 4, "missing": 3, "corrupted": 0,
-    "drives": [
-      { "endpoint": ".../disk1", "state": "missing" },
-      { "endpoint": ".../disk2", "state": "missing" },
-      { "endpoint": ".../disk3", "state": "missing" },
-      { "endpoint": ".../disk4", "state": "ok" }
-    ]
-  },
-  "after": {
-    "color": "red", "offline": 0, "online": 4, "missing": 3, "corrupted": 0,
-    "drives": [
-      { "endpoint": ".../disk1", "state": "missing" },
-      { "endpoint": ".../disk2", "state": "missing" },
-      { "endpoint": ".../disk3", "state": "missing" },
-      { "endpoint": ".../disk4", "state": "missing" }
-    ]
-  }
-}
+**Actual mc emission** (three NDJSON records, verbatim). The bucket-level line is always green (bucket metadata is untouched); the object-level line is the diagnostic one:
+
+```json
+{"status":"success","type":"bucket","name":"heal-test/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"size":0}
+{"status":"success","error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0","detail":"Object not found: heal-test/heal-test-obj3","type":"object","name":"/","before":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"after":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"size":0}
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":0,"duration":1}
 ```
 
-**Analysis:**
+**Key observations about the object-level record.** This is **not** a populated `HealResultItem` with three `missing` drives and one `ok` drive — that populated shape does not surface through mc for a dangling-purged object. Instead:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `type` | `"object"` | Record kind |
+| `name` | `"/"` | Bucket/object could not be identified post-purge; mc's formatter substitutes `"/"` |
+| `error` | `"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0"` | mc-layer error string (see below) |
+| `detail` | `"Object not found: heal-test/heal-test-obj3"` | mc-layer human-readable detail |
+| `before.drives` / `after.drives` | `null` | No drive array — the result was zeroed |
+| `before.color` / `after.color` | `""` (empty) | No color classification |
+| `before.online` / `missing` / `offline` / `corrupted` | `0 / 0 / 0 / 0` | All aggregates zero |
+| `size` | `0` | Object is gone; no size to report |
+| summary `objects_healed` | `0` | Object was not healed (was purged) |
+
+**Why the emission looks like this (mc-layer mechanics).** When the heal path delegates to `deleteIfDangling` (step 2 of the decision trace below), the object is purged before `HealObject` can assemble a populated `HealResultItem`; the server returns an empty/zeroed result item. mc then runs that record through `getObjectHCCChange` at `cmd/admin-heal-result-item.go:42-48`, which computes `surplusShardsBeforeHeal = onlineBefore - dataShards = 0 - 0 = 0` and calls `getHColCode` at `cmd/admin-heal-ui.go:55`. Because both `parityShards` and the surplus are zero, `getHColCode` returns the error string `"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0"`. mc then attaches its own human-readable `detail: "Object not found: <bucket>/<object>"` because a subsequent metadata read for the (now-purged) object returns `ObjectNotFound`. The `drives` fields are `null`, `name` collapses to `"/"`, and every count is zero — **this is the dangling-purge signature in Format B (mc stdout).**
+
+**Provenance of `"Read failed. Insufficient number of drives online"`.** This is the human-readable form of the server-side sentinel `errErasureReadQuorum` defined at `cmd/erasure-errors.go:23` (`errors.New("Read failed. Insufficient number of drives online")`). It is the error raised internally when a read cannot meet read-quorum. It does **not** appear in mc's NDJSON stream for the dangling-purge case — the chain `errErasureReadQuorum → toObjectErr → API response transformation` leaves mc with the empty `HealResultItem` described above, and mc substitutes its own `"Object not found"` phrasing. The original sentinel string may still appear in server logs or to direct admin-API clients that call `HealObject` and inspect the returned error object; it is **not** a user-visible string in the mc CLI for this scenario.
+
+**Decision trace (server-side, what actually happened before the emission):**
 
 1. `disksToHealCount=3 > 2=ParityBlocks` → `cannotHeal=true` (`cmd/erasure-healing.go:428`).
 2. Since `Remove: healDeleteDangling=true` (background heal default) and no `quorumETag` rescue, the branch at `cmd/erasure-healing.go:438` delegates to `deleteIfDangling`.
 3. Inside, `isObjectDangling(metaArr, errs, dataErrsByPart)` runs (`cmd/erasure-object.go:483`): `notFoundMetaErrs=3`, `validMeta.Erasure.ParityBlocks=2`. **Criterion #5** at `cmd/erasure-healing.go:1026-1028` fires: `notFoundMetaErrs (3) > ParityBlocks (2)` → `return validMeta, true`.
-4. The caller purges the object from all disks via `DeleteObject`. The `runtime.Caller(1)` capture at `cmd/erasure-object.go:526` and the deferred `auditDanglingObjectDeletion` at line 531 record the purge. In the emitted JSON, `After.Drives[3]` flips to `"missing"` (disk4's valid copy was deleted as part of the purge).
+4. The caller purges the object from all disks via `DeleteObject`. The `runtime.Caller(1)` capture at `cmd/erasure-object.go:526` and the deferred `auditDanglingObjectDeletion` at line 531 record the purge. disk4's previously-valid copy is deleted as part of the purge (this is why the object is fully gone after heal, not "recovered on 1/4 disks").
 
-Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp s3://heal-test/heal-test-obj3 /tmp/x` returns `NoSuchKey`.
+Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp s3://heal-test/heal-test-obj3 /tmp/x` returns `NoSuchKey`. A subsequent `mc admin heal --json local/heal-test/heal-test-obj3` produces the same null-drives record (the object is still absent).
+
+**Conceptual Format A view** (for teaching — this shape does *not* surface in mc stdout; it is what a direct `madmin-go` client would see for the server-side decision state *before* the purge, i.e. if `healDeleteDangling` were `false` or if the admin client is a `dry-run` inspector):
+
+```jsonc
+// Conceptual only — not emitted by mc. Included to illustrate the server-side
+// pre-purge state and the populated-drives layout a direct admin-API consumer
+// would observe before the delegation to deleteIfDangling.
+{
+  "resultId": 3, "type": "object",
+  "bucket": "heal-test", "object": "heal-test-obj3",
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": {
+    "drives": [
+      { "state": "missing" },
+      { "state": "missing" },
+      { "state": "missing" },
+      { "state": "ok" }
+    ]
+  },
+  "after": {
+    "drives": [
+      { "state": "missing" },
+      { "state": "missing" },
+      { "state": "missing" },
+      { "state": "missing" }
+    ]
+  }
+}
+```
 
 ### 12.4 Scenario D — Corrupted Part File (Size Mismatch)
 
@@ -868,7 +922,7 @@ Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp 
   "bucket": "heal-test", "object": "heal-test-corrupt",
   "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
   "before": {
-    "color": "yellow", "offline": 0, "online": 4, "missing": 1, "corrupted": 0,
+    "color": "yellow", "offline": 0, "online": 3, "missing": 1, "corrupted": 0,
     "drives": [
       { "endpoint": ".../disk1", "state": "missing" },
       { "endpoint": ".../disk2", "state": "ok" },
@@ -877,13 +931,14 @@ Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp 
     ]
   },
   "after": {
-    "color": "green", "missing": 0,
+    "color": "green", "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
     "drives": [ { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
-  }
+  },
+  "objectSize": 1048576
 }
 ```
 
-**Analysis:** `CheckParts` at `xl-storage.go:2406` compares file size on disk (`15 bytes`) against `fi.Parts[i].Size` (`1,048,576 bytes`). Mismatch → `checkPartFileCorrupt` (code 5 at `cmd/storage-datatypes.go:536-544`). `shouldHealObjectOnDisk` picks this up as `errPartMissingOrCorrupt`, which maps to drive state `missing`. Reconstruction proceeds.
+**Analysis:** `CheckParts` at `xl-storage.go:2406` compares file size on disk (`15 bytes`) against `fi.Parts[i].Size` (~`524,320 bytes` per shard — half of the 1 MiB object plus bitrot-header overhead). Mismatch → `checkPartFileCorrupt` (code 5 at `cmd/storage-datatypes.go:536-544`). `shouldHealObjectOnDisk` picks this up as `errPartMissingOrCorrupt`, which maps to drive state `missing`. Reconstruction proceeds. Before-aggregate `online=3` (disk2, disk3, disk4), `missing=1` (disk1). Note that the `corrupted=0` count is not `1` despite the part being "corrupt" on disk — because `errPartMissingOrCorrupt` maps to `DriveStateMissing`, not `DriveStateCorrupt`, in the switch at `cmd/erasure-healing.go:382-393` (see §8.2). The mc wrapper's `size` field (Format B) and the Format A `objectSize` field both carry the **total object size** (`1048576` for a 1 MiB test object), not the per-shard on-disk size — this is the total `HealResultItem.ObjectSize` populated from `FileInfo.Size`.
 
 **Why state is `missing` and not `corrupt`:** the state mapping at `cmd/erasure-healing.go:382-393` treats `errPartMissingOrCorrupt` as "missing" (a heal-needed signal) — not `corrupt` which is reserved for xl.meta-level unreadable-with-non-actionable-error cases.
 
@@ -891,7 +946,24 @@ Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp 
 
 **Setup:** Open `disk1/heal-test/heal-test-bitrot/<dataDir>/part.1`, flip one byte at offset 512, keep total size intact.
 
-**Normal scan:** `mc admin heal --json local/heal-test` reports `color: green, before.state: ok × 4, after.state: ok × 4` — the corruption is **invisible** because `CheckParts` only compares sizes.
+**Normal scan:** `mc admin heal --json local/heal-test` reports the object as fully healthy — the corruption is **invisible** to `CheckParts` because the on-disk file size still equals `fi.Parts[i].Size`:
+
+```jsonc
+{
+  "resultId": 5, "type": "object",
+  "object": "heal-test-bitrot",
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": { "color": "green", "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [ { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "after":  { "color": "green", "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [ { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "objectSize": 1048576
+}
+```
+
+The summary for this normal scan shows `objects_healed: 0` — nothing was fixed because nothing was detected.
 
 **Deep scan:** `mc admin heal --scan deep --json local/heal-test` invokes `VerifyFile` at `cmd/xl-storage.go:3097`, which reads the entire file and verifies the HighwayHash-256 bitrot signature. Mismatch → `errFileCorrupt`. Result:
 
@@ -899,14 +971,24 @@ Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp 
 {
   "resultId": 5, "type": "object",
   "object": "heal-test-bitrot",
-  "before": { "color": "yellow", "missing": 1, "drives": [
-    { "state": "missing" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
-  ]},
-  "after": { "color": "green", "missing": 0, "drives": [
-    { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
-  ]}
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": { "color": "yellow", "offline": 0, "online": 3, "missing": 1, "corrupted": 0,
+    "drives": [
+      { "state": "missing" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
+    ]
+  },
+  "after":  { "color": "green",  "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [
+      { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
+    ]
+  },
+  "objectSize": 1048576
 }
 ```
+
+The summary for the deep scan shows `objects_healed: 1`.
+
+**State mapping note:** even though the defect is a bitrot (content-level) error, the drive surfaces as `"missing"` — not `"corrupt"` — because `errFileCorrupt` on a part (via the `errPartMissingOrCorrupt` classification) is routed to `DriveStateMissing` in the switch at `cmd/erasure-healing.go:382-393`. The user-visible `"corrupt"` state is reserved for unreadable xl.meta with non-actionable errors (see §8.2).
 
 **Operational lesson:** silent bitrot can hide from the default healer. To defend against it, operators must either run `mc admin heal --scan deep` periodically or enable the scheduled background bitrot scanner via **`MINIO_HEAL_BITROTSCAN`** (see `internal/config/heal/heal.go:39` for the env var name and line 50 for the `Bitrot` config field). The default is off. Auto-escalation from normal to deep scan does happen per-request at `cmd/erasure-healing.go:1080-1085`, but only when some other detection path first raises `errFileCorrupt`.
 
@@ -914,51 +996,118 @@ Post-purge: `aws s3 ls s3://heal-test/heal-test-obj3` returns empty. `aws s3 cp 
 
 **Setup:** Remove `xl.meta` from `disk1`, `disk2`, `disk3` for `heal-test-dangling`, leaving the data-dir orphaned on those disks. Only `disk4` has valid metadata.
 
-**Result:** Byte-for-byte identical in shape to Scenario C:
+**Actual mc emission** (object-level NDJSON record, verbatim — **byte-for-byte identical to Scenario C's object-level record apart from the `detail` string**, which names a different object):
+
+```json
+{"status":"success","error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0","detail":"Object not found: heal-test/heal-test-dangling","type":"object","name":"/","before":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"after":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"size":0}
+```
+
+The surrounding bucket-level and summary records are shaped exactly as in §12.3 (bucket all-green; summary `objects_healed: 0`).
+
+**Analysis:** Same cascade as Scenario C at the server side. `notFoundMetaErrs=3`, criterion #5 at `cmd/erasure-healing.go:1026-1028` fires, object is purged, disk4's xl.meta is deleted as part of the purge, and `HealObject` returns the zeroed `HealResultItem`. mc applies the same Format-B dangling-purge signature explained in §12.3 (`drives: null`, all counts zero, `name: "/"`, `error = "Invalid parity shard count..."`, `detail = "Object not found: heal-test/heal-test-dangling"`). The orphaned data-dirs on disk1–3 are cleaned up on a subsequent scanner pass by `checkAbandonedParts` at `cmd/erasure-healing.go:659+`; see also §12.3's "Provenance of `Read failed. Insufficient number of drives online`" note — that sentinel likewise does **not** surface in mc stdout here.
+
+**Conceptual Format A view** (for teaching — not emitted by mc; illustrates the pre-purge decision state):
 
 ```jsonc
+// Conceptual only — not emitted by mc. Illustrates the server-side pre-purge state.
 {
   "resultId": 6, "type": "object",
   "bucket": "heal-test", "object": "heal-test-dangling",
-  "detail": "Read failed. Insufficient number of drives online",
-  "before": { "color": "red", "missing": 3, "drives": [
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": { "drives": [
     { "state": "missing" }, { "state": "missing" }, { "state": "missing" }, { "state": "ok" }
   ]},
-  "after": { "color": "red", "missing": 3, "drives": [
+  "after": { "drives": [
     { "state": "missing" }, { "state": "missing" }, { "state": "missing" }, { "state": "missing" }
   ]}
 }
 ```
 
-**Analysis:** Same cascade as Scenario C. `notFoundMetaErrs=3`, criterion #5 at `cmd/erasure-healing.go:1026-1028` fires, object is purged. The orphaned data-dirs on disk1-3 are cleaned up on a subsequent scanner pass by `checkAbandonedParts` at `cmd/erasure-healing.go:659+`.
-
 ### 12.7 Scenario F — Simulated Partial Write/Delete
 
-**Setup:** Identical to Scenario B — stop MinIO, remove data from `disk1` and `disk2`, restart, heal.
+**Setup:** Same shape as Scenario B, against a different object name: PUT `heal-test/heal-test-partdel`, stop MinIO, remove `disk1/heal-test/heal-test-partdel/` AND `disk2/heal-test/heal-test-partdel/`, restart, heal.
 
-**Result:** **Byte-for-byte identical** to Scenario B's JSON. `red → green`, reconstruction succeeds. The healer has no "operation type" field in `PartialOperation` (`cmd/mrf.go:51-63`) and no write-vs-delete branch in `HealObject`. The identical output is the direct evidence that healing is state-driven, not history-driven.
-
-### 12.8 Scenario F-2 — Versioned Delete-Marker Heal
-
-**Setup:** Enable versioning on `heal-test`. PUT `heal-test-versioned` (creates version v1). DELETE the object (creates a delete marker v2). Stop MinIO, remove the delete-marker xl.meta from `disk1` only. Restart, heal.
-
-**Result:**
+**Actual mc object-level emission:**
 
 ```jsonc
 {
-  "resultId": 7, "type": "object",
-  "bucket": "heal-test", "object": "heal-test-versioned",
-  "versionId": "<v2-uuid>",
-  "before": { "color": "yellow", "missing": 1, "drives": [
-    { "state": "missing" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
-  ]},
-  "after": { "color": "green", "missing": 0, "drives": [
-    { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" }
-  ]}
+  "resultId": 6, "type": "object",
+  "bucket": "heal-test", "object": "heal-test-partdel",
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": {
+    "color": "red", "offline": 0, "online": 2, "missing": 2, "corrupted": 0,
+    "drives": [
+      { "endpoint": ".../disk1", "state": "missing" },
+      { "endpoint": ".../disk2", "state": "missing" },
+      { "endpoint": ".../disk3", "state": "ok" },
+      { "endpoint": ".../disk4", "state": "ok" }
+    ]
+  },
+  "after": {
+    "color": "green", "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [
+      { "endpoint": ".../disk1", "state": "ok" },
+      { "endpoint": ".../disk2", "state": "ok" },
+      { "endpoint": ".../disk3", "state": "ok" },
+      { "endpoint": ".../disk4", "state": "ok" }
+    ]
+  },
+  "objectSize": 1048576
 }
 ```
 
-**Analysis:** `validMeta.Deleted=true` → criterion #4 at `cmd/erasure-healing.go:1012-1017` applies, but `notFoundMetaErrs=1 ≤ dataBlocks=2` so it does not fire. Heal propagates the delete marker's xl.meta to disk1. `After.Drives[0].State` becomes `ok`. Versioning is preserved: v1 remains accessible via `aws s3api get-object --version-id v1-uuid`.
+**Result:** **Shape-identical** to Scenario B — the only fields that differ are the identity fields (`object`: `heal-test-partdel` vs `heal-test-obj2`) and the `resultId` sequence number. All aggregate counts, drive states, before/after colors, sizes, and per-drive state transitions match byte-for-byte. `red → green`, reconstruction succeeds. The healer has no "operation type" field in `PartialOperation` (`cmd/mrf.go:51-63`) and no write-vs-delete branch in `HealObject`. This identical JSON shape is the direct evidence that healing is state-driven, not history-driven: MRF's "operation type" affects *when* heal is triggered (read-after-partial-write vs read-after-partial-delete), not *how* the healer behaves once invoked.
+
+### 12.8 Scenario F-2 — Versioned Delete-Marker Heal
+
+**Setup:** Enable versioning on `heal-test-versioned`. PUT object `v1` (creates a live version). DELETE the object by name (creates a delete marker v2). Stop MinIO, remove the entire `disk1/heal-test-versioned/v1/` directory (both the live-version data-dir and the delete-marker's xl.meta on disk1). Restart, heal recursively: `mc admin heal --json --recursive local/heal-test-versioned`.
+
+**Actual mc emission** (four NDJSON records — bucket + delete-marker version entry + live version entry + summary). The bucket entry's `drives` array is elided as `[...]` for brevity; it mirrors the healthy 4-drive shape shown in the next two records.
+
+```jsonc
+{"status":"success","type":"bucket","name":"heal-test-versioned/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[...]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[...]},"size":0}
+{"status":"success","type":"object","name":"heal-test-versioned/v1","before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"missing"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"size":0}
+{"status":"success","type":"object","name":"heal-test-versioned/v1","before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"missing"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio-heal-experiments/disk4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":2,"objects_healed":2,"items_scanned":3,"items_healed":2,"size":1048576,"duration":1}
+```
+
+In Format-B-augmented-with-identity-fields form, the two object records are:
+
+```jsonc
+// Delete marker v2 (size=0)
+{
+  "resultId": 7, "type": "object",
+  "bucket": "heal-test-versioned", "object": "v1", "versionId": "<v2-uuid>",
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": { "color": "yellow", "offline": 0, "online": 3, "missing": 1, "corrupted": 0,
+    "drives": [ { "state": "missing" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "after":  { "color": "green",  "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [ { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "objectSize": 0
+}
+
+// Live version v1 (size=1 MiB)
+{
+  "resultId": 8, "type": "object",
+  "bucket": "heal-test-versioned", "object": "v1", "versionId": "<v1-uuid>",
+  "parityBlocks": 2, "dataBlocks": 2, "diskCount": 4, "setCount": 1,
+  "before": { "color": "yellow", "offline": 0, "online": 3, "missing": 1, "corrupted": 0,
+    "drives": [ { "state": "missing" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "after":  { "color": "green",  "offline": 0, "online": 4, "missing": 0, "corrupted": 0,
+    "drives": [ { "state": "ok" }, { "state": "ok" }, { "state": "ok" }, { "state": "ok" } ]
+  },
+  "objectSize": 1048576
+}
+```
+
+**Note on mc's `name` field for versions.** mc renders both the delete-marker record and the live-version record with `name: "heal-test-versioned/v1"`; the two records are distinguished only by their `size` field (`0` for the delete marker, `1048576` for the live data) and — at the Format A level — by their `versionId` values (which mc does not surface in the NDJSON stream it prints). Both records have `before.online=3, missing=1` because disk1 was removed in the setup.
+
+**Non-recursive vs. recursive heal.** A direct heal of `mc admin heal --json local/heal-test-versioned/v1` (without `--recursive`) produces the dangling-purge null-drives signature from §12.3 — because the top-most "object" name resolves to the delete marker v2 and the API can't hand back a populated `HealResultItem` for a deleted object. The recursive invocation enumerates both versions and heals each independently, which is what produces the four-record stream shown above.
+
+**Analysis:** For each version: `validMeta.Deleted=true` for v2 → criterion #4 at `cmd/erasure-healing.go:1012-1017` applies, but `notFoundMetaErrs=1 ≤ dataBlocks=2` so it does not fire; heal propagates the delete-marker xl.meta to disk1. For v1: `disksToHealCount=1 ≤ ParityBlocks=2` → standard reconstruction. `After.Drives[0].State` becomes `ok` for both. Versioning is preserved: v1 remains accessible via `aws s3api get-object --version-id <v1-uuid>`; a no-version read continues to return the delete-marker (`NoSuchKey`).
 
 ---
 
@@ -1234,7 +1383,15 @@ Paths are relative to the repository root. All citations target commit `c07e5b49
 
 ### 16.4 Runtime Evidence Provenance
 
-Every JSON block in [§12](#12-six-scenarios-with-runtime-json) is a captured emission from `mc admin heal --json` run against a locally-built MinIO binary at commit `c07e5b49d477` with `DataBlocks=2, ParityBlocks=2` (single-set, 4-disk setup on `/tmp/minio-heal-experiments/disk{1..4}`). The capture files were deleted per [§15.2](#152-cleanup-commands-executed); the embedded text is the only persisted copy.
+All JSON blocks in [§12](#12-six-scenarios-with-runtime-json) were derived from live captures of `mc admin heal --json` run against a locally-built MinIO binary at commit `c07e5b49d477` with `DataBlocks=2, ParityBlocks=2` (single-set, 4-disk setup on `/tmp/minio-heal-experiments/disk{1..4}`). The capture files were deleted per [§15.2](#152-cleanup-commands-executed); the embedded text is the only persisted copy. To help the reader connect a block to the underlying mechanism, the §12 material has been rendered in one of three clearly-labeled forms:
+
+- **Literal mc NDJSON** — verbatim lines from the mc stdout stream. §12.3 (Scenario C), §12.6 (Scenario E), §12.7 (Scenario F), and §12.8 (Scenario F-2) each include a literal-mc block. These blocks contain *only* fields that mc actually emits: `status`, `type`, `name`, `before.{color,offline,online,missing,corrupted,drives}`, `after.{…}`, `size`, and (in error cases) `detail` and `error`. Where the `drives` array appears, each element has the full Format B shape `{uuid, endpoint, state}`. No identity fields (`bucket`, `object`, `parityBlocks`, `dataBlocks`, `diskCount`, `setCount`, `objectSize`, `versionId`, `resultId`) appear in literal-mc blocks, because mc does not surface them at the NDJSON layer.
+- **Format-B-augmented hybrid** — a pedagogical rendering for scenarios whose mc output is a simple success record (§12.1, §12.2, §12.4, §12.5, §12.7, §12.8's "augmented" view). In these blocks, the Format B aggregates and drive states exactly match what mc emitted, but we have added identity/layout fields from the server-side `madmin-go` `HealResultItem` (Format A) so the reader can see in one place *which object the record refers to* and *what EC parameters govern the decision*. Any reader wiring up a parser against mc NDJSON should **ignore** the fields listed above as "Format A-only"; they will not be present on the wire. Conversely, the aggregate counts and drive-state strings shown in these hybrid blocks are exactly those emitted by mc and can be trusted for tooling. Within the `drives` array, individual entries are abbreviated to `{ "state": "…" }` where the `endpoint` and `uuid` are not the focus of the discussion; the literal mc `drives` element is always `{"uuid":"","endpoint":"...","state":"…"}` with a valid endpoint path.
+- **Conceptual Format A view** — in §12.3 and §12.6 the dangling-purge signature is shown in two forms: first the literal mc null-drives output, then a conceptual reconstruction of the server-side `defaultHealResult` at `cmd/erasure-healing.go:787-800`. The conceptual view is labeled "(not emitted by mc)" and is included purely to reveal the server's internal model of the purged object; it must not be taken as something a parser will see on the mc side.
+
+A concrete example of the distinction: the phrase **"Read failed. Insufficient number of drives online"** is the string form of the `errErasureReadQuorum` sentinel defined at `cmd/erasure-errors.go:23`. It is used server-side in the `toObjectErr()` transformation and appears in MinIO's structured server logs. It is **not** what `mc admin heal --json` writes to stdout. For the dangling-purge case covered by §12.3 and §12.6, mc emits `"detail": "Object not found: <bucket>/<object>"` together with `"error": "Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0"` (from `cmd/admin-heal-ui.go:55`). Both strings are evidence of the same underlying decision — the object was deemed irrecoverable, purged, and can no longer be read — but the two strings surface at different points in the stack and a reader using one to grep server logs while expecting to see it in mc output (or vice versa) will be surprised. §12.3's "mc layer mechanics" subsection traces the full path from server sentinel through the admin API to mc stdout.
+
+A second concrete example: the `online`, `offline`, `missing`, and `corrupted` aggregates at the `before`/`after` level are strictly state-filtered counts computed by `GetOnlineCounts`, `GetOfflineCounts`, `GetMissingCounts`, and `GetCorruptedCounts` in `madmin-go/v3@v3.0.77/heal-commands.go` (lines 220-250). Each function iterates `Drives` and increments only when `v.State` equals the respective constant. Consequently `online + missing + offline + corrupted` is not guaranteed to equal `diskCount`: if any drive reports `permission-denied`, `faulty`, `root-mount`, `unknown`, or `unformatted` (the other five `DriveState*` constants at `heal-commands.go:120-128`), it is counted in none of the four aggregates. In a healthy 4-disk set with no such edge-case states, the sum does equal 4, and the §12 blocks are all captured from such runs — but tooling must not assume the invariant. This is why §12.1 shows `before.online=3` (not 4) when one disk is `missing`: `online` means *"drives in state `ok`"*, not *"drives that are reachable"* or *"drives that are formatted"*.
 
 ---
 
@@ -1338,11 +1495,11 @@ Every JSON block in [§12](#12-six-scenarios-with-runtime-json) is a captured em
 |---|---|---|---|---|---|
 | A | Removed `disk1/.../heal-test-obj1/` | 3/4 | Reconstruct | All disks `ok` | yellow → green |
 | B | Removed `disk1,disk2/.../heal-test-obj2/` | 2/4 (floor) | Reconstruct | All disks `ok` | red → green |
-| C | Removed `disk1,disk2,disk3/.../heal-test-obj3/` | 1/4 | Dangling purge (#5) | Object deleted from all | red → red + `detail` |
+| C | Removed `disk1,disk2,disk3/.../heal-test-obj3/` | 1/4 | Dangling purge (#5) | Object deleted from all | null-drives (mc) / `red → red` + `detail: "Read failed…"` (server-side) |
 | D | Overwrote `disk1/.../part.1` with 15 bytes | 3/4 (1 size-corrupt) | Reconstruct | All disks `ok` | yellow → green |
 | D-2 (normal scan) | Flipped one byte in `disk1/.../part.1` | 3/4 (silent) | No-op (undetected) | Corrupt bytes remain | green → green (false clean) |
 | D-2 (deep scan) | Same | 3/4 (1 bitrot) | Reconstruct | All disks `ok` | yellow → green |
-| E | Removed `xl.meta` from disk1-3 | 1/4 (meta) | Dangling purge (#5) | Object deleted + data-dirs orphaned | red → red + `detail` |
+| E | Removed `xl.meta` from disk1-3 | 1/4 (meta) | Dangling purge (#5) | Object deleted + data-dirs orphaned | null-drives (mc) / `red → red` + `detail: "Read failed…"` (server-side) |
 | F | Same as B (simulated partial op) | 2/4 | Reconstruct | All disks `ok` | red → green (identical to B) |
 | F-2 | Removed disk1 delete-marker xl.meta | 3/4 | Reconstruct meta | All disks have marker | yellow → green |
 
