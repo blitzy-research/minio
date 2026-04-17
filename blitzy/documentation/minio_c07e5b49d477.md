@@ -16,6 +16,7 @@ This document presents a comprehensive, evidence-backed investigation of five di
 6. [Investigation 5 — Privilege Escalation Prevention via User Mappings](#investigation-5--privilege-escalation-prevention-via-user-mappings)
 7. [Summary of Findings](#summary-of-findings)
 8. [Appendix A — Source File / Line Reference Index](#appendix-a--source-file--line-reference-index)
+9. [Appendix B — Reproduction Checklist](#appendix-b--reproduction-checklist)
 
 ---
 
@@ -222,23 +223,24 @@ The handler path for a PUT is `cmd/object-handlers.go` → `PutObjectHandler`. B
 **(1) Entry point — `cmd/object-handlers.go` lines 1893–1897** (PutObjectHandler):
 
 ```go
-if !crypto.SSEC.IsRequested(r.Header) && !replica {
-    sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
-    sseConfig.Apply(r.Header, sse.ApplyOptions{
-        AutoEncrypt: globalAutoEncryption,
-    })
-}
+// Check if bucket encryption is enabled
+sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
+sseConfig.Apply(r.Header, sse.ApplyOptions{
+    AutoEncrypt: globalAutoEncryption,
+})
 ```
 
-**Why this matters:** The PutObject handler retrieves the bucket's stored `BucketSSEConfig` via `globalBucketSSEConfigSys.Get(bucket)` and calls `Apply()` on the incoming request headers *before* any SSE-specific processing runs. The `Apply` call is a no-op when the client already supplied an SSE header; otherwise, it mutates `r.Header` in place.
+**Why this matters:** The PutObject handler retrieves the bucket's stored `BucketSSEConfig` via `globalBucketSSEConfigSys.Get(bucket)` and calls `Apply()` on the incoming request headers **unconditionally** — there is no wrapping `if` guard at this call site. The guard that skips the mutation when the client already supplied SSE headers lives inside `Apply()` itself (see the `crypto.Requested(headers)` early-return at `internal/bucket/encryption/bucket-sse-config.go:136` shown next). This means that for every PUT, `Apply()` is invoked; it then decides internally whether to inject a default SSE header or return without mutating anything.
 
 **(2) Header injection — `internal/bucket/encryption/bucket-sse-config.go` lines 135–153** (the `Apply` method):
 
 ```go
 // Apply applies the SSE bucket configuration on the given HTTP headers and
-// sets the specified SSE headers. Apply does not overwrite any existing
-// SSE headers. Further, it will neither set nor overwrite any SSE headers
-// for any HEAD, GET or COPY request.
+// sets the specified SSE headers.
+//
+// Apply does not overwrite any existing SSE headers. Further, it will
+// set minimal SSE-KMS headers if autoEncrypt is true and the BucketSSEConfig
+// is nil.
 func (b *BucketSSEConfig) Apply(headers http.Header, opts ApplyOptions) {
     if crypto.Requested(headers) {
         return
@@ -306,7 +308,7 @@ sequenceDiagram
 - The bucket-level default encryption configuration takes precedence **by mutation of the request headers**, not by request rejection.
 - The upload succeeds with HTTP 200, the object is encrypted at rest, and `mc stat` reports `Encryption: SSE-S3`.
 - The user's `s3:PutObject` permission remains fully valid — MinIO does **not** require `s3:x-amz-server-side-encryption` condition keys to be satisfied by default.
-- The precise locus of the behavior is the three-line conditional at `cmd/object-handlers.go:1893-1897` that calls `sseConfig.Apply()`, which in turn executes `headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)` at `internal/bucket/encryption/bucket-sse-config.go:148`.
+- The precise locus of the behavior is the unconditional `sseConfig.Apply(r.Header, ...)` call at `cmd/object-handlers.go:1893-1897`, which delegates the "do nothing if the client already requested SSE" decision to `Apply()` itself (via the `if crypto.Requested(headers) { return }` short-circuit at `internal/bucket/encryption/bucket-sse-config.go:136`). When that guard does not trigger, `Apply()` executes `headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)` at `internal/bucket/encryption/bucket-sse-config.go:148`.
 
 ---
 
@@ -499,64 +501,75 @@ The enforcement point is `enforceRetentionBypassForDelete` in `cmd/bucket-object
 **(1) Hook registration — `cmd/object-handlers.go` lines 2598–2612** (inside `DeleteObjectHandler`):
 
 ```go
-opts.EvalRetentionBypassFn = func(oi ObjectInfo, gerr error) error {
-    return enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
-        ObjectV: ObjectV{
-            ObjectName: object,
-            VersionID:  opts.VersionID,
-        },
-    }, oi, gerr)
-}
+opts.SetEvalRetentionBypassFn(func(goi ObjectInfo, gerr error) (err error) {
+    err = nil
+    if vID != "" {
+        err := enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
+            ObjectV: ObjectV{
+                ObjectName: object,
+                VersionID:  vID,
+            },
+        }, goi, gerr)
+        if err != nil && !isErrObjectNotFound(err) {
+            return err
+        }
+    }
+    return
+})
 ```
 
-**Why this matters:** The handler binds the retention-evaluation function so that every version-specific delete runs through `enforceRetentionBypassForDelete`, which is the single gatekeeper.
+**Why this matters:** The handler binds the retention-evaluation callback via `opts.SetEvalRetentionBypassFn(...)` so that every delete runs through `enforceRetentionBypassForDelete`, which is the single gatekeeper. Two important guards are visible here: (a) the callback only invokes `enforceRetentionBypassForDelete` when `vID != ""`, so a plain `DELETE` without a version ID (which creates a delete marker rather than removing a specific version) skips retention enforcement entirely; and (b) an `isErrObjectNotFound(err)` filter suppresses not-found errors so that deletes of already-absent versions are idempotent.
 
 **(2) The enforcement function — `cmd/bucket-object-lock.go` lines 84–159** (`enforceRetentionBypassForDelete`):
 
-The function fetches `ret := objectlock.GetObjectRetentionMeta(oi.UserDefined)`, then branches on `ret.Mode`:
+The function fetches `ret := objectlock.GetObjectRetentionMeta(oi.UserDefined)`, then branches on `ret.Mode` (the code below is reproduced verbatim from the source):
 
 ```go
 // Compliance branch (lines 107–123)
 case objectlock.RetCompliance:
+    // In compliance mode, a protected object version can't be overwritten
+    // or deleted by any user, including the root user in your AWS account.
     t, err := objectlock.UTCNowNTP()
     if err != nil {
         internalLogIf(ctx, err, logger.WarningKind)
-        return ObjectLocked{
-            Bucket:    bucket,
-            Object:    object.ObjectName,
-            VersionID: object.VersionID,
-        }
+        return ObjectLocked{}
     }
+
     if !ret.RetainUntilDate.Before(t) {
-        return ObjectLocked{
-            Bucket:    bucket,
-            Object:    object.ObjectName,
-            VersionID: object.VersionID,
-        }
+        return ObjectLocked{}
     }
     return nil
 ```
 
-**Critical observation:** The COMPLIANCE branch **never** consults the bypass header. It performs a pure time comparison: `ret.RetainUntilDate.Before(currentTime)`. If the retention period has not elapsed, it unconditionally returns `ObjectLocked{}` — no user permission is checked, no header is considered.
+**Critical observation:** The COMPLIANCE branch **never** consults the bypass header. It performs a pure time comparison: `ret.RetainUntilDate.Before(currentTime)`. If the retention period has not elapsed, it unconditionally returns `ObjectLocked{}` (an empty struct — the `Bucket`, `Object`, and `VersionID` fields are left at their zero values; the `Error()` method formats a constant WORM message regardless, so the filled-vs-empty distinction is only cosmetic in the error text). No user permission is checked, no header is considered.
 
-The GOVERNANCE branch, by contrast, *does* look at the bypass header:
+The GOVERNANCE branch, by contrast, **does** look at the bypass header. The actual control flow performs bypass detection first, then a time check, and finally a permission check as separate sequential steps:
 
 ```go
 // Governance branch (lines 124–156)
 case objectlock.RetGovernance:
-    govBypassPerm := checkRequestAuthType(ctx, r,
-        policy.BypassGovernanceRetentionAction,
-        bucket, object.ObjectName)
-    byPassSet := objectlock.IsObjectLockGovernanceBypassSet(r.Header) &&
-                 govBypassPerm == ErrNone
+    byPassSet := objectlock.IsObjectLockGovernanceBypassSet(r.Header)
     if !byPassSet {
         t, err := objectlock.UTCNowNTP()
-        // ... same time-only check, same ObjectLocked{} return ...
+        if err != nil {
+            internalLogIf(ctx, err, logger.WarningKind)
+            return ObjectLocked{}
+        }
+
+        if !ret.RetainUntilDate.Before(t) {
+            return ObjectLocked{}
+        }
+        return nil
     }
-    // Bypass allowed; return nil (delete proceeds).
+    // If bypass is set, an s3:BypassGovernanceRetention permission check is
+    // required. On failure the handler surfaces errAuthentication (not
+    // ObjectLocked), which maps to HTTP 403 Forbidden.
+    if checkRequestAuthType(ctx, r, policy.BypassGovernanceRetentionAction, bucket, object.ObjectName) != ErrNone {
+        return errAuthentication
+    }
 ```
 
-**Why this matters:** Only GOVERNANCE mode honors `X-Amz-Bypass-Governance-Retention: true`, and even then it additionally requires `s3:BypassGovernanceRetention` permission. COMPLIANCE mode is strict immutability by design.
+**Why this matters:** Only GOVERNANCE mode honors `X-Amz-Bypass-Governance-Retention: true`, and even then it additionally requires `s3:BypassGovernanceRetention` permission. Note that the two gates are sequential rather than combined into a single boolean: the bypass header alone skips the time check, and only *after* that is the permission verified. COMPLIANCE mode is strict immutability by design.
 
 **(3) Error type — `cmd/object-api-errors.go` lines 336–341** (`ObjectLocked`):
 
@@ -748,9 +761,12 @@ Content-Type: application/xml
 
 ### 3.6 Source Code Analysis
 
-**(1) Bitrot algorithm registry — `cmd/bitrot.go` lines 38–70:**
+**(1) Bitrot algorithm registry — `cmd/xl-storage-format-v1.go` lines 143–155** (type and const block) and **`cmd/bitrot.go` lines 39–44** (runtime dispatch map):
 
 ```go
+// BitrotAlgorithm specifies a algorithm used for bitrot protection.
+type BitrotAlgorithm uint
+
 const (
     // SHA256 represents the SHA-256 hash function
     SHA256 BitrotAlgorithm = 1 + iota
@@ -762,6 +778,8 @@ const (
     BLAKE2b512
 )
 ```
+
+Separately, `cmd/bitrot.go` lines 39–44 declare the `bitrotAlgorithms map[BitrotAlgorithm]string` that maps each algorithm constant to its canonical string identifier, and `BitrotAlgorithm.New()` (lines 46–65) returns an appropriate `hash.Hash` implementation for each algorithm.
 
 **Why this matters:** `HighwayHash256S` is the streaming variant used for per-shard checksums during read — this is the algorithm that detects the corruption we injected.
 
@@ -973,7 +991,7 @@ Body: allowed content
 The critical return statement (around lines 2229–2233) is:
 
 ```go
-hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args, parentUser)
+hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args)
 if hasSessionPolicy {
     return isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 }
@@ -982,8 +1000,9 @@ return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
 ```
 
 **Why this matters:**
+- `isAllowedBySessionPolicyForServiceAccount` takes a **single** argument — the original `args policy.Args` — and internally forces `sessionPolicyArgs.IsOwner = false` before evaluating the session policy (see § 4.6.2). The `parentUser` string is **not** passed into the session policy evaluation; it is used only in the separate parent-policy check via `parentArgs` (see § 4.6.3).
 - `isAllowedSP` is the session policy's decision for the request.
-- `combinedPolicy.IsAllowed(parentArgs)` is the **parent user's** policy decision, evaluated with `AccountName = parentUser` (see lines 2217–2219 in the same function) — i.e., it answers "would the parent user be allowed to do this?".
+- `combinedPolicy.IsAllowed(parentArgs)` is the **parent user's** policy decision, evaluated with `AccountName = parentUser` (see lines 2210–2211 in the same function) — i.e., it answers "would the parent user be allowed to do this?".
 - The return value is the logical **AND** of the two: BOTH must allow. This is textbook intersection semantics — the session policy can only **narrow**, never **widen**, the parent user's effective permissions.
 - `isOwnerDerived` is a narrow bypass for credentials derived from the server's root account; even then the session policy still gates the decision (see § 4.6.3).
 
@@ -1022,7 +1041,7 @@ func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowe
 
 #### 4.6.3 How the parent check uses `parentArgs`
 
-Earlier in `IsAllowedServiceAccount` (around lines 2214–2219):
+Earlier in `IsAllowedServiceAccount` (lines 2210–2211):
 
 ```go
 parentArgs := args
@@ -1284,16 +1303,16 @@ func (p Policy) IsAllowed(args Args) bool {
 **Location:** `cmd/iam.go` lines 2138–2236 (`IsAllowedServiceAccount`), specifically the decision at line 2232:
 
 ```go
-hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args, parentUser)
+hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args)
 if hasSessionPolicy {
     return isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 }
 return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
 ```
 
-**Why this matters:** When the escalated `eviltempkey` attempts any admin API (say, `admin:ListUsers`):
+**Why this matters:** Note that `isAllowedBySessionPolicyForServiceAccount` takes a **single** parameter (`args policy.Args`) and internally forces `IsOwner=false` on the session-policy evaluation (see § 4.6.2). The `parentUser` value is only used for the *parent* policy check via `parentArgs` (set earlier at `cmd/iam.go:2210–2211`), not for the session-policy check. When the escalated `eviltempkey` attempts any admin API (say, `admin:ListUsers`):
 
-1. `isAllowedBySessionPolicyForServiceAccount` evaluates the embedded `admin:*`/`s3:*` session policy → `isAllowedSP = true`.
+1. `isAllowedBySessionPolicyForServiceAccount` evaluates the embedded `admin:*`/`s3:*` session policy against `args` (with `IsOwner` forced to `false`) → `isAllowedSP = true`.
 2. `combinedPolicy.IsAllowed(parentArgs)` evaluates the **parent `basicuser`**'s actual attached policies against the same action. `basic-s3` grants no `admin:*` actions, so this returns **false**.
 3. The decision is `true && false` → **false** → `403 AccessDenied`.
 
@@ -1331,7 +1350,7 @@ In effect, the `DenyOnly` flag is an **optimization**, not a security hole. It a
 | `cmd/iam.go` | 2320–2378 | `isAllowedBySessionPolicyForServiceAccount` |
 | `cmd/iam.go` | 2381–2421 | `isAllowedBySessionPolicy` |
 | `cmd/iam.go` | 2417 | `sessionPolicyArgs.IsOwner = false` |
-| `cmd/auth-handler.go` | ~476 | admin-action auth with `DenyOnly: true` for self-targeting operations |
+| `cmd/auth-handler.go` | 466–480 | `DeleteObjectVersionAction` deny-only pre-check — an unrelated but similarly-patterned use of `DenyOnly: true` in the S3 authorization layer (not admin self-targeting). When a caller issues `DeleteObject` with a `versionId`, the auth layer additionally verifies that no Deny statement covers `DeleteObjectVersionAction`. This confirms the `DenyOnly` pattern is used elsewhere in MinIO as a defense-in-depth optimization. |
 | `github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 172–207 | `Policy.IsAllowed` with `DenyOnly` short-circuit |
 
 ### 5.8 Conclusion
@@ -1358,7 +1377,7 @@ The five investigations collectively demonstrate that MinIO's security subsystem
 |---|----------|-------------------|--------------------|
 | 1 | Bucket SSE vs user write permission | Server **transparently injects** `X-Amz-Server-Side-Encryption: AES256` before the object handler; upload succeeds with HTTP 200 and the object is encrypted at rest. The `s3:PutObject` permission remains sufficient; there is no rejection. | `cmd/object-handlers.go:1893-1897` + `internal/bucket/encryption/bucket-sse-config.go:135-153` |
 | 2 | Object Lock COMPLIANCE delete | Returns **HTTP 400 `InvalidRequest`** with body `"Object is WORM protected and cannot be overwritten"`. The `X-Amz-Bypass-Governance-Retention` header is **silently ignored** in COMPLIANCE mode. Delete-without-version-id creates a delete marker (allowed). | `cmd/bucket-object-lock.go:104-123` + `cmd/api-errors.go:1059-1063` |
-| 3 | Bit rot detection (single-drive) | Per-shard `HighwayHash256S` checksum mismatch yields `errFileCorrupt`. In single-drive mode returns **HTTP 503 `SlowDownRead`** with `Retry-After: 60`. In multi-drive erasure mode, healing transparently repairs the shard. | `cmd/bitrot.go:38-70` + `cmd/bitrot-streaming.go` + `cmd/erasure-object.go:395-407` + `cmd/api-errors.go:869-873` |
+| 3 | Bit rot detection (single-drive) | Per-shard `HighwayHash256S` checksum mismatch yields `errFileCorrupt`. In single-drive mode returns **HTTP 503 `SlowDownRead`** with `Retry-After: 60`. In multi-drive erasure mode, healing transparently repairs the shard. | `cmd/xl-storage-format-v1.go:143-155` (type + const) + `cmd/bitrot.go:39-44` (dispatch map) + `cmd/bitrot-streaming.go:183-186` (shard verify) + `cmd/erasure-object.go:395-407` + `cmd/api-errors.go:869-873` |
 | 4 | STS session policy enforcement | **Strict intersection semantics.** A session policy can only narrow, never widen, the parent's permissions. Even root-derived credentials are gated (`IsOwner=false`). | `cmd/iam.go:2138-2236` (decision at 2232) + `cmd/iam.go:2381-2421` (especially 2417) |
 | 5 | Privilege escalation via user mappings / session policy | Direct admin calls are denied. Self-service account creation with `admin:*` session policy **succeeds** (due to `DenyOnly`), but the resulting credentials have no admin power because the runtime AND-intersection clips them to the parent's real permissions. | `cmd/admin-handlers-users.go:2781-2801` + `cmd/iam.go:2232` + `github.com/minio/pkg/v3@v3.0.22/policy/policy.go:~172-207` |
 
@@ -1393,11 +1412,12 @@ This appendix consolidates every source code location cited in the five investig
 | 2 — Object Lock | `cmd/object-api-errors.go` | 336–341 — `ObjectLocked` type and `Error()` method with WORM message |
 | 2 — Object Lock | `cmd/api-errors.go` | 1059–1063 — `ErrObjectLocked` → `Code="InvalidRequest"`, HTTP 400 |
 | 2 — Object Lock | `internal/bucket/object/lock/lock.go` | Object lock mode constants (`RetGovernance`, `RetCompliance`); `LegalHoldStatus`; retention validation |
-| 3 — Bit rot | `cmd/bitrot.go` | 38–70 — algorithm registry (`SHA256`, `HighwayHash256`, `HighwayHash256S`, `BLAKE2b512`); `bitrotVerify()`; `bitrotSelfTest()` |
-| 3 — Bit rot | `cmd/bitrot-streaming.go` | Streaming HighwayHash256S writer/reader — per-shard checksum interleaving and verification |
+| 3 — Bit rot | `cmd/xl-storage-format-v1.go` | 143–155 — `BitrotAlgorithm` type declaration and const block (`SHA256`, `HighwayHash256`, `HighwayHash256S`, `BLAKE2b512`); `DefaultBitrotAlgorithm = HighwayHash256S` at line 158 |
+| 3 — Bit rot | `cmd/bitrot.go` | 39–44 — `bitrotAlgorithms map[BitrotAlgorithm]string` runtime dispatch; 46–65 — `BitrotAlgorithm.New()` constructor per algorithm; 157–206 — `bitrotVerify()` with multiple checksum-mismatch `errFileCorrupt` returns (lines ~163, 166, 178, 201, 205–206); `bitrotSelfTest()` |
+| 3 — Bit rot | `cmd/bitrot-streaming.go` | Streaming HighwayHash256S writer/reader — per-shard checksum interleaving and verification; lines 183–186 perform `if !bytes.Equal(b.h.Sum(nil), b.hashBytes) { return 0, errFileCorrupt }` (the actual per-shard checksum mismatch path) |
 | 3 — Bit rot | `cmd/bitrot-whole.go` | Whole-file (non-streaming) bitrot writer/reader |
 | 3 — Bit rot | `cmd/erasure-object.go` | 395–407 — corruption detection path; `healOnce.Do(...)` with `BitrotScan: true` |
-| 3 — Bit rot | `cmd/erasure-object.go` | ~642 — `errs[i] = errFileCorrupt` on checksum mismatch |
+| 3 — Bit rot | `cmd/erasure-object.go` | ~642 — `errs[i] = errFileCorrupt` assigned when the merged file metadata fails the validity check (`!lfi.IsValid()`); note this is a metadata-level corruption signal, distinct from the per-shard HighwayHash256S checksum mismatch path in `bitrot-streaming.go:183-186` |
 | 3 — Bit rot | `cmd/api-errors.go` | 869–873 — `ErrSlowDownRead` → `Code="SlowDownRead"`, HTTP 503 |
 | 3 — Bit rot | `cmd/storage-errors.go` | `errFileCorrupt` error definition |
 | 3 — Bit rot | `cmd/xl-storage.go` | XL storage part-file management and read streams |
@@ -1418,7 +1438,7 @@ This appendix consolidates every source code location cited in the five investig
 | 5 — Privilege escalation | `cmd/iam.go` | 2138–2236 — `IsAllowedServiceAccount` (runtime intersection gate) |
 | 5 — Privilege escalation | `cmd/iam.go` | 2197–2201 — defensive `return false` when no parent policy present |
 | 5 — Privilege escalation | `cmd/iam.go` | 2230–2232 — `isAllowedSP && combinedPolicy.IsAllowed(parentArgs)` AND-intersection |
-| 5 — Privilege escalation | `cmd/auth-handler.go` | ~476 — admin-action auth with `DenyOnly: true` for self-targeting operations |
+| 5 — Privilege escalation | `cmd/auth-handler.go` | 466–480 — `DeleteObjectVersionAction` deny-only pre-check (`DenyOnly: true`); an unrelated but similarly-patterned use of the `DenyOnly` flag in the S3 authorization layer. Included here as confirmation that the pattern is also used as a defense-in-depth optimization elsewhere in MinIO, not as self-targeting admin auth. |
 | 5 — Privilege escalation | `~/go/pkg/mod/github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 172–207 — `Policy.IsAllowed` evaluation; ~188 — `if args.DenyOnly { return true }` short-circuit |
 | Common — Infrastructure | `cmd/server-main.go` | Server bootstrap; IAM / KMS init order |
 | Common — Infrastructure | `cmd/globals.go` | Global security constants (`globalMaxSkewTime`, IAM refresh interval) |
