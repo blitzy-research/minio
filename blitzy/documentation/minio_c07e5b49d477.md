@@ -986,7 +986,7 @@ Body: allowed content
 
 #### 4.6.1 `IsAllowedServiceAccount` — the AND intersection gate
 
-**Location:** `cmd/iam.go` lines 2138–2236.
+**Location:** `cmd/iam.go` lines 2140–2237 (func declaration at L2140, closing brace at L2237).
 
 The critical return statement (around lines 2229–2233) is:
 
@@ -1263,7 +1263,7 @@ if !globalIAMSys.IsAllowed(policy.Args{
 
 #### Mechanism 2 — `Policy.IsAllowed(...)` short-circuits under `DenyOnly=true`
 
-**Location:** `github.com/minio/pkg/v3/policy/policy.go` lines 172–207 (in the Go module cache at `~/go/pkg/mod/github.com/minio/pkg/v3@v3.0.22/policy/policy.go`).
+**Location:** `github.com/minio/pkg/v3/policy/policy.go` lines 173–207 (func declaration at L173, closing brace at L207; in the Go module cache at `~/go/pkg/mod/github.com/minio/pkg/v3@v3.0.22/policy/policy.go`).
 
 Structurally (condensed, illustrative — policy.go is MinIO's open-source policy engine):
 
@@ -1300,7 +1300,7 @@ func (p Policy) IsAllowed(args Args) bool {
 
 #### Mechanism 3 — Runtime intersection enforcement
 
-**Location:** `cmd/iam.go` lines 2138–2236 (`IsAllowedServiceAccount`), specifically the decision at line 2232:
+**Location:** `cmd/iam.go` lines 2140–2237 (`IsAllowedServiceAccount`; func declaration at L2140, closing brace at L2237), specifically the decision at line 2232:
 
 ```go
 hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args)
@@ -1345,13 +1345,13 @@ In effect, the `DenyOnly` flag is an **optimization**, not a security hole. It a
 | `cmd/admin-handlers-users.go` | 2714–2818 | `commonAddServiceAccount` — full self-service svcacct creation path |
 | `cmd/admin-handlers-users.go` | 2781 | `denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)` |
 | `cmd/admin-handlers-users.go` | 2785–2801 | `globalIAMSys.IsAllowed` call with `DenyOnly: denyOnly` |
-| `cmd/iam.go` | 2138–2236 | `IsAllowedServiceAccount` dispatch and intersection return |
+| `cmd/iam.go` | 2140–2237 | `IsAllowedServiceAccount` dispatch and intersection return |
 | `cmd/iam.go` | 2230–2232 | `return isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))` |
 | `cmd/iam.go` | 2320–2378 | `isAllowedBySessionPolicyForServiceAccount` |
 | `cmd/iam.go` | 2381–2421 | `isAllowedBySessionPolicy` |
 | `cmd/iam.go` | 2417 | `sessionPolicyArgs.IsOwner = false` |
 | `cmd/auth-handler.go` | 466–480 | `DeleteObjectVersionAction` deny-only pre-check — an unrelated but similarly-patterned use of `DenyOnly: true` in the S3 authorization layer (not admin self-targeting). When a caller issues `DeleteObject` with a `versionId`, the auth layer additionally verifies that no Deny statement covers `DeleteObjectVersionAction`. This confirms the `DenyOnly` pattern is used elsewhere in MinIO as a defense-in-depth optimization. |
-| `github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 172–207 | `Policy.IsAllowed` with `DenyOnly` short-circuit |
+| `github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 173–207 | `Policy.IsAllowed` with `DenyOnly` short-circuit |
 
 ### 5.8 Conclusion
 
@@ -1378,8 +1378,8 @@ The five investigations collectively demonstrate that MinIO's security subsystem
 | 1 | Bucket SSE vs user write permission | Server **transparently injects** `X-Amz-Server-Side-Encryption: AES256` before the object handler; upload succeeds with HTTP 200 and the object is encrypted at rest. The `s3:PutObject` permission remains sufficient; there is no rejection. | `cmd/object-handlers.go:1893-1897` + `internal/bucket/encryption/bucket-sse-config.go:135-153` |
 | 2 | Object Lock COMPLIANCE delete | Returns **HTTP 400 `InvalidRequest`** with body `"Object is WORM protected and cannot be overwritten"`. The `X-Amz-Bypass-Governance-Retention` header is **silently ignored** in COMPLIANCE mode. Delete-without-version-id creates a delete marker (allowed). | `cmd/bucket-object-lock.go:104-123` + `cmd/api-errors.go:1059-1063` |
 | 3 | Bit rot detection (single-drive) | Per-shard `HighwayHash256S` checksum mismatch yields `errFileCorrupt`. In single-drive mode returns **HTTP 503 `SlowDownRead`** with `Retry-After: 60`. In multi-drive erasure mode, healing transparently repairs the shard. | `cmd/xl-storage-format-v1.go:143-155` (type + const) + `cmd/bitrot.go:39-44` (dispatch map) + `cmd/bitrot-streaming.go:183-186` (shard verify) + `cmd/erasure-object.go:395-407` + `cmd/api-errors.go:869-873` |
-| 4 | STS session policy enforcement | **Strict intersection semantics.** A session policy can only narrow, never widen, the parent's permissions. Even root-derived credentials are gated (`IsOwner=false`). | `cmd/iam.go:2138-2236` (decision at 2232) + `cmd/iam.go:2381-2421` (especially 2417) |
-| 5 | Privilege escalation via user mappings / session policy | Direct admin calls are denied. Self-service account creation with `admin:*` session policy **succeeds** (due to `DenyOnly`), but the resulting credentials have no admin power because the runtime AND-intersection clips them to the parent's real permissions. | `cmd/admin-handlers-users.go:2781-2801` + `cmd/iam.go:2232` + `github.com/minio/pkg/v3@v3.0.22/policy/policy.go:~172-207` |
+| 4 | STS session policy enforcement | **Strict intersection semantics.** A session policy can only narrow, never widen, the parent's permissions. Even root-derived credentials are gated (`IsOwner=false`). | `cmd/iam.go:2140-2237` (decision at 2232) + `cmd/iam.go:2381-2421` (especially 2417) |
+| 5 | Privilege escalation via user mappings / session policy | Direct admin calls are denied. Self-service account creation with `admin:*` session policy **succeeds** (due to `DenyOnly`), but the resulting credentials have no admin power because the runtime AND-intersection clips them to the parent's real permissions. | `cmd/admin-handlers-users.go:2781-2801` + `cmd/iam.go:2232` + `github.com/minio/pkg/v3@v3.0.22/policy/policy.go:~173-207` |
 
 ### Cross-Cutting Observations
 
@@ -1413,7 +1413,7 @@ This appendix consolidates every source code location cited in the five investig
 | 2 — Object Lock | `cmd/api-errors.go` | 1059–1063 — `ErrObjectLocked` → `Code="InvalidRequest"`, HTTP 400 |
 | 2 — Object Lock | `internal/bucket/object/lock/lock.go` | Object lock mode constants (`RetGovernance`, `RetCompliance`); `LegalHoldStatus`; retention validation |
 | 3 — Bit rot | `cmd/xl-storage-format-v1.go` | 143–155 — `BitrotAlgorithm` type declaration and const block (`SHA256`, `HighwayHash256`, `HighwayHash256S`, `BLAKE2b512`); `DefaultBitrotAlgorithm = HighwayHash256S` at line 158 |
-| 3 — Bit rot | `cmd/bitrot.go` | 39–44 — `bitrotAlgorithms map[BitrotAlgorithm]string` runtime dispatch; 46–65 — `BitrotAlgorithm.New()` constructor per algorithm; 157–206 — `bitrotVerify()` with multiple checksum-mismatch `errFileCorrupt` returns (lines ~163, 166, 178, 201, 205–206); `bitrotSelfTest()` |
+| 3 — Bit rot | `cmd/bitrot.go` | 39–44 — `bitrotAlgorithms map[BitrotAlgorithm]string` runtime dispatch; 46–65 — `BitrotAlgorithm.New()` constructor per algorithm; 157–210 — `bitrotVerify()` (func declaration at L158, closing brace at L210) with multiple checksum-mismatch `errFileCorrupt` returns at lines 163, 166, 178, 201, 206; `bitrotSelfTest()` at L218+ |
 | 3 — Bit rot | `cmd/bitrot-streaming.go` | Streaming HighwayHash256S writer/reader — per-shard checksum interleaving and verification; lines 183–186 perform `if !bytes.Equal(b.h.Sum(nil), b.hashBytes) { return 0, errFileCorrupt }` (the actual per-shard checksum mismatch path) |
 | 3 — Bit rot | `cmd/bitrot-whole.go` | Whole-file (non-streaming) bitrot writer/reader |
 | 3 — Bit rot | `cmd/erasure-object.go` | 395–407 — corruption detection path; `healOnce.Do(...)` with `BitrotScan: true` |
@@ -1421,25 +1421,26 @@ This appendix consolidates every source code location cited in the five investig
 | 3 — Bit rot | `cmd/api-errors.go` | 869–873 — `ErrSlowDownRead` → `Code="SlowDownRead"`, HTTP 503 |
 | 3 — Bit rot | `cmd/storage-errors.go` | `errFileCorrupt` error definition |
 | 3 — Bit rot | `cmd/xl-storage.go` | XL storage part-file management and read streams |
-| 4 — STS / session policy | `cmd/iam.go` | 2138–2236 — `IsAllowedServiceAccount` full function |
+| 4 — STS / session policy | `cmd/iam.go` | 2140–2237 — `IsAllowedServiceAccount` full function |
 | 4 — STS / session policy | `cmd/iam.go` | 2229–2232 — decision return: `isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))` |
 | 4 — STS / session policy | `cmd/iam.go` | 2239–2317 — `IsAllowedSTS` (same intersection pattern for STS creds) |
 | 4 — STS / session policy | `cmd/iam.go` | 2320–2378 — `isAllowedBySessionPolicyForServiceAccount` |
 | 4 — STS / session policy | `cmd/iam.go` | 2381–2421 — `isAllowedBySessionPolicy` generic |
 | 4 — STS / session policy | `cmd/iam.go` | 2417 — `sessionPolicyArgs.IsOwner = false` |
-| 4 — STS / session policy | `cmd/iam.go` | 2436–2483 — `IsAllowed` dispatch chain routing to STS / service-account / regular-user |
-| 4 — STS / session policy | `cmd/iam.go` | 1022–1123 — `NewServiceAccount` embeds session policy in JWT claims |
+| 4 — STS / session policy | `cmd/iam.go` | 2437–2483 — `IsAllowed` dispatch chain routing to STS / service-account / regular-user |
+| 4 — STS / session policy | `cmd/iam.go` | 1022–1114 — `NewServiceAccount` embeds session policy in JWT claims; specifically L1065–1067: `if len(policyBuf) > 0 { m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf); m[iamPolicyClaimNameSA()] = embeddedPolicyType }` |
 | 4 — STS / session policy | `cmd/sts-handlers.go` | 44–150 — STS handler registration; `populateSessionPolicy` |
-| 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 649–760 — `AddServiceAccount` handler (validates caller identity; sets `denyOnly` for self-targeting) |
+| 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 650–793 — `AddServiceAccount` handler (validates caller identity; sets `denyOnly` for self-targeting) |
 | 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 2714–2818 — `commonAddServiceAccount` (common creation path) |
 | 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 2781 — `denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)` |
 | 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 2785–2801 — `globalIAMSys.IsAllowed` with `DenyOnly: denyOnly` |
-| 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 195–215 — `AddUser` handler with `checkDenyOnly` parallel |
-| 5 — Privilege escalation | `cmd/iam.go` | 2138–2236 — `IsAllowedServiceAccount` (runtime intersection gate) |
+| 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 180–232 — `GetUserInfo` handler illustrating the `checkDenyOnly` self-targeting parallel (pattern: `checkDenyOnly := false` at L199 → set `true` at L203 when `name == cred.AccessKey` (check at L200) → passed as `DenyOnly: checkDenyOnly` in `policy.Args` at L213). The real `AddUser` handler implements the same pattern — see the row immediately below. |
+| 5 — Privilege escalation | `cmd/admin-handlers-users.go` | 444–557 — `AddUser` handler with `checkDenyOnly` parallel (`checkDenyOnly := false` at L495 → set `true` at L499 when `accessKey == cred.AccessKey` (check at L496) → passed as `DenyOnly: checkDenyOnly` in `policy.Args` at L509). This is the handler originally intended by the AAP §0.4.1 reference; the row above documents the same pattern at the earlier line range where QA originally located it. |
+| 5 — Privilege escalation | `cmd/iam.go` | 2140–2237 — `IsAllowedServiceAccount` (runtime intersection gate) |
 | 5 — Privilege escalation | `cmd/iam.go` | 2197–2201 — defensive `return false` when no parent policy present |
 | 5 — Privilege escalation | `cmd/iam.go` | 2230–2232 — `isAllowedSP && combinedPolicy.IsAllowed(parentArgs)` AND-intersection |
 | 5 — Privilege escalation | `cmd/auth-handler.go` | 466–480 — `DeleteObjectVersionAction` deny-only pre-check (`DenyOnly: true`); an unrelated but similarly-patterned use of the `DenyOnly` flag in the S3 authorization layer. Included here as confirmation that the pattern is also used as a defense-in-depth optimization elsewhere in MinIO, not as self-targeting admin auth. |
-| 5 — Privilege escalation | `~/go/pkg/mod/github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 172–207 — `Policy.IsAllowed` evaluation; ~188 — `if args.DenyOnly { return true }` short-circuit |
+| 5 — Privilege escalation | `~/go/pkg/mod/github.com/minio/pkg/v3@v3.0.22/policy/policy.go` | 173–207 — `Policy.IsAllowed` evaluation (func declaration at L173, closing brace at L207); L188 — `if args.DenyOnly { return true }` short-circuit |
 | Common — Infrastructure | `cmd/server-main.go` | Server bootstrap; IAM / KMS init order |
 | Common — Infrastructure | `cmd/globals.go` | Global security constants (`globalMaxSkewTime`, IAM refresh interval) |
 | Common — Infrastructure | `cmd/routers.go` | 9-handler middleware chain definition |
