@@ -12,9 +12,9 @@
 
 **The read-only boundary HOLDS. No bypass hides in the corners, and no TOCTOU window was found.**
 
-Across **48 distinct probes** plus a **1,780-attempt concurrent TOCTOU storm**, a read-only identity could **not** mutate a single byte, object, tag, version, ACL, retention setting, or multipart part. Every mutation-capable or mutation-adjacent operation returned a true authorization denial (**HTTP 403 `AccessDenied`**, or per-object `AccessDenied` for bulk delete), and **every denial was corroborated by a byte-for-byte storage side-effect check** showing the backend identical to a recorded baseline (normalized manifest hash `62b7fdb620a4ec26dd4b3b8bb7195eb6`).
+Across **47 distinct probes** plus a **2,804-attempt concurrent TOCTOU storm**, a read-only identity could **not** mutate a single byte, object, tag, version, ACL, retention setting, or multipart part. Every mutation-capable or mutation-adjacent operation returned a true authorization denial (**HTTP 403 `AccessDenied`**, or per-object `AccessDenied` for bulk delete), and **every denial was corroborated by a byte-for-byte storage side-effect check** showing the backend identical to a recorded baseline (normalized manifest hash `6ea533261c5e5fb9bbac77778ecd9f8e`).
 
-The reason is structural, not incidental: **authorization (`IAMSys.IsAllowed` [cmd/iam.go:L2437]) is evaluated inside the auth handler *before* the object-layer/erasure engine is ever invoked**, under a **deny-by-default** model. A denied request returns from the handler without taking a namespace lock or touching storage, so there is no code path — and therefore no race window — by which a denied operation can produce a side effect.
+The reason is structural, not incidental: under a **deny-by-default** model, **every write-adjacent handler gates its durable mutation behind a successful `IAMSys.IsAllowed` decision [cmd/iam.go:L2437]**. In the common case that check runs in the auth handler before the object layer is entered at all; in the two handlers that perform a non-mutating pre-auth read (`DeleteObjectTagging`) or authorize inside a metadata callback (`PutObjectRetention`), the decision still precedes any namespace-locked write/rename or metadata commit (the precise three-category audit is in Section 6). A denied request therefore never reaches the durable mutation, so there is no code path — and hence no race window — by which it can produce a side effect.
 
 Two precise nuances refine (and strengthen) this verdict and are documented in full below:
 1. **`GetObjectAttributes` is *denied* for the canned read-only user** even though that user can fully `GetObject` the same object — because the handler requires `s3:GetObjectAttributes` **AND** `s3:GetObject` (logical AND), not an OR-fallback [cmd/object-handlers.go:L593-L596].
@@ -69,7 +69,7 @@ CGO_ENABLED=0 go build -tags kqueue -trimpath -o /tmp/minio-investigation/minio_
 ```
 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 MINIO_BROWSER=off \
   /tmp/minio-investigation/minio_bin server /tmp/minio-investigation/data --address 127.0.0.1:9000
-# GET /minio/health/live  -> 200
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/minio/health/live   # -> 200
 ```
 A single node fully exercises the authorization decision because authorization is decided **before** the erasure/data-plane layer; quorum mechanics do not change the deny path. The backend stores objects in `xl.meta` format (single-node, single-drive).
 
@@ -79,9 +79,9 @@ A single node fully exercises the authorization decision because authorization i
 - `roprefix / roprefix12345` → custom prefix-scoped policy — **Variant B**
 
 **Step 4 — Seed baseline state and record inventory** (keys, sizes, ETags, version IDs):
-- `testbucket` (versioning **enabled**): `readable/f1.txt` (50 B, ETag `d0a31ea3…`, tagged `team=research&class=public`), `readable/f2.txt` (51 B), `secret/secret.txt` (27 B)
+- `testbucket` (versioning **enabled**): `readable/f1.txt` (50 B, ETag `0219f6ab…`, tagged `team=research&class=public`), `readable/f2.txt` (51 B), `secret/secret.txt` (27 B)
 - `lockbucket` (object-lock **enabled** + versioned): `locked.txt` (19 B)
-- On-disk baseline: normalized manifest of all object `xl.meta` files → combined hash **`62b7fdb620a4ec26dd4b3b8bb7195eb6`**
+- On-disk baseline: normalized manifest of all object `xl.meta` files → combined hash **`6ea533261c5e5fb9bbac77778ecd9f8e`**
 
 ---
 
@@ -136,12 +136,22 @@ Middleware chain ─ setAuthMiddleware (classify auth type, validate skew)   [cm
 Auth Handler ─ checkRequestAuthType / isPutActionAllowed                    [cmd/auth-handler.go]
    ▼
 IAMSys.IsAllowed(action, resource, conditions)                              [cmd/iam.go:L2437]
-   ├── DENY  ─► handler returns 403 AccessDenied; Object Handler & Erasure Engine NEVER invoked
+   ├── DENY  ─► handler returns 403 AccessDenied; the durable storage mutation (namespace lock + temp write + atomic rename) is never reached
    └── ALLOW ─► proceed ─► Object/Multipart Handler ─► Erasure Engine
                            (namespace lock, write to .minio.sys/tmp, write-quorum, atomic rename)
 ```
 
-The authorization call happens **before** any object-layer call in every write-adjacent handler. Because a denied request returns from the handler **before** the namespace lock is taken or any temp write/rename occurs, **there is no execution path by which a denied request can mutate storage** — and therefore no race against concurrent writers can manufacture one. The concurrent-load experiment (Section 9) validates this empirically.
+### The three handler categories (where authorization sits relative to the object layer)
+
+**The precise invariant (stated exactly, not over-simplified).** The security-relevant guarantee is **not** the blanket claim that "the object layer is never touched on a denial" — that is too strong, because two of the probed handlers legitimately make a non-mutating object-layer call, or run their authorization check inside an object-layer callback, before the decision is final. The exact, source-accurate invariant is narrower: **in every write-adjacent handler the durable storage *mutation* is gated behind a successful `IsAllowed` decision; the only object-layer calls that may execute *before* that decision are non-mutating reads or request validation.** Auditing every probed handler against the source, they fall into three categories — and in all three a denial leaves storage byte-for-byte unchanged (verified in Sections 8–9):
+
+- **Category 1 — authorize before any object-layer call (the common case).** The handler calls `checkRequestAuthType`/`isPutActionAllowed` → `IsAllowed` first; on denial it returns immediately, never constructing an object-layer request. This covers `PutObject` [cmd/object-handlers.go:L1836], `UploadPart`, `CopyObject` [cmd/object-handlers.go:L1173,L1206], the multipart family [cmd/object-multipart-handlers.go:L83,L268,L927,L1118,L1162], `DeleteObject` [cmd/object-handlers.go:L2528], the per-object check in bulk delete [cmd/bucket-handlers.go:L505], `PutObjectTagging` (new tags are parsed from the **request body** [cmd/object-handlers.go:L3141,L3148], so authorization at [cmd/object-handlers.go:L3151] precedes the `GetObjectInfo` at [cmd/object-handlers.go:L3162]), `PutObjectLegalHold` (authz at [cmd/object-handlers.go:L2718] precedes `GetBucketInfo` at [cmd/object-handlers.go:L2723]), ACL, and all listing/HEAD handlers.
+
+- **Category 2 — a safe, non-mutating pre-auth read; the mutation is strictly post-auth.** `DeleteObjectTaggingHandler` deliberately calls `objAPI.GetObjectInfo` [cmd/object-handlers.go:L3259] **before** `checkRequestAuthType(DeleteObjectTaggingAction)` [cmd/object-handlers.go:L3301], specifically to load the object's *existing* tags into the `X-Amz-Tagging` header [cmd/object-handlers.go:L3297] so tag-conditioned policies can be evaluated. That pre-auth call is a **read**; the mutation `objAPI.DeleteObjectTags` [cmd/object-handlers.go:L3313] runs only after authorization passes. (Contrast `PutObjectTagging`, whose new tags arrive in the request body, so it authorizes first — the asymmetry is by design.) A denied request therefore performs a harmless read and returns `403` with the tags intact — confirmed by the side-effect check (Section 8).
+
+- **Category 3 — authorization evaluated *inside* the object-layer metadata callback, ahead of the durable write.** `PutObjectRetentionHandler` validates the signature [cmd/object-handlers.go:L2874], reads bucket info [cmd/object-handlers.go:L2880], enforces the `Content-MD5` and lock-enabled gates, parses the retention body [cmd/object-handlers.go:L2895], then calls `PutObjectMetadata` [cmd/object-handlers.go:L2933] passing an `EvalMetadataFn` callback [cmd/object-handlers.go:L2912] that performs the `PutObjectRetentionAction` authorization via `enforceRetentionBypassForPut` [cmd/bucket-object-lock.go:L167] → `isPutRetentionAllowed` [cmd/auth-handler.go:L704] → `IsAllowed`. The erasure layer invokes this callback **before** committing any change: `PutObjectMetadata` evaluates `EvalMetadataFn` and, on its error, returns `ObjectInfo{}, err` at [cmd/erasure-object.go:L2181-L2183] — *before* `updateObjectMeta` performs the durable on-disk write at [cmd/erasure-object.go:L2192]. So even though the authorization is embedded in the object layer, a denial aborts ahead of the write and produces no side effect — confirmed empirically: the valid-`Content-MD5` retention probe returned `403` with the object's `xl.meta` unchanged.
+
+Across all three categories the conclusion is identical and is grounded in the **actual call ordering** rather than a blanket assertion: **a denied write-adjacent request never reaches the durable mutation, so there is no execution path — and hence no race window — by which it can change storage.** The concurrent-load experiment (Section 9) validates this empirically under sustained same-prefix contention.
 
 ---
 
@@ -180,7 +190,7 @@ Legend: **HTTP/S3** is the captured trace; **Side effect** is the storage check;
 
 After each probe wave the backend was checked two independent ways:
 
-1. **On-disk (authoritative byte-level):** re-snapshot every object `xl.meta` under the data directory, normalize paths, and compare md5 + a combined manifest hash against the baseline. After the full static probe matrix (Sections 7, 10, 11): **`CURRENT == BASELINE == 62b7fdb620a4ec26dd4b3b8bb7195eb6`**, manifest diff **empty (4/4 objects byte-for-byte identical)**, only the 4 baseline object directories present, **0** pending multipart upload directories, and **all** would-be probe artifacts (`copy.txt`, `ro-mpu.txt`, `presigned-evil.txt`, `secret/presigned-evil2.txt`, `post-evil.txt`) **absent**.
+1. **On-disk (authoritative byte-level):** re-snapshot every object `xl.meta` under the data directory, normalize paths, and compare md5 + a combined manifest hash against the baseline. After the full static probe matrix (Sections 7, 10, 11): **`CURRENT == BASELINE == 6ea533261c5e5fb9bbac77778ecd9f8e`**, manifest diff **empty (4/4 objects byte-for-byte identical)**, only the 4 baseline object directories present, **0** pending multipart upload directories, and **all** would-be probe artifacts (`readable/ro-copy.txt`, `readable/ro-copy2.txt`, `readable/ro-mpu.txt`, `readable/ro-presign.txt`, `secret/ro-presign2.txt`, `readable/ro-postpolicy.txt`) **absent**.
 
 2. **S3-layer (oracle corroboration):** listing via the authorized `writer` identity reported exactly the 3 seeded `testbucket` objects (same sizes/ETags), **3 versions, 0 delete markers**, and `readable/f1.txt` tags still `{class=public, team=research}` — confirming the denied `PutObjectTagging`/`DeleteObjectTagging`/`CopyObject(REPLACE)`/`DeleteObject` probes changed nothing.
 
@@ -190,27 +200,58 @@ After each probe wave the backend was checked two independent ways:
 
 ## 9. Concurrent-Load / TOCTOU Results
 
-**Setup:** 6 legitimate **writer** threads churned the `churn/` prefix of `testbucket` (rapid `PutObject` + `PutObjectTagging` + `DeleteObject` + `CreateMultipartUpload`/`Abort`), creating namespace-lock contention and a constantly-moving race surface, while 6 **read-only** (`rocanned`) threads raced four mutation classes each iteration:
+**Setup:** 6 legitimate **writer** threads (identity `writer`, canned `readwrite`) churned the **`readable/churn/`** prefix of `testbucket` — deliberately the **same `readable/` prefix the read-only identity is scoped to read**, so the contention lands on the exact key-space under test (not a disjoint `churn/` bucket). Each writer iteration exercised the full spread of write **and** metadata traffic the AAP calls for, against that shared prefix:
+- `PutObject` (new object `readable/churn/w*`),
+- **`CopyObject`** — a copy-style write with source `readable/f1.txt` → `readable/churn/copy-*` (this is the copy traffic the prior version of this report was missing),
+- `PutObjectTagging` (metadata mutation on a churn key),
+- **`HeadObject`** (stat) and **`ListObjectsV2`** with `prefix=readable/` (the list/stat traffic the prior version was missing),
+- `DeleteObject`, and periodic `CreateMultipartUpload`/`AbortMultipartUpload`.
+
+Simultaneously, 6 **read-only** (`rocanned`) threads raced four mutation classes each iteration, **all targeting the same `readable/` prefix**:
 - `PutObject` of a **uniquely-named canary** `readable/RO-CANARY-<uuid>.txt` (a definitive positive breach test — only the read-only identity ever attempts these names),
 - a raw SigV4 **presigned-style PUT** `readable/RO-PRESIGN-*`,
-- `DeleteObject` of a **live churn key** the writer had just created,
+- `DeleteObject` of a **live churn key** a writer had just created (the sharpest TOCTOU race — the read-only delete and the writer's lifecycle collide on the identical key),
 - `CreateMultipartUpload` `readable/RO-MPU-*`.
 
-**Outcome (8.2 s):**
+**Outcome (9.13 s wall-clock):**
 
 | Metric | Value |
 |--------|-------|
-| Concurrent legitimate writer ops | **2,502** |
-| Read-only mutation attempts | **1,780** |
-| Read-only **successes** | **0** |
-| Read-only `403 AccessDenied` | **1,778** |
-| **Breaches** (any canary/part/delete that took effect) | **0 (empty)** |
+| Concurrent legitimate writer ops (across 8 classes) | **3,264** |
+| Read-only mutation attempts (across 4 classes) | **2,804** |
+| Read-only **successes** (HTTP 2xx) | **0** |
+| Read-only `403 AccessDenied` | **2,804** |
+| **Breaches** (any canary/part/delete that took effect) | **0 (empty list)** |
 
-Per-class denial counts: `PutObject` 445, presigned-PUT 445, `CreateMultipartUpload` 445, race-`DeleteObject` 443 — all `403`.
+**Writer traffic by class** — confirms the contention spans writes *and* the copy + list/stat metadata surface required by the AAP, all on the shared `readable/` prefix:
 
-**Post-storm side-effect check:** **zero** `RO-CANARY*`/`RO-PRESIGN*`/`RO-MPU*` artifacts anywhere on disk; the 4 baseline objects byte-for-byte identical. After purging the writers' *legitimate* churn (including delete-marker versions — see note), the data directory returned **exactly** to the baseline hash `62b7fdb620a4ec26dd4b3b8bb7195eb6` with an empty diff.
+| Writer op | Count |
+|-----------|------:|
+| `PutObject` | 490 |
+| `CopyObject` (copy-style write) | 490 |
+| `PutObjectTagging` | 490 |
+| `HeadObject` (stat) | 490 |
+| `ListObjectsV2` (`prefix=readable/`) | 490 |
+| `DeleteObject` | 490 |
+| `CreateMultipartUpload` | 162 |
+| `AbortMultipartUpload` | 162 |
+| **Total** | **3,264** |
 
-**Interpretation:** Under sustained contention, **no TOCTOU window exists**. This is the empirical confirmation of the code invariant from Section 6: because `IsAllowed` is evaluated before the object layer and a denial returns immediately, concurrent writers cannot create a moment in which a denied read-only request slips through to storage.
+**Read-only attempt accounting — every attempt classified, the totals close exactly.** Each read-only attempt is counted into exactly one mutually-exclusive outcome bucket (`403 AccessDenied`, 2xx breach, 4xx validation reject, 5xx, or SDK/transport error), so the per-class row and the per-outcome columns both sum to the grand total with **nothing left unaccounted**:
+
+| Read-only class | Attempts | `403 AccessDenied` | 2xx breach | 4xx validation | 5xx | SDK/transport error |
+|-----------------|---------:|-------------------:|-----------:|---------------:|----:|--------------------:|
+| `PutObject` canary `readable/RO-CANARY-*` | 701 | 701 | 0 | 0 | 0 | 0 |
+| presigned-PUT `readable/RO-PRESIGN-*` | 701 | 701 | 0 | 0 | 0 | 0 |
+| `CreateMultipartUpload` `readable/RO-MPU-*` | 701 | 701 | 0 | 0 | 0 | 0 |
+| race-`DeleteObject` of a live `readable/churn/*` key | 701 | 701 | 0 | 0 | 0 | 0 |
+| **Total** | **2,804** | **2,804** | **0** | **0** | **0** | **0** |
+
+The accounting closes with **zero residual**: 2,804 attempts = 2,804 `403` + 0 + 0 + 0 + 0. There were **no** non-`403` outcomes — no validation rejections, timeouts, cancellations, SDK/transport errors, or non-S3 responses — so there is no unexplained gap between attempts and denials. (Every read-only mutation class is gated at authorization *before* any object-existence or request-shape check, so even a `DeleteObject` racing a just-deleted key returns `403`, not `404`.)
+
+**Post-storm side-effect check:** **zero** `RO-CANARY*`/`RO-PRESIGN*`/`RO-MPU*` artifacts anywhere on disk and **zero** read-only-created keys in the oracle inventory; the 4 baseline objects byte-for-byte identical. After purging the writers' *legitimate* churn (1,470 object versions and delete-markers, via the authorized oracle — including delete-marker versions, see note) and confirming 0 pending multipart uploads, the data directory returned **exactly** to the baseline hash `6ea533261c5e5fb9bbac77778ecd9f8e` with an empty diff.
+
+**Interpretation:** Under sustained **same-prefix** contention, **no TOCTOU window exists**. This is the empirical confirmation of the code invariant from Section 6: because every write-adjacent handler gates its durable mutation behind the `IsAllowed` decision — whether checked before the object layer (Category 1), after a safe non-mutating pre-auth read (Category 2), or inside the pre-write metadata callback (Category 3) — concurrent writers cannot create a moment in which a denied read-only request slips through to storage.
 
 > *Secondary observation (versioning semantics, not a security finding):* on a versioned bucket, the writers' `DeleteObject` calls created delete markers, so prior-version `xl.meta` persisted on disk until an explicit `--versions` purge. This is documented MinIO behavior [docs/bucket/versioning/README.md] and is orthogonal to the authorization question.
 
@@ -224,8 +265,8 @@ Per-class denial counts: `PutObject` 445, presigned-PUT 445, `CreateMultipartUpl
 | ListObjectsV2 (`prefix=readable/`) | `s3:ListBucket` + `s3:prefix` | [cmd/bucket-listobjects-handlers.go:L172] | **403** | **200** (lists `readable/*`) |
 | ListObjectsV2 (`prefix=secret/`) | `s3:ListBucket` + `s3:prefix` | [cmd/bucket-listobjects-handlers.go:L172] | **403** | **403** (prefix outside grant) |
 | ListObjectsV1 | `s3:ListBucket` | [cmd/bucket-listobjects-handlers.go:L273,L287] | **403** | **403** (no prefix) |
-| ListObjectVersions (no prefix) | `s3:ListBucket` | [cmd/bucket-listobjects-handlers.go:L62] | **403** | **403** |
-| ListObjectVersions (`prefix=readable/`) | `s3:ListBucket` + `s3:prefix` | [cmd/bucket-listobjects-handlers.go:L62] | **403** | **200** |
+| ListObjectVersions (no prefix) | `s3:ListBucketVersions` (primary), `s3:ListBucket` (fallback) | authz [cmd/bucket-listobjects-handlers.go:L87]; fallback [cmd/auth-handler.go:L495-L509] | **403** | **403** |
+| ListObjectVersions (`prefix=readable/`) | `s3:ListBucketVersions` (primary), `s3:ListBucket` + `s3:prefix` (fallback) | authz [cmd/bucket-listobjects-handlers.go:L87]; fallback [cmd/auth-handler.go:L495-L509] | **403** | **200** (via `ListBucket` fallback) |
 | HeadBucket | `s3:ListBucket` | [cmd/bucket-handlers.go:L1644,L1658] | **403** | **403** (HEAD sends no prefix) |
 | HeadObject (`readable/f1`) | `s3:GetObject` | `headObjectHandler` | **200** | **200** |
 | HeadObject (`secret/secret`) | `s3:GetObject` | `headObjectHandler` | **200** | **403** (GetObject scoped to `readable/*`) |
@@ -234,6 +275,7 @@ Per-class denial counts: `PutObject` 445, presigned-PUT 445, `CreateMultipartUpl
 **What this means:**
 - **Variant A (canned `readonly`) cannot enumerate at all** — every `List*` is `403`, because the canned policy has no `s3:ListBucket` (matching the intentional omission in [github.com/minio/pkg/v3@v3.0.22/policy/constants.go:L53-L60]). But it **can** `HeadObject`/`GetObject` **any** key it knows across **all** prefixes (including `secret/`), since its `GetObject` is granted on `arn:aws:s3:::*`.
 - **Variant B confines both listing and head/get to the `readable/` prefix.** `secret/` is fully invisible: it can neither be listed nor head-ed. This is the correct least-privilege shape.
+- **`ListObjectVersions` authorizes against `s3:ListBucketVersions` first**, not `s3:ListBucket`. `ListObjectVersionsHandler` checks `policy.ListBucketVersionsAction` [cmd/bucket-listobjects-handlers.go:L87] (constant `"s3:ListBucketVersions"` [github.com/minio/pkg/v3@v3.0.22/policy/action.go:L84]); if that is not granted, `authorizeRequest` **falls back to `s3:ListBucket`** [cmd/auth-handler.go:L495-L509] (with an equivalent anonymous-path fallback at [cmd/auth-handler.go:L447-L460]), because MinIO treats the two as equivalent ("s3:ListBucket permission is same as s3:ListBucketVersions"). Neither read-only policy grants `s3:ListBucketVersions`, so the observed `ListObjectVersions` results are produced **entirely by the `s3:ListBucket` fallback**: Variant A has no `ListBucket` at all → `403`; Variant B grants `ListBucket` only under the `s3:prefix=readable/*` condition, so the no-prefix call fails the condition (`403`) while `prefix=readable/` satisfies it (`200`). This is why the disclosure answer for versions tracks the plain-`ListBucket` answer exactly.
 
 **Metadata observable without reading object bytes:**
 - `ListObjectsV2` (Variant B) exposes per object: **Key, Size, ETag, LastModified, StorageClass, Owner** (DisplayName + canonical ID).
@@ -276,7 +318,7 @@ Line 595 (the `GetObject` check) executes **only if** the `GetObjectAttributesAc
 
 ### 12.2 A `400` validation rejection is not a `403` authorization denial
 - **Bulk `DeleteObjects`** checks for the **`Content-Md5` request header's presence first** [cmd/bucket-handlers.go:L432-L433]; absent → `400 MissingContentMD5`, **before** authorization runs. (The gate is header-presence only — a checksum trailer does not substitute at this point.) With a valid `Content-MD5`, the request clears the gate and reaches **per-object** authorization [cmd/bucket-handlers.go:L505], which denies each object and **continues** (records a per-object `AccessDenied` rather than failing the whole request) — yielding **HTTP 200 with per-object `AccessDenied` and zero `<Deleted>` entries**. The bucket-level check at [cmd/bucket-handlers.go:L471] intentionally ignores its error (it only populates the access-key for logging); the authoritative decision is the per-object one.
-- **`PutObjectRetention`** likewise requires `Content-MD5` [cmd/object-handlers.go:L2855] and an object-lock-enabled bucket *before* authorization; on a lock-enabled bucket with a valid `Content-MD5` it reaches `isPutRetentionAllowed` [cmd/auth-handler.go:L704] → `IsAllowed(PutObjectRetentionAction)` and returns **403**.
+- **`PutObjectRetention`** likewise requires `Content-MD5` [cmd/object-handlers.go:L2855] and an object-lock-enabled bucket *before* authorization; on a lock-enabled bucket with a valid `Content-MD5` it parses the retention body [cmd/object-handlers.go:L2895] and calls `PutObjectMetadata` with an `EvalMetadataFn` callback [cmd/object-handlers.go:L2912] that performs the authorization via `enforceRetentionBypassForPut` [cmd/bucket-object-lock.go:L167] → `isPutRetentionAllowed` [cmd/auth-handler.go:L704] → `IsAllowed(PutObjectRetentionAction)`. That callback is evaluated **before** the durable metadata write [cmd/erasure-object.go:L2181-L2192], so the denial returns **403** with no side effect (verified — the valid-`Content-MD5` retention probe left `locked.txt`'s `xl.meta` unchanged).
 
 The harness sent valid `Content-MD5` values precisely so the **authorization** decision (still denial) could be observed, and reported both the `400` and the `403`/per-object cases so the two are never conflated. Object-lock retention/legal-hold WORM semantics are themselves enforced independently of IAM [cmd/bucket-object-lock.go:L167].
 
@@ -293,9 +335,9 @@ The **primary identity under test is a static IAM user**. Research surfaced a la
 **The read-only boundary HOLDS at commit `c07e5b49d`. A principal intended to be read-only on a bucket/prefix cannot mutate data through any probed write-adjacent surface — multipart, copy, tagging, ACL, retention, legal-hold, single or bulk delete — nor through presigned-URL, POST-policy, or reserved-bucket corners, and not under concurrent write contention.**
 
 **Why (rationale, grounded in code + evidence):**
-1. **Deny-by-default at a single chokepoint.** Every write-adjacent handler routes through `s3APIMiddleware` [cmd/api-router.go:L210] to an auth entry point that calls `IsAllowed` [cmd/iam.go:L2437], which denies anything not explicitly granted. The read-only policies grant no mutating action, so all mutations are denied. *(Evidence: 18/18 write-adjacent ops `403`/per-object `AccessDenied`.)*
-2. **Authorization precedes the data plane.** The `IsAllowed` decision is made in the auth handler *before* the object/erasure layer is reached; a denial returns immediately, taking no namespace lock and writing no temp/rename. *(Evidence: every denial corroborated by a byte-for-byte unchanged backend.)*
-3. **No TOCTOU window.** Because there is no code path from "denied" to "storage," concurrency cannot manufacture one. *(Evidence: 1,780 read-only mutation attempts against 2,502 concurrent legitimate writes → 0 successes, 0 breaches, baseline restored exactly.)*
+1. **Deny-by-default at a single chokepoint.** Every write-adjacent handler routes through `s3APIMiddleware` [cmd/api-router.go:L210] to an auth entry point that calls `IsAllowed` [cmd/iam.go:L2437], which denies anything not explicitly granted. The read-only policies grant no mutating action, so all mutations are denied. *(Evidence: every write-adjacent probe denied — direct `403 AccessDenied` for the mutation APIs; the two `Content-MD5`-gated paths return `400` pre-auth and `403` once well-formed; bulk delete returns a `200` envelope with per-object `AccessDenied` and 0 deleted.)*
+2. **The durable mutation is always gated behind authorization.** In the common case the `IsAllowed` decision is made before the object layer is reached at all; in the two nuanced handlers a non-mutating pre-auth read (`DeleteObjectTagging` [cmd/object-handlers.go:L3259]) or an authorization check embedded in the metadata callback (`PutObjectRetention`, whose `EvalMetadataFn` is evaluated before `updateObjectMeta` [cmd/erasure-object.go:L2181-L2192]) still precedes the durable write (see the three-category audit in Section 6). In all cases a denial aborts before any namespace-locked temp-write/rename or metadata commit. *(Evidence: every denial corroborated by a byte-for-byte unchanged backend.)*
+3. **No TOCTOU window.** Because there is no code path from "denied" to the durable mutation, concurrency cannot manufacture one. *(Evidence: 2,804 read-only mutation attempts against 3,264 concurrent legitimate writes on the same `readable/` prefix → 0 successes, 0 breaches, every attempt accounted for as a `403`, baseline restored exactly.)*
 4. **The corners are closed and the gates are honest.** Presigned/POST-policy requests are still IAM-checked; reserved buckets are blocked for all identities by a separate guard; and request-validation `400`s are correctly distinguished from authorization `403`s.
 
 **Caveats bounding the verdict:** findings pertain to this exact checkout (`c07e5b49d`) and the pinned policy package `github.com/minio/pkg/v3 v3.0.22`. The identity under test is a **static IAM user**; STS/service-account **session policies** are an adjacent surface noted for awareness (Section 13) but not exercised here. The disclosure surface differs by policy: the canned `readonly` role permits `HeadObject`/`GetObject` on *known keys across all prefixes* (no listing), whereas a properly prefix-scoped policy confines both listing and read to the intended prefix — a configuration choice, not a vulnerability.
@@ -319,7 +361,7 @@ All under `/tmp/minio-investigation/` (outside the repo): `minio_bin` (built ser
 | PutObjectTagging | `PutObjectTaggingHandler` [cmd/object-handlers.go:L3122] | `PutObjectTaggingAction` [L3151] | `checkRequestAuthType` |
 | DeleteObjectTagging | `DeleteObjectTaggingHandler` [cmd/object-handlers.go:L3235] | `DeleteObjectTaggingAction` [L3301] | `checkRequestAuthType` |
 | PutObjectLegalHold | `PutObjectLegalHoldHandler` [cmd/object-handlers.go:L2698] | `PutObjectLegalHoldAction` [L2718] | `checkRequestAuthType` |
-| PutObjectRetention | `PutObjectRetentionHandler` [cmd/object-handlers.go:L2855] | `PutObjectRetentionAction` [cmd/auth-handler.go:L728-L731] | `isPutRetentionAllowed` [cmd/auth-handler.go:L704] |
+| PutObjectRetention | `PutObjectRetentionHandler` [cmd/object-handlers.go:L2855] | `PutObjectRetentionAction` [cmd/auth-handler.go:L728-L731] | `EvalMetadataFn` [cmd/object-handlers.go:L2912] → `enforceRetentionBypassForPut` [cmd/bucket-object-lock.go:L167] → `isPutRetentionAllowed` [cmd/auth-handler.go:L704] (callback gated before durable write [cmd/erasure-object.go:L2181-L2192]) |
 | GetObjectAttributes | `getObjectAttributesHandler` [cmd/object-handlers.go:L580] | `GetObjectAttributesAction` AND `GetObjectAction` [L593-L596] | `checkRequestAuthType` |
 | NewMultipartUpload | `NewMultipartUploadHandler` [cmd/object-multipart-handlers.go:L64] | `PutObjectAction` [L83] | `checkRequestAuthType` |
 | CopyObjectPart | `CopyObjectPartHandler` [cmd/object-multipart-handlers.go:L244] | `PutObjectAction` [L268] + `GetObjectAction` [L301] | `checkRequestAuthType` |
@@ -330,7 +372,8 @@ All under `/tmp/minio-investigation/` (outside the repo): `minio_bin` (built ser
 | ListMultipartUploads | `ListMultipartUploadsHandler` [cmd/bucket-handlers.go:L251] | `ListBucketMultipartUploadsAction` [L265] | `checkRequestAuthType` |
 | GetBucketLocation | `GetBucketLocationHandler` [cmd/bucket-handlers.go:L204] | `GetBucketLocationAction` [L218] | `checkRequestAuthType` |
 | HeadBucket | `HeadBucketHandler` [cmd/bucket-handlers.go:L1644] | `ListBucketAction` [L1658] | `checkRequestAuthType` |
-| ListObjects v1/v2/versions | [cmd/bucket-listobjects-handlers.go:L273 / L154 / L62] | `ListBucketAction` [L287 / L172] | `checkRequestAuthType` |
+| ListObjects v1 / v2 | `ListObjectsV1Handler` [cmd/bucket-listobjects-handlers.go:L273] / `ListObjectsV2Handler` [cmd/bucket-listobjects-handlers.go:L154] | `ListBucketAction` [L287 / L172] | `checkRequestAuthType` |
+| ListObjectVersions | `ListObjectVersionsHandler` [cmd/bucket-listobjects-handlers.go:L62] | `ListBucketVersionsAction` (authz [cmd/bucket-listobjects-handlers.go:L87]); fallback `ListBucketAction` [cmd/auth-handler.go:L495-L509] | `checkRequestAuthType` |
 | PutObjectACL / PutBucketACL | [cmd/acl-handlers.go:L172 / L61] | `PutBucketPolicyAction` [L193 / L77] | `checkRequestAuthType` |
 | Object-lock (WORM) enforcement | `enforceRetentionBypassForPut` [cmd/bucket-object-lock.go:L167] | (evaluated independently of IAM) | — |
 | Authorization engine | — | `IAMSys.IsAllowed` [cmd/iam.go:L2437]; `IsAllowedSTS` [L2242]; `IsAllowedServiceAccount` [L2140] | deny-by-default |
