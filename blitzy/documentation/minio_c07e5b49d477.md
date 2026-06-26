@@ -81,7 +81,7 @@ WARNING: Host local has more than 2 drives of set. ...
 ```
 
 **Non-root requirement (and why it matters)** — the server was run as a **non-root** user
-(`miniouser`, uid 1001). This is essential for reproducibility: the **root account bypasses
+(`gotester`, uid 1001). This is essential for reproducibility: the **root account bypasses
 discretionary access control (DAC)**, so a process running as root would still be able to read a
 directory after `chmod 000`. Only a non-root process experiences the permission change as a genuine
 *permission denied*, which is exactly the disk-failure condition we want to inject.
@@ -472,17 +472,22 @@ discovers the restored path on its next tick and folds the drive back into the s
 
 ## 7. Q6 — How Are Objects Written While a Disk Was Down Repaired When It Returns?
 
-**Answer.** Three mechanisms cooperate. (a) At write time, an object that cannot reach every drive is
-immediately protected by an **automatic parity upgrade** recorded in its metadata; (b) the partial
-write is **enqueued for healing** through the MRF (Most-Recent-Failures) subsystem; and (c) the object
-stays **fully readable** from its surviving shards throughout, while the **missing shard is later
-reconstructed onto the returned drive via Reed-Solomon healing**. Reconstruction is performed by the
-MRF heal routine, the new-disk/fresh-disk heal monitor, the periodic background data-scanner, and/or
-an operator-triggered `mc admin heal`.
+**Answer.** For the four-drive `EC:2` topology under test, repair is driven by the **healing
+subsystem**, not by a parity upgrade. Three facts cooperate. (a) The 3/4 write **succeeds at write
+quorum using the standard `EC:2` layout** (2 data + 2 parity); because only three drives are online,
+three shards are written and the shard destined for the offline drive is simply *missing*. For this
+topology **no parity upgrade is recorded** — the availability-optimized upgrade path caps parity at
+`len(storageDisks)/2`, which for four drives is already `2`, so the recorded parity does not change
+(the line-by-line trace is below). (b) The partial write is **enqueued for healing** through the MRF
+(Most-Recent-Failures) subsystem. (c) The object stays **fully readable** from its surviving shards
+throughout, while the **missing shard is later reconstructed onto the returned drive via Reed-Solomon
+healing**. Reconstruction is performed by the MRF heal routine, the new-disk/fresh-disk heal monitor,
+the periodic background data-scanner, and/or an operator-triggered `mc admin heal`.
 
-**Code — parity upgrade at write time.** When availability-optimized storage is in effect (the
-default), the write path increases parity for each offline drive and records the upgrade in the
-object's metadata:
+**Code — the availability-optimized parity path, and why it does *not* upgrade this object.** When
+storage is availability-optimized (the default), the write path *conditionally* increases parity for
+each offline drive, **but caps the result at `len(storageDisks)/2`** and only stamps the upgrade
+metadata when the parity actually changed. The full block is:
 
 ```go
 // cmd/erasure-object.go:1291-1318
@@ -516,18 +521,34 @@ if !opts.MaxParity && globalStorageClass.AvailabilityOptimized() {
 }
 ```
 
-The metadata key recording the upgrade is:
+**Applying this to the four-drive `EC:2` run (the case the user asked about).** Default parity is `2`
+(`EC:2`), so `parityOrig = 2`. With `drive4` offline the loop increments `parityDrives` to `3`
+(`offlineDrives = 1`). The quorum guard `offlineDrives >= (len(storageDisks)+1)/2` evaluates to
+`1 >= 2`, which is **false**, so the write proceeds. The cap `parityDrives >= len(storageDisks)/2`
+evaluates to `3 >= 2`, which is **true**, so `parityDrives` is clamped **back to `2`**. Because
+`parityOrig (2) == parityDrives (2)`, the final `if parityOrig != parityDrives` is **false** and the
+`minIOErasureUpgraded` metadata is **never written**. In short, for a four-drive `EC:2` set the
+standard parity is already the maximum the cap allows, so a one-drive outage cannot raise it:
+`scenarioA.txt` is stored with ordinary `EC:2` parity and carries **no** `x-minio-internal-erasure-upgraded`
+key. The metadata key, on the larger sets where it *is* set, is:
 
 ```go
-// cmd/erasure-metadata.go:38
+// cmd/erasure-metadata.go:37-38
+// Object was stored with additional erasure codes due to degraded system at upload time
 const minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"
 ```
 
-The identical logic exists on the multipart write path (`cmd/erasure-multipart.go:412`,
-`cmd/erasure-multipart.go:434-435`). This code-level behavior is corroborated by the official MinIO
-documentation, which describes the same automatic *parity upgrade* governed by the
-`MINIO_ERASURE_PARITY_FAILURE` setting — the docs are presented here only as external corroboration of
-what the code already does.
+The parity upgrade therefore records metadata only on **larger** sets that have headroom below the
+`len(storageDisks)/2` cap — for example an `EC:4` object on a 12-drive set, where the cap is `6` and a
+single offline drive can lift recorded parity from `4` to `5`. The identical conditional logic exists
+on the multipart write path (`cmd/erasure-multipart.go:412`, `cmd/erasure-multipart.go:434-435`),
+subject to the same cap (there computed as `len(onlineDisks)/2`). Whether the path runs at all is
+governed by the repository-defined storage-class optimization setting `MINIO_STORAGE_CLASS_OPTIMIZE`
+(`OptimizeEnv`, `internal/config/storageclass/storage-class.go:54`); `AvailabilityOptimized()`
+(`internal/config/storageclass/storage-class.go:322-333`) returns `true` for the default (empty) or
+`"availability"` value, enabling the conditional upgrade. No environment variable *forces* a parity
+upgrade in the four-drive `EC:2` one-drive case — the `len(storageDisks)/2` cap makes it a no-op for
+this topology.
 
 **Code — MRF enqueue.** A write that completed but did not reach every drive is queued for repair:
 
@@ -598,9 +619,10 @@ re-detected automatically by the polling loops, and **cluster health recovers un
 seconds (Q5). **Object-shard reconstruction**, however, is the job of the heal subsystem (MRF heal,
 fresh-disk heal, the background scanner, or an explicit `mc admin heal`). That is why a freshly
 returned drive can briefly still be missing a shard for an object that was written during the outage,
-*even though that object is fully readable and the cluster reports healthy*. The parity upgrade and the
-surviving shards guarantee durability and readability immediately; the missing shard is then
-normalized onto the returned drive by the heal subsystem rather than instantaneously and passively.
+*even though that object is fully readable and the cluster reports healthy*. The surviving `EC:2`
+shards (three of the four written, which exceeds read quorum 2) guarantee durability and readability
+immediately; the missing shard is then normalized onto the returned drive by the heal subsystem rather
+than instantaneously and passively.
 
 ---
 
@@ -700,6 +722,8 @@ both cluster probes would return `503`. The other three rows are directly observ
   drive is rediscovered on the next tick with no external push, which is why cluster health returned
   to `200` unattended after permissions were restored. Object-shard reconstruction for data written
   during the outage is then completed by the heal subsystem (`cmd/mrf.go:220`,
-  `cmd/erasure-healing.go:258`), backed by the write-time parity upgrade
-  (`cmd/erasure-object.go:1291-1318`).
+  `cmd/erasure-healing.go:258`). The availability-optimized parity path
+  (`cmd/erasure-object.go:1291-1318`) can add parity on larger sets, but on this four-drive `EC:2` set
+  it is a no-op — parity is already at the `len(storageDisks)/2` cap — so durability here rests on the
+  standard `EC:2` shards plus healing.
 
