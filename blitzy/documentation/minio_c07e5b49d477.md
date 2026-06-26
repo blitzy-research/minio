@@ -140,7 +140,9 @@ The two negative reads return `404` with S3 error XML (host-id truncated as `dd9
 - Routing & middleware: `cmd/api-router.go:L210` (`s3APIMiddleware`), `cmd/api-router.go:L253` (`registerAPIRouter`).
 - Handlers: `cmd/bucket-handlers.go:L723` (`PutBucketHandler`), `cmd/bucket-handlers.go:L306` (`ListBucketsHandler`), `cmd/bucket-handlers.go:L1644` (`HeadBucketHandler`); `cmd/bucket-listobjects-handlers.go:L154` (`ListObjectsV2Handler`), `cmd/bucket-listobjects-handlers.go:L273` (`ListObjectsV1Handler`); `cmd/object-handlers.go:L1745` (`PutObjectHandler`), `cmd/object-handlers.go:L715` (`GetObjectHandler`), `cmd/object-handlers.go:L1009` (`HeadObjectHandler`).
 - Response writers: `cmd/api-response.go:L925` (`writeSuccessResponseXML`), `cmd/api-response.go:L940` (`writeSuccessResponseHeadersOnly`), `cmd/api-response.go:L945` (`writeErrorResponse`), `cmd/api-response.go:L986` (`writeErrorResponseJSON`).
-- Headers: `cmd/api-headers.go:L51` (`setCommonHeaders`), `cmd/api-headers.go:L111` (`setObjectHeaders`), `cmd/api-headers.go:L120-L121` — the quoted `ETag` is set as `w.Header()[xhttp.ETag] = []string{"\"" + objInfo.ETag + "\""}`. The `x-amz-request-id` is injected by `cmd/generic-handlers.go:L536` (`addCustomHeadersMiddleware`); the header constant is `internal/http/headers.go:L160` (`AmzRequestID = "x-amz-request-id"`).
+- Common headers: `cmd/api-headers.go:L51` (`setCommonHeaders`). The `x-amz-request-id` is injected by `cmd/generic-handlers.go:L536` (`addCustomHeadersMiddleware`); the header constant is `internal/http/headers.go:L160` (`AmzRequestID = "x-amz-request-id"`).
+- **PutObject response `ETag`** (the `PutObject` rows in the transcript): `PutObjectHandler` sets the response headers via `setPutObjHeaders` at `cmd/object-handlers.go:L2099`, then writes the success response at `cmd/object-handlers.go:L2128` (`writeSuccessResponseHeadersOnly`). `setPutObjHeaders` is defined at `cmd/object-handlers-common.go:L355`, and it writes the quoted `ETag` directly as a map entry at `cmd/object-handlers-common.go:L359-L360` (`w.Header()[xhttp.ETag] = []string{...}`, the value wrapped in double quotes; set as a literal map key so broken clients see exactly `ETag`).
+- **GET/HEAD object response `ETag`** (the `GetObject hello.txt` row): `cmd/api-headers.go:L111` (`setObjectHeaders`) sets the quoted `ETag` at `cmd/api-headers.go:L120-L121` (`w.Header()[xhttp.ETag] = []string{"\"" + objInfo.ETag + "\""}`). This is the GET/HEAD path, distinct from the `PutObject` path above.
 - Error codes for the negative reads: `cmd/api-errors.go:L149` (`ErrNoSuchKey` declaration; 404 mapping at `cmd/api-errors.go:L669`) and `cmd/api-errors.go:L119` (`ErrNoSuchBucket` declaration; 404 mapping at `cmd/api-errors.go:L639`).
 
 **Rationale.** `PutObject` returns an `ETag` — the MD5 of the single-part body (`a9cb0d083d193fbfed149dda4946d607` for `hello.txt`) — while `PutBucket` returns no `ETag` because there is no object body to hash. `ListObjectsV2` returns keys sorted lexicographically, which is why `docs/readme.md` appears before `hello.txt`. The `EncodingType: url` element is present because the boto3 client requested URL-encoded keys. The missing-resource reads return `404` (`NoSuchKey`/`NoSuchBucket`) rather than `403` precisely because authentication and authorization both succeeded under the valid root credentials (see Section 6).
@@ -211,10 +213,27 @@ Three negative probes were run against the server; each returns HTTP `403`:
 - **Unknown access key → `403 InvalidAccessKeyId`** — message: "The Access Key Id you provided does not exist in our records." Declared at `cmd/api-errors.go:L93`; mapped at `cmd/api-errors.go:L579`.
 - **Anonymous/unsigned GET on a private object → `403 AccessDenied`** — message: "Access Denied." Declared at `cmd/api-errors.go:L86`; mapped at `cmd/api-errors.go:L539`.
 
-Example — the `AccessDenied` response body lead (anonymous GET on the private object):
+Example — all three captured `403` responses, **verbatim** as returned by the server (each is an S3 error XML body with `Content-Type: application/xml`; the `HostId` is the deterministic node id `dd9025…e3e8` reproduced in Section 4, and each `RequestId` is a per-request id):
+
+Wrong secret (a tampered SigV4 signature) → `403 SignatureDoesNotMatch`:
 
 ```xml
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message>...
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message><Key>hello.txt</Key><BucketName>first-bucket</BucketName><Resource>/first-bucket/hello.txt</Resource><RequestId>18BCC02DF98844A4</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Unknown access key (a credential not present in IAM) → `403 InvalidAccessKeyId`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InvalidAccessKeyId</Code><Message>The Access Key Id you provided does not exist in our records.</Message><Key>hello.txt</Key><BucketName>first-bucket</BucketName><Resource>/first-bucket/hello.txt</Resource><RequestId>18BCC02DF9911766</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Anonymous/unsigned GET on a private object → `403 AccessDenied`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>hello.txt</Key><BucketName>first-bucket</BucketName><Resource>/first-bucket/hello.txt</Resource><RequestId>18BCC02DF99C26FB</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
 **Rationale.** With valid root credentials, **both** authentication (signature verification) and authorization (IAM policy) pass. This is precisely why the missing-resource reads in Section 4 return **404** (`NoSuchKey`/`NoSuchBucket`) and not **403**: the request was authenticated and authorized, so the server proceeds to look up the resource and reports that it does not exist. A `403` arises only when signature, identity, or permission fails — exactly the three cases above.
@@ -277,14 +296,16 @@ The `format:"xl-single"` value proves that a single-node single-drive run uses t
 
 ### 8.2 The data-directory layout
 
-After the flow, each object is stored as a **directory** containing an `xl.meta` file; a nested key (`docs/readme.md`) produces nested directories:
+After the flow, each object is stored as a **directory** containing an `xl.meta` file; a nested key (`docs/readme.md`) produces nested directories. The data directory holds **three** object directories — the two primary first-bucket-flow objects plus `trace-demo.txt`, which is the object created by the `PutObject` shown in the Section 5 request trace (`PUT /first-bucket/trace-demo.txt`):
 
 ```text
 /tmp/minio-data/first-bucket/
 ├── docs/readme.md/xl.meta      (496 bytes)
 ├── hello.txt/xl.meta           (479 bytes)
-└── (trace-demo.txt/xl.meta)    (extra object from trace demo)
+└── trace-demo.txt/xl.meta      (third object, created during the Section 5 trace demonstration)
 ```
+
+Because `trace-demo.txt` was written into the **same** data directory as the two primary objects, it persists alongside them and therefore also appears in the post-restart listing in Section 9 (`KeyCount=3`).
 
 ### 8.3 The `xl.meta` format
 
@@ -303,7 +324,7 @@ For the small objects in this flow, the data is **inlined into `xl.meta`** rathe
 - The `xl.meta` `MetaSys` carries `x-minio-internal-inline-data: true`.
 - **No `part.*` files exist** for these objects. For larger objects, MinIO instead stores the data as `part.N` under a data-directory UUID (per the tree comment at `cmd/xl-storage-format-v2.go:L90-L103`).
 
-The inline flag is read back via `fi.InlineData()`: `cmd/erasure-object.go:L155` (`inlineData := fi.InlineData()`) and `cmd/erasure-object.go:L178` (`if inlineData {`), which selects the inlined-data read path on `GetObject`.
+On the **read** side, the inline flag is resolved via `fi.InlineData()` while the object's file-info is loaded: `cmd/erasure-object.go:L902` — inside `getObjectFileInfo` (the file-info resolver used by `GetObject`), `if err == nil && (fi.InlineData() || len(fi.Data) > 0) { break }` — and the inline bytes are loaded alongside the metadata in `cmd/xl-storage.go:L1713-L1722` — inside `ReadVersion`, where `fi.InlineData()` short-circuits the read and `fi.SetInlineData()` marks the version inline. The accessors themselves are defined in `cmd/storage-datatypes.go`: `InlineData()` at `cmd/storage-datatypes.go:L361` and `SetInlineData()` at `cmd/storage-datatypes.go:L371`. (Note: `cmd/erasure-object.go:L155`/`L178` also call `fi.InlineData()`, but those lines are inside `CopyObject` — they preserve the inline flag during a metadata update, and are **not** the `GetObject` read path.)
 
 ### 8.5 The `.minio.sys/` system tree
 
@@ -334,10 +355,17 @@ The server was stopped by sending `SIGTERM` to the **specific numeric process ID
 INFO: Exiting on signal: TERMINATED
 ```
 
-Example — deterministic stop targeting the exact PID captured at launch:
+Example — the server PID is captured at launch as `$!` of the backgrounded process, echoed to confirm it is a concrete numeric PID (here `104011`), verified with `ps`, and then stopped by that exact numeric PID — never a broad `pkill`:
 
 ```sh
-kill "$MINIO_PID"   # SIGTERM to the exact PID; no broad pkill
+$ minio server /tmp/minio-data --address ":9000" --console-address ":9001" &
+$ MINIO_PID=$!
+$ echo "$MINIO_PID"
+104011
+$ ps -o pid=,comm= -p "$MINIO_PID"
+ 104011 minio
+$ kill "$MINIO_PID"     # equivalently: kill 104011 — SIGTERM to the exact numeric PID; no broad pkill
+process exited after ~2s
 ```
 
 The **same binary** was then restarted against the **same data directory** `/tmp/minio-data`, with no re-upload of any object.
@@ -348,18 +376,18 @@ A key, verified nuance: the **restart** startup log does **NOT** contain the `Fo
 
 ### 9.3 Persistence proof (no re-upload)
 
-After the restart, the previously created bucket and objects were still present and byte-identical:
+After the restart, the previously created bucket and **all three** objects were still present and byte-identical (no re-upload). The on-disk `xl.meta` files of Section 8 — including the Section 5 `trace-demo.txt` object — were reloaded from the same data directory:
 
 ```text
 ListBuckets   -> first-bucket  (CreationDate 2026-06-26 19:34:31.378+00:00, unchanged)
-ListObjectsV2 -> docs/readme.md (54 B), hello.txt (40 B)  (identical ETags)
+ListObjectsV2 -> KeyCount=3: docs/readme.md (54 B), hello.txt (40 B), trace-demo.txt  (identical ETags)
 GetObject hello.txt      -> 200, Content-Length: 40, MD5 a9cb0d083d193fbfed149dda4946d607 (byte-identical)
                             body = "Hello, MinIO! This is the first object.\n"
 GetObject docs/readme.md -> MD5 459d129d91f3f29826bf786aeb476812 (byte-identical)
 ```
 
 - `ListBuckets` still shows `first-bucket` with the **same** `CreationDate` (`2026-06-26 19:34:31.378+00:00`) as before the restart.
-- `ListObjectsV2` returns `docs/readme.md` (54 B) and `hello.txt` (40 B) with **identical ETags**.
+- `ListObjectsV2` returns all three persisted keys — `docs/readme.md` (54 B), `hello.txt` (40 B), and `trace-demo.txt` (the Section 5 trace-demo object) — each with **identical ETags** (`KeyCount=3`), consistent with the on-disk tree in Section 8.2. The byte-identity checks below focus on the two primary first-bucket-flow objects.
 - `GetObject hello.txt` returns `200` with `Content-Length: 40` and a downloaded MD5 of `a9cb0d083d193fbfed149dda4946d607` — byte-identical to the original upload — with body `"Hello, MinIO! This is the first object.\n"`.
 - `GetObject docs/readme.md` returns MD5 `459d129d91f3f29826bf786aeb476812` — byte-identical.
 
@@ -370,10 +398,10 @@ GetObject docs/readme.md -> MD5 459d129d91f3f29826bf786aeb476812 (byte-identical
 The cross-cutting conclusions from the investigation, each grounded in the evidence above:
 
 - **404 vs 403 under valid credentials.** Missing-resource reads return `404` (`NoSuchKey`/`NoSuchBucket`) — not `403` — because authentication and authorization both succeeded; the server then truthfully reports the resource is absent. A `403` only arises on signature, identity, or permission failure (the three captured cases in Section 6). See `cmd/api-errors.go:L149`/`L119` (404 decls) versus `cmd/api-errors.go:L156`/`L93`/`L86` (403 decls).
-- **ETag semantics.** `PutObject` returns an `ETag` that is the MD5 of the single-part body (e.g. `a9cb0d083d193fbfed149dda4946d607`), set as a quoted value at `cmd/api-headers.go:L121`; `PutBucket` returns no `ETag` because there is no object body to hash.
+- **ETag semantics.** `PutObject` returns an `ETag` that is the MD5 of the single-part body (e.g. `a9cb0d083d193fbfed149dda4946d607`), set as a quoted value by `setPutObjHeaders` (`cmd/object-handlers-common.go:L359-L360`, invoked from `PutObjectHandler` at `cmd/object-handlers.go:L2099`); `PutBucket` returns no `ETag` because there is no object body to hash.
 - **Single-drive erasure backend.** Even a single-node single-drive local run uses the erasure-coded `xl-storage` backend (single-drive erasure semantics), **not** a legacy filesystem backend — proven on disk by `format.json` `format:"xl-single"` (Section 8) and at startup by the `Formatting 1st pool, 1 set(s), 1 drives per set.` banner; the deployment enum is `ErasureSDSetupType` at `cmd/setup-type.go:L31`.
 - **One-time formatting.** The `Formatting … pool` banner appears only on first initialization and is skipped on subsequent restarts, because the format line at `cmd/prepare-storage.go:L194` is gated by `firstDisk` at `cmd/prepare-storage.go:L193`.
-- **Durable persistence.** Writes are committed atomically via temp-write-then-`RenameData` (`cmd/xl-storage.go:L2564`); small objects are inlined into `xl.meta` and read back via `fi.InlineData()` (`cmd/erasure-object.go:L155`/`L178`). The same bucket and byte-identical objects remain accessible after a real restart on the same data directory (Section 9).
+- **Durable persistence.** Writes are committed atomically via temp-write-then-`RenameData` (`cmd/xl-storage.go:L2564`); small objects are inlined into `xl.meta` and resolved on read via `fi.InlineData()` in `getObjectFileInfo` (`cmd/erasure-object.go:L902`) and `ReadVersion` (`cmd/xl-storage.go:L1713-L1722`). The same bucket and byte-identical objects remain accessible after a real restart on the same data directory (Section 9).
 - **Observability is opt-in.** Successful S3 requests are silent on the default console; per-request observability comes from the HTTP tracer (`httpTracerMiddleware`, `cmd/http-tracer.go:L69`), surfaced via `mc admin trace`.
 
 ### Investigation-only confirmation
@@ -390,4 +418,4 @@ $ git status --porcelain --untracked-files=no
             # (empty: zero tracked source files changed; go.mod / go.sum untouched)
 ```
 
-This confirms the governing rule from `docs/debugging/README.md`-style read-only investigation conventions: the source code remained the source of truth, consulted but never altered.
+This confirms compliance with the governing investigation-only constraint, which originates in the **`SWE-AtlasQnA-Repo` rule set and the prompt directives** (build and run the source, treat the code as the source of truth, do not modify any existing repository files, and add no other code): the source code remained the source of truth, consulted but never altered. (`docs/debugging/README.md` is MinIO's *Server Debugging Guide* — it documents the `mc admin trace` convention exercised in Section 5, and is **not** the source of the read-only/investigation-only rule.)
