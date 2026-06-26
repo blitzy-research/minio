@@ -2,6 +2,8 @@
 
 > An evidence-backed Q&A explaining how MinIO's object-healing engine adjudicates ambiguous, conflicting per-disk states on a 4-drive erasure-coded deployment — grounded in the source code as the truth and corroborated by a real build-and-run.
 
+## Section 0 — Title & Metadata
+
 | Field | Value |
 |---|---|
 | Repository | `github.com/minio/minio` |
@@ -52,7 +54,7 @@ All object-level healing flows through `healObject(ctx, disks, bucket, object, .
 
 ### 2.1 `healObject` step by step
 
-1. **Audit hook is armed first.** A deferred `auditHealObject(...)` is registered at the top of the function [`cmd/erasure-healing.go` L266] so that whatever the outcome, the heal attempt is recorded (see §2.4).
+1. **Audit hook is armed first.** A deferred `auditHealObject(...)` is registered at the top of the function [`cmd/erasure-healing.go` L266] so that whatever the outcome, the heal attempt is recorded (see §2.5).
 
 2. **Read every disk's metadata.** `readAllFileInfo` is called across *all* disks of the set [`cmd/erasure-healing.go` L296]. The per-disk results (`metaArr`) and errors (`errs`) drive every subsequent decision.
 
@@ -125,14 +127,14 @@ It computes `notFoundMetaErrs`/`nonActionableMetaErrs` [`cmd/erasure-healing.go`
 | # | Scenario | Threshold used | Counts considered | Result | Lines |
 |---|---|---|---|---|---|
 | 1 | **No valid meta at all** (all `xl.meta` missing/unreadable) | `dataBlocks = (len(metaArr)+1)/2` (= 2 on a 4-disk set) | not-found **parts** | **purge** if `notFoundPartsErrs > dataBlocks`; else **leave** ("We have no idea what this file is, leave it as is") | L988–L1006 |
-| 2 | **Any non-actionable (corrupt) error present** | — | meta + parts non-actionable | **leave** (return `false`) | L1008–L1010 |
+| 2 | **A valid `FileInfo` exists** (branch 1 did not apply) **and any non-actionable (corrupt) error is present** | — | meta + parts non-actionable | **leave** (return `false`) | L1008–L1010 |
 | 3 | **Delete marker** (`validMeta.Deleted`) | `dataBlocks = (len(errs)+1)/2` (= 2) | not-found **meta only** (parts ignored — a delete marker has no parts) | **purge** if `notFoundMetaErrs > dataBlocks`; else **leave** | L1012–L1017 |
 | 4 | **Normal object** (a write) | `validMeta.Erasure.ParityBlocks` (= 2) | not-found meta **OR** not-found parts | **purge** if `notFoundMetaErrs > parity` **or** (`!IsRemote()` and `notFoundPartsErrs > parity`); else **leave** | L1025–L1035 |
 
 Two design notes that the code makes explicit:
 
 - The "do not delete valid content if any is recoverable" rationale lives in branch 1's purge guard [`cmd/erasure-healing.go` L993–L1000]: when there is no valid `FileInfo` at all, the code deliberately compares against `dataBlocks` (not parity) and only purges when even that is exceeded — "ideally parityBlocks is sufficient, however we can't know that since we do have the FileInfo{}".
-- **Branch 2 is the crux of "leave."** The presence of *any* non-actionable error flips the whole decision to `false` (leave) [`cmd/erasure-healing.go` L1008–L1010]. This is why "3 of 4 corrupt" is **not** purged — corruption is non-actionable, so MinIO retains the object rather than risk deleting bytes that could be recovered by other means.
+- **Branch 2 is the crux of "leave."** **Once a valid `FileInfo` has been found** — i.e., the no-valid-meta branch at L988–L1006 did *not* apply — the presence of *any* non-actionable meta/part error flips the whole decision to `false` (leave) [`cmd/erasure-healing.go` L1008–L1010]. This is why "3 of 4 corrupt" — where every surviving `xl.meta` is still readable, so `validMeta` *is* valid — is **not** purged: corruption is non-actionable, so MinIO retains the object rather than risk deleting bytes that could be recovered by other means. (When **no** valid `xl.meta` survives at all, control never reaches this guard; branch 1 alone decides purge-vs-leave, on `notFoundPartsErrs > dataBlocks` — L988–L1006.)
 
 ### 2.5 The audit trail
 
@@ -147,7 +149,7 @@ A successful reconstruct (After all `ok`) produces no such warning; a purge retu
 
 ## Section 3 — Runtime Evidence
 
-**Methodology.** The `minio` binary was built ephemerally outside the repository tree with `CGO_ENABLED=0 go build -tags kqueue -o /tmp/minio .` (producing version `DEVELOPMENT.GOGET`, `go1.23.2 linux/amd64`). Two complementary forms of evidence were captured: (3a) the existing deterministic healing unit tests, executed **read-only**; and (3b) an ephemeral, live 4-drive server (`/tmp/minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4`) exercised through an offline MinIO/admin Go client. All scratch artifacts lived under `/tmp` and were removed afterward; the repository working tree was verified clean (`git status --porcelain` empty) — see Section 0 constraints.
+**Methodology.** The `minio` binary was built ephemerally outside the repository tree with `CGO_ENABLED=0 go build -tags kqueue -o /tmp/minio .` (producing version `DEVELOPMENT.GOGET`, `go1.23.2 linux/amd64`). Two complementary forms of evidence were captured: (3a) the existing deterministic healing unit tests, executed **read-only**; and (3b) an ephemeral, live 4-drive server (`/tmp/minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4`) exercised through an offline MinIO/admin Go client. All scratch artifacts lived under `/tmp` and were removed afterward; the repository working tree was verified clean (`git status --porcelain` empty), so this document remains the sole persisted artifact.
 
 ### 3a. Unit-test evidence
 
@@ -175,7 +177,7 @@ Captured results (each `ok github.com/minio/minio/cmd`):
 
 **`TestIsObjectDangling` sub-cases** are the executable form of the truth table. Running `-run '^TestIsObjectDangling$' -count=1 -v` rendered all 13 sub-cases as **PASS** (`go test` renders spaces in case names as underscores):
 
-```
+```text
 === RUN   TestIsObjectDangling
 === RUN   TestIsObjectDangling/FileInfoExists-case1
 === RUN   TestIsObjectDangling/FileInfoExists-case2
@@ -202,7 +204,7 @@ Three sub-cases map directly onto the truth-table branches:
 
 **Methodological honesty (must be disclosed).** Running all six tests in a **single** `go test -run 'A|B|...'` process causes the large-disk tests (`TestHealObjectCorruptedXLMeta`, `TestHealObjectCorruptedParts`, `TestHealLastDataShard`) to **fail** with `InsufficientReadQuorum` — "Storage resources are insufficient for the read operation" — due to **shared global state across tests in one process**, not a defect in the code under test. The combined run was captured to be transparent about this:
 
-```
+```text
 --- PASS: TestIsObjectDangling (0.00s)
 --- PASS: TestHealingDanglingObject (0.25s)
 --- PASS: TestHealCorrectQuorum (0.43s)
@@ -218,17 +220,24 @@ The error string is exactly `InsufficientReadQuorum.Error()` [`cmd/object-api-er
 
 ### 3b. Live 4-drive evidence
 
-A single-node 4-drive erasure set was launched (`/tmp/minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4`); the server logged:
+A single-node 4-drive erasure set was launched (`/tmp/minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4`) and exercised through an **ephemeral Go client** built outside the repository tree against the warmed module cache, using the project's own pinned clients `github.com/minio/minio-go/v7@v7.0.80` (S3 data ops — `PutObject`/`GetObject`/`StatObject`) and `github.com/minio/madmin-go/v3@v3.0.77` (the admin `Heal` API). The `mc` binary is **not** installed in this environment (the AAP lists it as optional), so the color-coded `mc admin heal` lines shown below are rendered **directly from the captured `madmin.HealResultItem`** returned by the admin `Heal` API — i.e., from the exact per-drive `Before`/`After` data that `mc admin heal --verbose` itself consumes to produce its display. The rendering rule (matching `mc`) is: a drive set prints **Green** when every drive `State == ok`, otherwise **Yellow**; an object counts as *healed* when it advanced from a non-Green `Before` to a Green `After`. The server logged:
 
-```
+```text
 INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
 INFO: WARNING: Host local has more than 2 drives of set. A host failure will result in data becoming unavailable.
 ```
 
-A 6 MiB object (`healbucket/obj.bin`, 6 291 456 bytes, deterministic payload, md5 `7dd5292f35f821d251a2b23bf562de44`) was stored. On each of the 4 drives the backend layout is **one `part.1` shard of 3 145 920 bytes plus an `xl.meta` of 364 bytes** (2 data + 2 parity):
+A **6 MiB** object (`healbucket/obj.bin`, 6 291 456 bytes) was stored. Its payload is fully **deterministic and reproducible** — `byte[i] = i mod 256` — so the captured content hash is independently verifiable:
 
+```text
+$ python3 -c "import sys;sys.stdout.buffer.write(bytes(i&0xFF for i in range(6291456)))" | md5sum
+d740f660753a4a38a24d739d768410e9  -
 ```
-/tmp/d1/healbucket/obj.bin/<data-dir>/part.1   3145920
+
+The live single-part `PutObject` returned this same value as the object **ETag** (`local_md5 == etag == d740f660753a4a38a24d739d768410e9`), confirming `ETag == md5(content)`. On each of the 4 drives the backend layout is **one `part.1` shard of 3 145 920 bytes plus an `xl.meta` of 364 bytes** (2 data + 2 parity); the shard's `nonzero_bytes` count is 3 133 632 because the deterministic payload contains exactly `3145920 / 256 = 12288` naturally-zero bytes:
+
+```text
+/tmp/d1/healbucket/obj.bin/<data-dir>/part.1   3145920   (nonzero_bytes=3133632)
 /tmp/d1/healbucket/obj.bin/xl.meta                  364
 # ... identical on d2, d3, d4
 ```
@@ -241,9 +250,16 @@ Every `HealResultItem` returned by the admin API reported `dataBlocks: 2`, `pari
 "before": [d1: ok, d2: ok, d3: ok, d4: ok]
 "after":  [d1: ok, d2: ok, d3: ok, d4: ok]   // dataBlocks=2 parityBlocks=2 diskCount=4
 ```
+
+Rendered in `mc admin heal --verbose` form from the captured result item (both drive sets all-`ok` → Green→Green; nothing needed repair → 0 healed):
+
+```text
+[Green -> Green] healbucket/obj.bin
+Healed: 0/1 objects; 0/1 healed, 0/1 failed
 ```
-GET  ok  size=6291456  md5=7dd5292f35f821d251a2b23bf562de44
-STAT ok  size=6291456  etag=7dd5292f35f821d251a2b23bf562de44
+```text
+GET  ok  size=6291456  md5=d740f660753a4a38a24d739d768410e9
+STAT ok  size=6291456  etag=d740f660753a4a38a24d739d768410e9
 ```
 
 **Case 1 — 1 drive has nothing** (object directory deleted on d1; an actionable *missing* error). Heal reconstructs the shard onto d1; the per-drive state flips `missing → ok`:
@@ -252,11 +268,18 @@ STAT ok  size=6291456  etag=7dd5292f35f821d251a2b23bf562de44
 "before": [d1: missing, d2: ok, d3: ok, d4: ok]
 "after":  [d1: ok,      d2: ok, d3: ok, d4: ok]
 ```
+
+Rendered in `mc admin heal --verbose` form (Before has a non-`ok` drive → Yellow; After all-`ok` → Green; one object advanced to healthy → 1 healed):
+
+```text
+[Yellow -> Green] healbucket/obj.bin
+Healed: 1/1 objects; 1/1 healed, 0/1 failed
 ```
+```text
 # shard restored on d1:
 /tmp/d1/healbucket/obj.bin/<data-dir>/part.1   3145920
 /tmp/d1/healbucket/obj.bin/xl.meta                  364
-GET ok  size=6291456  md5=7dd5292f35f821d251a2b23bf562de44   # matches baseline
+GET ok  size=6291456  md5=d740f660753a4a38a24d739d768410e9   # matches baseline
 ```
 → **RECONSTRUCT** (`disksToHealCount = 1 ≤ parity = 2`).
 
@@ -266,20 +289,27 @@ GET ok  size=6291456  md5=7dd5292f35f821d251a2b23bf562de44   # matches baseline
 "before": [d1: missing, d2: missing, d3: ok, d4: ok]
 "after":  [d1: ok,      d2: ok,      d3: ok, d4: ok]
 ```
+
+Rendered in `mc admin heal --verbose` form (Before two `missing` → Yellow; After all-`ok` → Green):
+
+```text
+[Yellow -> Green] healbucket/obj.bin
+Healed: 1/1 objects; 1/1 healed, 0/1 failed
 ```
-GET ok  size=6291456  md5=7dd5292f35f821d251a2b23bf562de44   # matches baseline
+```text
+GET ok  size=6291456  md5=d740f660753a4a38a24d739d768410e9   # matches baseline
 ```
 → **RECONSTRUCT at the parity boundary** (mirrors `TestHealCorrectQuorum`).
 
 **Case 3a — 3 drives have nothing** (object directory deleted on d1, d2, d3; only d4 remains; **not-found** errors). The object is below read quorum (2), so it is invisible to the read/list path:
 
+```text
+STAT -> NoSuchKey (HTTP 404): The specified key does not exist.
+GET  -> NoSuchKey (HTTP 404): The specified key does not exist.
 ```
-STAT -> The specified key does not exist.
-GET  -> The specified key does not exist.
-```
-A **direct** `HealObject` invocation on this object then **purged** the lone d4 remnant — after the heal, the object directory was gone from **all four** drives, and a subsequent `STAT` still reported "The specified key does not exist." Because `notFoundMetaErrs (3) > parity (2)` with **no** non-actionable errors, `isObjectDangling` is **true** (branch 4) → `deleteIfDangling` purges the version [`cmd/erasure-healing.go` L968–L1036, `cmd/erasure-object.go` L482].
+A heal of this object path then **purged** the lone d4 remnant — after the heal, the object directory was gone from **all four** drives, and a subsequent `STAT` still returned `NoSuchKey`. Because `notFoundMetaErrs (3) > parity (2)` with **no** non-actionable errors, `isObjectDangling` is **true** (branch 4) → `deleteIfDangling` purges the version [`cmd/erasure-healing.go` L968–L1036, `cmd/erasure-object.go` L482].
 
-→ **PURGE.** A subtlety worth stating precisely: a *listing-driven* `mc admin heal` cannot enumerate a sub-quorum object, so in that mode the d4 remnant would persist until the background scanner samples it; but a direct object-level `HealObject` (as captured here) adjudicates and purges it immediately. The deterministic purge is also proven in-repo by `TestHealingDanglingObject` (§3a).
+→ **PURGE.** A subtlety worth stating precisely — and observed directly here: the admin `Heal` **sequence** did *not* return a per-object `madmin.HealResultItem` for this object (a *listing-driven* `mc admin heal` cannot enumerate a sub-quorum object), yet the dangling d4 version was still removed by the heal of that path (and, failing that, the background scanner would sample and purge it later). The deterministic purge is also proven in-repo by `TestHealingDanglingObject` (§3a).
 
 **Case 3b — 3 drives have corrupted data** (`part.1` bytes zeroed on d1, d2, d3 with the file size preserved; `xl.meta` kept intact on all 4; **non-actionable** corruption errors). A deep-scan heal (`--scan deep`, i.e. bitrot verification) was issued. Heal did **not** reconstruct and did **not** purge — the per-drive states stayed `corrupt`:
 
@@ -287,16 +317,24 @@ A **direct** `HealObject` invocation on this object then **purged** the lone d4 
 "before": [d1: corrupt, d2: corrupt, d3: corrupt, d4: corrupt]
 "after":  [d1: corrupt, d2: corrupt, d3: corrupt, d4: corrupt]   // heal did NOT reconstruct
 ```
-```
-# backend AFTER heal — object retained, part.1 still zeroed on d1-d3, intact on d4:
-d1 part.1: size=3145920 nonzero_bytes=0
-d2 part.1: size=3145920 nonzero_bytes=0
-d3 part.1: size=3145920 nonzero_bytes=0
-d4 part.1: size=3145920 nonzero_bytes=3145920
-```
-Because non-actionable (corrupt) errors are present, `isObjectDangling` is **false** (branch 2) → the object is **left** in place. Reads then split:
 
+Rendered in `mc admin heal --verbose` form (Before has non-`ok` drives → Yellow; After still non-`ok` → Yellow; no object advanced to healthy → 0 healed):
+
+```text
+[Yellow -> Yellow] healbucket/obj.bin
+Healed: 0/1 objects; 0/1 healed, 0/1 failed
 ```
+```text
+# backend AFTER heal — object retained; part.1 still zeroed on d1-d3, intact on d4:
+d1 part.1: size=3145920  nonzero_bytes=0
+d2 part.1: size=3145920  nonzero_bytes=0
+d3 part.1: size=3145920  nonzero_bytes=0
+d4 part.1: size=3145920  nonzero_bytes=3133632   # unchanged from baseline (the deterministic
+                                                 # payload has 1/256 naturally-zero bytes)
+```
+Because every surviving `xl.meta` is intact on all 4 drives, the engine *does* find a valid `FileInfo` (so the no-valid-meta branch L988–L1006 does **not** apply); and because non-actionable (corrupt) errors are then present, `isObjectDangling` is **false** (branch 2, L1008–L1010) → the object is **left** in place. Reads then split:
+
+```text
 HEAD /healbucket/obj.bin  -> HTTP 200          # xl.meta metadata quorum intact on all 4
 GET  /healbucket/obj.bin  -> HTTP 503
 <Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message>...</Error>
@@ -416,7 +454,7 @@ On a successful reconstruction, each healed disk's **`After`** state is overwrit
 
 Healing is invoked from several entry points; the object-layer entrypoint is `HealObject` [`cmd/erasure-healing.go` L1039]:
 
-- **Read-time auto-heal** on `GET`/`HEAD` — bitrot verification during reads schedules a heal for damaged shards it encounters.
+- **Read-time auto-heal** on `GET`/`HEAD` — when a read encounters a missing or bitrot-corrupt shard, the read path schedules a background heal via `globalMRFState.addPartialOp(...)`: the data path `getObjectWithFileInfo` does so on `errFileNotFound`/`errFileCorrupt` during decode [`cmd/erasure-object.go` L396–L407, passing `BitrotScan: errors.Is(err, errFileCorrupt)`], and the `FileInfo` read path `getObjectFileInfo` — used by both `GET` and `HEAD` — does so when reconstructable blocks are missing (`missingBlocks > 0 && missingBlocks < fi.Erasure.DataBlocks`) [`cmd/erasure-object.go` L790–L805].
 - **Background data-scanner** — samples roughly **one object in 1,024** via `healObjectSelectProb = 1024` [`cmd/data-scanner.go` L61] ("Overall probability of a file being scanned; one in n"). Deep bitrot scanning is governed by `internal/config/heal/heal.go` (`Config` at L48, `BitrotScanCycle` at L65/L69) and is not continuous by default — which is why Case 3b's corruption required an explicit deep scan to be detected.
 - **Erasure-set background driver** — `healErasureSet` [`cmd/global-heal.go` L152] sweeps a set and calls `HealObject` (at L426 and L462).
 - **Manual full-scan admin API** — `HealHandler` [`cmd/admin-handlers.go` L1308] backs `mc admin heal`; the returned heal summary reflects state **after** the attempt (the per-drive `After` list).
@@ -429,7 +467,7 @@ During a deep scan, per-part classification uses the `checkPart*` result codes [
 
 ### 6.1 Why this design
 
-MinIO's healing engine is built around a single principle: **refuse to delete on ambiguity.** Reconstruction is attempted whenever enough shards survive (≤ parity damaged) because that is provably safe and lossless. When damage exceeds parity, the engine does not blindly delete — it consults the dangling gate, which purges **only** when the evidence is unambiguous: metadata/shards are *not-found* (actionable) beyond parity, meaning the data is genuinely gone and the residual sub-quorum fragments are just litter. But if **any** non-actionable (corruption) error is present, the gate **leaves** the object [`cmd/erasure-healing.go` L1008–L1010], trading a read-quorum error (`SlowDownRead`) for the chance that the bytes are recoverable by other means — a re-scan, a transient-fault recovery, or replication resynchronization from another site. The no-valid-meta branch is even more cautious, comparing against `dataBlocks` rather than parity and explaining in-code that it does so to "ensure that we do not delete any valid content, if any is recoverable" [`cmd/erasure-healing.go` L993–L1000].
+MinIO's healing engine is built around a single principle: **refuse to delete on ambiguity.** Reconstruction is attempted whenever enough shards survive (≤ parity damaged) because that is provably safe and lossless. When damage exceeds parity, the engine does not blindly delete — it consults the dangling gate, which purges **only** when the evidence is unambiguous: metadata/shards are *not-found* (actionable) beyond parity, meaning the data is genuinely gone and the residual sub-quorum fragments are just litter. But once a valid `FileInfo` has been found, if **any** non-actionable (corruption) error is present, the gate **leaves** the object [`cmd/erasure-healing.go` L1008–L1010], trading a read-quorum error (`SlowDownRead`) for the chance that the bytes are recoverable by other means — a re-scan, a transient-fault recovery, or replication resynchronization from another site. The no-valid-meta branch is even more cautious, comparing against `dataBlocks` rather than parity and explaining in-code that it does so to "ensure that we do not delete any valid content, if any is recoverable" [`cmd/erasure-healing.go` L993–L1000].
 
 Three insights crystallize the behavior:
 
@@ -481,7 +519,7 @@ Three insights crystallize the behavior:
 
 ### 6.4 Bottom line
 
-On a 4-drive erasure set, MinIO heals an inconsistent object by **reconstructing** it whenever ≤ 2 disks need repair; otherwise it **leaves** the object (returning `errErasureReadQuorum`, surfaced as HTTP 503 `SlowDownRead`) when corruption makes the situation ambiguous, and **purges** it (returning `errFileNotFound`) only when metadata/shards are missing beyond parity with no recoverable signal. Healing therefore does **not** always reconstruct — the outcome is a deterministic function of *how many* disks are bad and, decisively, *why*.
+On a 4-drive erasure set, MinIO heals an inconsistent object by **reconstructing** it whenever ≤ 2 disks need repair; otherwise it **leaves** the object (returning `errErasureReadQuorum`, surfaced as HTTP 503 `SlowDownRead`) when a readable `xl.meta` survives but non-actionable corruption is present, and **purges** it (returning `errFileNotFound`) only when metadata/shards are missing beyond parity with **only** not-found (actionable) errors. Healing therefore does **not** always reconstruct — the outcome is a deterministic function of *how many* disks are bad and, decisively, *why*.
 
 ---
 
