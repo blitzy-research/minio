@@ -23,10 +23,14 @@ The following constraints governed the entire investigation and are honored thro
 2. **Code-as-truth, no assumptions.** Every claim cites a verified `file:line` at HEAD
    `c07e5b49d` **and** is confirmed by running the system (server trace/log output for
    Requirements 1–3; Go test output for Requirements 4–5).
-3. **Ephemeral artifacts under `/tmp` only.** The built `minio` binary, server data
-   directories, the `mc` client, scratch scripts, and captured logs all lived under `/tmp`
-   and were deleted afterward. The end-state `git status --porcelain` in the source tree is
-   **empty** (see [§6](#6-cleanup--source-tree-integrity)).
+3. **Ephemeral artifacts removed; system tools left in place.** The genuinely temporary
+   artifacts this task produced — the compiled `./minio` binary (built at the repo root and
+   git-ignored), the throwaway server data directories and ephemeral STS reproduction module
+   under `/tmp`, and the scratch scripts and captured trace/test logs — were all deleted after
+   the evidence was captured. The **Go 1.23.12 toolchain** (`/usr/local/go`) and the **`mc`**
+   client (`/usr/local/bin/mc`) are external, system-level tools *outside* the repository: they
+   were used, not created or deleted, by this task. The end-state `git status --porcelain` in
+   the source tree is **empty** (see [§6](#6-cleanup--source-tree-integrity)).
 
 ### Environment
 
@@ -61,16 +65,16 @@ the relevant sections.
 | **1** | Req 2 — Object-Lock HTTP status | `ErrObjectLocked` "returned as HTTP 403" | `cmd/api-errors.go:L1059-L1063` defines it as `Code:"InvalidRequest"`, `HTTPStatusCode: http.StatusBadRequest` ⇒ **HTTP 400, not 403** (confirmed at runtime). Enum at `:L206`; mapping `ObjectLocked`→`ErrObjectLocked` at `:L2298-L2299`. |
 | **2** | Req 5 — file attribution | `SetPolicyForUserOrGroup` at `cmd/iam.go:L1770` | `cmd/iam.go:L1770` is **LDAP DN-normalization** code. `SetPolicyForUserOrGroup` is a deprecated admin handler at **`cmd/admin-handlers-users.go:L1770`** (gated by `policy.AttachPolicyAdminAction` `:L1773`). The IAM-store policy mutator is `PolicyDBSet` at `cmd/iam.go:L1928`. The Req 5 **root cause is unaffected**; only the admin-gating citation is corrected. |
 | **3** | Req 4 — constant location | `maxSTSSessionPolicySize` (2048) lives in `cmd/globals.go` | The constant is defined in **`cmd/sts-handlers.go:L89`** (used at `:L122-L123`); it is **not** in `cmd/globals.go`. The value `2048` is correct. |
-| **4** | Req 4 & 5 — test invocation | `go test … -run TestSTS ./cmd` / `-run TestUserPolicyEscalationBug ./cmd` | Both are **methods on the `*TestSuiteIAM` suite**, not top-level test functions; the AAP commands yield `ok … [no tests to run]`. The correct runners are `TestIAMInternalIDPSTSServerSuite` (Req 4) and `TestIAMInternalIDPServerSuite` (Req 5). Both corrected commands and their PASS output are shown. |
+| **4** | Req 4 & 5 — test invocation & evidence | `go test … -run TestSTS ./cmd` / `-run TestUserPolicyEscalationBug ./cmd` | Both are **methods on the `*TestSuiteIAM` suite**, not top-level test functions; the AAP commands yield `ok … [no tests to run]` (suite runners: `TestIAMInternalIDPSTSServerSuite` / `TestIAMInternalIDPServerSuite`). For **Req 5** the suite runner is the proof (PASS shown). For **Req 4**, code-as-truth revealed that *no* in-tree STS test supplies an inline session `Policy` — so `TestSTS` proves only inherited parent-policy behavior; session-policy **intersection** is therefore proven by a dedicated ephemeral `/tmp` reproduction (§4), not by `TestSTS`. |
 
 ### Master `file:line` anchor map
 
 | Req | Behavior | Primary anchors |
 |-----|----------|-----------------|
 | 1 | Encryption enforced *after* authorization | `cmd/object-handlers.go:L1745` (handler), `:L1836` (authz), `:L1893-L1897` (SSE apply); `cmd/iam.go:L2437` (`IsAllowed`); `internal/bucket/encryption/bucket-sse-config.go:L135-L151`; `internal/crypto/auto-encryption.go:L31,L37`; `cmd/http-tracer.go:L69` |
-| 2 | Object-Lock DELETE enforcement | `cmd/bucket-object-lock.go:L54,L84,L153,L245`; `cmd/object-handlers.go:L2386,L2509,L2601`; `cmd/bucket-handlers.go:L416,L573`; `cmd/api-errors.go:L206,L1059-L1063,L2298-L2299` |
+| 2 | Object-Lock DELETE enforcement | `cmd/bucket-object-lock.go:L54,L84,L101,L117,L121,L143,L147,L153,L245`; `cmd/object-handlers.go:L2509,L2601`; `cmd/bucket-handlers.go:L416,L573`; `cmd/api-errors.go:L206,L1059-L1063,L2298-L2299` |
 | 3 | Bitrot detection + heal on read | `cmd/bitrot.go:L158`; `cmd/erasure-object.go:L398,L407`; `cmd/erasure-healing.go:L152,L238,L243`; `cmd/xl-storage.go:L2678,L2687` |
-| 4 | STS session-policy intersection | `cmd/iam.go:L2242,L2136,L2310-L2312,L2317`; `cmd/sts-handlers.go:L89,L122-L123`; `cmd/sts-handlers_test.go:L44,L52,L393,L473,L573` |
+| 4 | STS session-policy intersection | `cmd/iam.go:L2242,L2136,L2310-L2312,L2317,L2381,L2386`; `cmd/sts-handlers.go:L89,L122-L123`. In-tree STS tests supply **no** inline session policy (`cmd/sts-handlers_test.go:L130,L253,L357,L447,L546,L593` set only AccessKey/SecretKey/Location; `L393,L473` / `L478,L573` prove inherited parent-policy behavior only); inline-session-policy intersection is proven by an ephemeral `/tmp` reproduction (see §4) |
 | 5 | Privilege-escalation prevention | `cmd/admin-handlers-users.go:L444,L495-L542`; `cmd/iam-store.go:L2659,L2672`; `cmd/iam.go:L1340,L1928`; `cmd/admin-handlers-users_test.go:L192,L205,L313,L422` |
 
 ---
@@ -273,9 +277,10 @@ Multi-object delete (`mc rm` → `s3.DeleteMultipleObjects`) — the batch POST 
 ### Code-Truth Root Cause
 
 - **Single-object path.** `DeleteObjectHandler` (declared `cmd/object-handlers.go:L2509`)
-  performs retention enforcement; the typed `ObjectLocked{}` condition is returned at
-  **`cmd/object-handlers.go:L2386`**, and the governance-bypass evaluation is the call site
-  at **`:L2601`**.
+  performs retention enforcement at the call site **`cmd/object-handlers.go:L2601`**
+  (`enforceRetentionBypassForDelete`); the typed `ObjectLocked{}` condition is returned from
+  inside that helper in `cmd/bucket-object-lock.go` (at **`:L101`, `:L117`, `:L121`, `:L143`,
+  `:L147`**), not from the object handler itself.
 - **Multi-object path.** `DeleteMultipleObjectsHandler` (declared `cmd/bucket-handlers.go:L416`)
   enforces at the call site **`:L573`**; the per-object errors are returned **inside a
   200 batch response**, which is why the POST itself is `200 OK`.
@@ -298,7 +303,7 @@ Multi-object delete (`mc rm` → `s3.DeleteMultipleObjects`) — the batch POST 
 
 | Path | Handler | Enforcement call site | Result shape |
 |------|---------|----------------------|--------------|
-| Single | `cmd/object-handlers.go:L2509` | `:L2601` (cond returned `:L2386`) | **HTTP 400** top-level `InvalidRequest` |
+| Single | `cmd/object-handlers.go:L2509` | `:L2601` (cond returned in `cmd/bucket-object-lock.go:L101-L147`) | **HTTP 400** top-level `InvalidRequest` |
 | Multi | `cmd/bucket-handlers.go:L416` | `:L573` | **HTTP 200** batch, per-object `<Error>InvalidRequest` |
 
 ### Rationale / Thinking
@@ -426,44 +431,134 @@ high speed HighwayHash checksums to protect against Bit Rot." Tooling corroborat
 
 ### Reproduction
 
-The proof is the in-process STS test `TestSTS`, which assumes a role with an inline session
-policy and asserts that an action permitted by the parent policy but excluded by the session
-policy is **denied**.
+The requirement is specifically about an **inline session policy** attached to *temporary*
+credentials, so the proof must AssumeRole **with** an inline `Policy` and show that an action
+the **parent** policy *allows* is *denied* under the temporary credentials. Critically, **no
+in-tree STS test supplies an inline session policy** — every `cr.STSAssumeRoleOptions` literal
+in `cmd/sts-handlers_test.go` (at `:L130`, `:L253`, `:L357`, `:L447`, `:L546`, `:L593`) sets
+only `AccessKey`, `SecretKey`, and `Location`, never `Policy`. The behavior was therefore
+proven with a **dedicated, ephemeral reproduction** run under `/tmp` (cleaned up afterward;
+**no source file was added or modified**).
 
-> **🚩 Discrepancy #4 (CODE WINS).** `TestSTS` is a **method on the `*TestSuiteIAM` suite**
-> (`cmd/sts-handlers_test.go:L393`), *not* a top-level `go test` function. The AAP-suggested
-> command `go test … -run TestSTS ./cmd` matches nothing and prints `ok … [no tests to run]`.
-> The correct top-level runner is `TestIAMInternalIDPSTSServerSuite`
-> (`cmd/sts-handlers_test.go:L52`), which calls `runAllIAMSTSTests` → `suite.TestSTS(c)`
-> (`:L44`).
+> **🚩 Discrepancy #4 (CODE WINS).** The AAP cited `TestSTS` / `TestSTSWithGroupPolicy`
+> `"Access Denied."` assertions (`cmd/sts-handlers_test.go:L473`, `:L573`) as proof of
+> session-policy *intersection*. Code-as-truth shows those prove only **inherited
+> parent-policy** behavior, not session-policy enforcement: `TestSTS` (a method on
+> `*TestSuiteIAM`, `:L393`) assumes a role with **no** inline `Policy`, and its parent policy
+> grants only `s3:PutObject`/`s3:GetObject`/`s3:ListBucket` (`:L403-L420`) — so the
+> `RemoveObject`→`"Access Denied."` at `:L473` is simply an *ungranted* action being denied;
+> `:L573` is the analogous assertion in `TestSTSWithGroupPolicy` (`:L478`), also with no inline
+> session policy. (Both are suite methods, so the AAP's `go test … -run TestSTS ./cmd` matches
+> nothing and prints `ok … [no tests to run]`; the suite runner is
+> `TestIAMInternalIDPSTSServerSuite`, `:L52` → `runAllIAMSTSTests` → `suite.TestSTS(c)`, `:L44`.)
+> To actually prove the requirement, the inline-session-policy reproduction below was used.
 
-Correct command:
+**Reproduction (ephemeral; `/tmp` only):**
 
-```bash
-go test -tags kqueue,dev -v -run TestIAMInternalIDPSTSServerSuite ./cmd
-```
+1. Build and launch a throwaway single-node, 4-drive erasure server:
+
+   ```bash
+   make build                                        # CGO_ENABLED=0 go build -tags kqueue
+   ./minio server /tmp/blitzy_minio_data/{1,2,3,4} \
+       --address 127.0.0.1:9100                      # root creds: minioadmin/minioadmin
+   ```
+
+2. Create a **broad parent canned policy** (`s3:*` on the bucket), a user, and attach it; then
+   AssumeRole with an **inline session policy** that allows only `s3:GetObject` +
+   `s3:ListBucket` (deliberately excluding `s3:PutObject`). Using
+   `github.com/minio/minio-go/v7/pkg/credentials`:
+
+   ```go
+   // parent canned policy "broadpolicy": Allow s3:*  on arn:aws:s3:::stsbucket[/*]
+   // inline SESSION policy:               Allow ONLY s3:GetObject + s3:ListBucket
+   ar := cr.STSAssumeRole{
+       Client:      &http.Client{Transport: http.DefaultTransport},
+       STSEndpoint: "http://127.0.0.1:9100",
+       Options: cr.STSAssumeRoleOptions{
+           AccessKey: "writer12345", SecretKey: "writer12345-secret",
+           Policy: inlineSessionPolicy,   // <<< the inline session policy (no s3:PutObject)
+       },
+   }
+   val, _ := ar.Retrieve()                // temporary creds carrying the session policy
+   ```
+
+   The reproduction then asserts: the **parent** user *can* PutObject (broad write is real);
+   the **STS** creds *can* List/Get (inside the intersection); the **STS** creds *cannot*
+   PutObject (excluded by the session policy even though the parent allows `s3:*`). It fails
+   loudly if PutObject is **not** denied.
 
 ### Captured Evidence
 
+Four independent, mutually corroborating layers were captured from the live server.
+
+**(1) Go test output — genuine `--- PASS`:**
+
 ```text
---- PASS: TestIAMInternalIDPSTSServerSuite (14.18s)
-    --- PASS: .../Test:_1,_ServerType:_ErasureSD (~3.5s)
-    --- SKIP: .../Test:_2,_ServerType:_ErasureSD_(with_etcd_backend) (0.00s)
-    --- PASS: .../Test:_3,_ServerType:_ErasureSD (~3.5s)
-    --- SKIP: .../Test:_4 (etcd)
-    --- PASS: .../Test:_5,_ServerType:_Erasure (~3.5s)
-    --- SKIP: .../Test:_6 (etcd)
-    --- PASS: .../Test:_7,_ServerType:_ErasureSet (~3.5s)
-    --- SKIP: .../Test:_8 (etcd)
+=== RUN   TestInlineSTSSessionPolicyIntersection
+    sts_session_policy_test.go:139: setup: parent canned policy 'broadpolicy' (s3:*) attached to user "writer12345"
+    sts_session_policy_test.go:154: PARENT creds: PutObject SUCCEEDED -> broad write (s3:*) is genuinely granted by the parent policy
+    sts_session_policy_test.go:174: AssumeRole returned temporary creds (AK=EQN4UZ..., session-token present) with inline session policy = {GetObject, ListBucket} only
+    sts_session_policy_test.go:196: STS creds: ListObjects SUCCEEDED (allowed by both parent and session policy)
+    sts_session_policy_test.go:207: STS creds: GetObject SUCCEEDED (allowed by both parent and session policy)
+    sts_session_policy_test.go:219: STS creds: PutObject DENIED -> "Access Denied."
+    sts_session_policy_test.go:220: PROOF: parent grants s3:* (incl. PutObject) yet temporary creds are DENIED PutObject because the inline session policy excludes it => effective permission = INTERSECTION(parent, session).
+--- PASS: TestInlineSTSSessionPolicyIntersection (0.27s)
 PASS
-ok  	github.com/minio/minio/cmd	14.471s
+ok  	blitzyrepro	0.289s
 ```
 
-The four storage-backend variants PASS; the four etcd variants SKIP gracefully when no etcd
-is configured (the shared `SetUpSuite` calls `c.Skip(...)` at
-`cmd/admin-handlers-users_test.go:L150`). Inside `TestSTS`, the negative assertions that prove
-enforcement check for `"Access Denied."` when the session policy excludes an action
-(`cmd/sts-handlers_test.go:L473` and `:L573`).
+**(2) `mc admin trace -v` — the `AssumeRole` request carries the inline `Policy` form parameter
+and succeeds (`200 OK`):**
+
+```text
+127.0.0.1:9100 [REQUEST sts.AssumeRole] [Client IP: 127.0.0.1]
+127.0.0.1:9100 POST /
+127.0.0.1:9100 Content-Type: application/x-www-form-urlencoded
+127.0.0.1:9100 Authorization: AWS4-HMAC-SHA256 Credential=writer12345/20260626//sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=…
+127.0.0.1:9100 Action=AssumeRole&DurationSeconds=3600&Policy=%7B%0A+%22Version%22%3A+%222012-10-17%22%2C…%22s3%3AGetObject%22%2C+%22s3%3AListBucket%22…%7D&Version=2011-06-15
+127.0.0.1:9100 [RESPONSE] [ Duration 2.434ms … ↑ 495 B  ↓ 1.1 KiB ]
+127.0.0.1:9100 200 OK
+```
+
+URL-decoding the `Policy=` form parameter yields exactly the inline session policy that was
+sent (read/list only — **no** `s3:PutObject`):
+
+```json
+{ "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::stsbucket", "arn:aws:s3:::stsbucket/*"] } ] }
+```
+
+**(3) `mc admin trace -v` — the STS-credentialed `PutObject` is rejected `403 / AccessDenied`:**
+
+```text
+127.0.0.1:9100 [REQUEST s3.PutObject] [Client IP: 127.0.0.1]
+127.0.0.1:9100 PUT /stsbucket/sts-write.txt
+127.0.0.1:9100 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9…   (STS session token)
+127.0.0.1:9100 Authorization: AWS4-HMAC-SHA256 Credential=EQN4UZW2Y0I8STARBLVO/20260626/us-east-1/s3/aws4_request,…
+127.0.0.1:9100 [RESPONSE] [ Duration 220µs … ↑ 140 B  ↓ 335 B ]
+127.0.0.1:9100 403 Forbidden
+127.0.0.1:9100 <?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>sts-write.txt</Key><BucketName>stsbucket</BucketName>…</Error>
+```
+
+**(4) The temporary credential itself embeds the session policy.** Base64-decoding the JWT
+payload of the `X-Amz-Security-Token` shown above reveals a `sessionPolicy` claim bound to the
+parent `writer12345`:
+
+```json
+{ "parent": "writer12345",
+  "accessKey": "EQN4UZW2Y0I8STARBLVO",
+  "sessionPolicy": "<base64>" }     // decodes to: Allow { s3:GetObject, s3:ListBucket }
+```
+
+This is the server-side embedding that `IsAllowedSTS` later extracts (via
+`args.Claims[sessionPolicyNameExtracted]`) and ANDs with the parent policy. Across all four
+layers the outcome is identical and reproducible: an action (`PutObject`) the **parent** policy
+permits (`s3:*`) is **denied** under the temporary credentials because the **inline session
+policy** excludes it — the effective permission set is the **intersection**.
 
 ### Code-Truth Root Cause
 
@@ -478,6 +573,10 @@ enforcement check for `"Access Denied."` when the session policy excludes an act
   ```
   The request must be allowed by **both** the inline session policy (`isAllowedSP`) **and**
   the parent/canned policy (`combinedPolicy.IsAllowed(args)`) — the **intersection**.
+- **Where the session policy is read.** `isAllowedBySessionPolicy` at **`cmd/iam.go:L2381`**
+  pulls the embedded policy from the STS token via `args.Claims[sessionPolicyNameExtracted]`
+  (**`:L2386`**) and evaluates it. This is exactly the `sessionPolicy` claim observed inside the
+  captured `X-Amz-Security-Token` (Evidence #4), confirming the wire ⇄ code linkage.
 - **No-session inherited path** returns `isOwnerDerived || combinedPolicy.IsAllowed(args)` at
   **`cmd/iam.go:L2317`** (when no session policy is attached, the parent policy alone governs).
 - **Session-policy size limit.** `maxSTSSessionPolicySize = 2048` is defined at
@@ -495,11 +594,16 @@ enforcement check for `"Access Denied."` when the session policy excludes an act
 
 Temporary credentials **cannot exceed** the parent's permissions because the evaluator ANDs
 the session-policy decision with the parent/canned-policy decision
-(`cmd/iam.go:L2310-L2312`). The passing suite exercises this end-to-end against an in-process
-server across multiple erasure backends, and the `"Access Denied."` assertions
-(`cmd/sts-handlers_test.go:L473`, `:L573`) confirm that an action *allowed* by the parent but
-*excluded* by the inline session policy is denied — i.e. the effective permission set is the
-intersection, never the union.
+(`cmd/iam.go:L2310-L2312`). The captured reproduction demonstrates this end-to-end against a
+live in-process server: the parent user *can* PutObject (broad `s3:*` write is genuinely
+granted), yet the temporary credentials — whose inline session policy lists only
+`s3:GetObject` + `s3:ListBucket` — are **denied** PutObject (`403 / AccessDenied`) while
+List and Get succeed. The denied action is precisely the one *allowed by the parent but
+excluded by the inline session policy*, so the effective permission set is the
+**intersection**, never the union. (By contrast, the in-tree `TestSTS` /
+`TestSTSWithGroupPolicy` `"Access Denied."` assertions at `cmd/sts-handlers_test.go:L473`,
+`:L573` use **no** inline session policy and therefore prove only inherited parent-policy
+behavior — which is why the dedicated reproduction above was required.)
 
 Documentation corroboration: MinIO's `docs/sts/assume-role.md` states the session's
 permissions are "the intersection of the canned policy name and the policy set here," that
@@ -625,18 +729,23 @@ action distinct from creating/updating a user's own credentials.
 
 ## 6. Cleanup & Source-Tree Integrity
 
-All reproduction was performed using **ephemeral artifacts confined to `/tmp`**:
+Reproduction relied on two distinct classes of resource — **temporary artifacts** that were
+created and then deleted, and **external system-level tools** that live outside the repository
+and were merely *used* (never created or deleted):
 
-- the Go 1.23.12 toolchain and the compiled `./minio` binary;
-- the external `mc` client and `boto3`;
-- the server data directories under `/tmp/mdata/d{1..4}`;
-- scratch reproduction scripts (`broadwrite.json`, boto3 helpers) and all captured
-  trace/log/test output files.
+- *Temporary artifacts (created, then deleted after capture):* the compiled `./minio` binary
+  and the `make build` debugging-tool binaries (built at the repo root; git-ignored); the
+  throwaway server data directories under `/tmp` (e.g. `/tmp/mdata/d{1..4}`); the ephemeral STS
+  reproduction module under `/tmp`; and all scratch reproduction scripts and captured
+  trace/log/test output files under `/tmp`.
+- *External system tools (used, not created or deleted):* the **Go 1.23.12** toolchain at
+  `/usr/local/go`, the **`mc`** client at `/usr/local/bin/mc`, and `boto3` — all installed
+  system-wide, outside the MinIO repository.
 
-Every one of these was deleted after the evidence was captured. No file was added, modified,
-or deleted anywhere in the MinIO source tree; the only artifact produced by this task is
-**this report**, which lives in the *destination* repository's `blitzy/documentation/`
-directory.
+The temporary artifacts were all deleted after the evidence was captured; the external system
+tools were left untouched in place. No file was added, modified, or deleted anywhere in the
+MinIO source tree; the only artifact produced by this task is **this report**, which lives in
+the *destination* repository's `blitzy/documentation/` directory.
 
 A cleanliness caveat discovered during the investigation: invoking `go` with `-mod=mod` can
 append lines to `go.sum`. The investigation therefore relied on the default `-mod=readonly`
@@ -668,7 +777,7 @@ repository was treated as a read-only reference corpus throughout, and the five 
 | 1 | Server-injected `X-Amz-Server-Side-Encryption: aws:kms` on an unsigned request | `internal/bucket/encryption/bucket-sse-config.go:L140-L141`; toggle `internal/crypto/auto-encryption.go:L31,L37`; authz precedes at `cmd/object-handlers.go:L1836` → `cmd/iam.go:L2437` |
 | 2 | `400 InvalidRequest` "Object is WORM protected and cannot be overwritten" | `cmd/api-errors.go:L1059-L1063` (def), `:L2298-L2299` (mapping), `:L206` (enum); enforcement `cmd/bucket-object-lock.go:L84` |
 | 3 | Correct bytes after zeroing a shard + deep-heal repair | `cmd/bitrot.go:L158` (`errFileCorrupt`); `cmd/erasure-object.go:L407` (`BitrotScan`); failure-only logs `cmd/erasure-healing.go:L238,L243` |
-| 4 | `--- PASS: TestIAMInternalIDPSTSServerSuite`; `"Access Denied."` on excluded action | intersection `cmd/iam.go:L2310-L2312`; assertions `cmd/sts-handlers_test.go:L473,L573`; limit `cmd/sts-handlers.go:L89` |
+| 4 | `--- PASS: TestInlineSTSSessionPolicyIntersection`; STS-credentialed `PutObject` → `403 AccessDenied` while parent allows `s3:*`; `Policy=` form param + `sessionPolicy` token claim captured in trace | intersection `cmd/iam.go:L2310-L2312`; session policy read at `:L2381,L2386`; limit `cmd/sts-handlers.go:L89` (ephemeral `/tmp` reproduction — **no source test modified**) |
 | 5 | `--- PASS: TestIAMInternalIDPServerSuite`; `RemoveBucket` stays `"Access Denied."` | `PolicyName` ignored `cmd/iam-store.go:L2672`; admin gates `cmd/admin-handlers-users.go:L1704,L1773,L1912`; fatal guard `cmd/admin-handlers-users_test.go:L422` |
 
 *Report complete. Source tree unchanged; this document is the sole deliverable.*
