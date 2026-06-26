@@ -28,7 +28,7 @@
 
 ## 1. Methodology — build → run → observe → capture
 
-Erasure coding only activates with a multi-drive `ErasureSetupType` (≥ 4 drives); a single-drive layout never exercises quorum logic. By default MinIO shards objects across **N/2 data + N/2 parity** drives, so it can lose up to **N/2** drives and still reconstruct data (`docs/erasure/README.md:3`, `docs/erasure/README.md:9`). Parity is configurable per storage class via `EC:M` (`docs/erasure/storage-class/README.md:3`).
+MinIO activates erasure coding from a **minimum erasure-set size of 2 drives** — the supported set sizes are `{2, 3, …, 16}` (`cmd/endpoint-ellipses.go:48`) and the minimum number of drives required for erasure coding is 2 (`docs/distributed/README.md:11`); only a single-drive layout never exercises quorum logic. This investigation deliberately uses a **4-drive** set so that the default **symmetric EC:2** layout exercises the quorum thresholds under study. By default MinIO shards objects across **N/2 data + N/2 parity** drives, so it can lose up to **N/2** drives and still reconstruct data (`docs/erasure/README.md:3`, `docs/erasure/README.md:9`). Parity is configurable per storage class via `EC:M` (`docs/erasure/storage-class/README.md:3`).
 
 The observations below were captured from a **single-node, 4-drive** erasure deployment. For a 4-drive set the default parity is `DefaultParityBlocks(4) == 2` (`internal/config/storageclass/storage-class.go:355`), i.e. **2 data + 2 parity (EC:2)** — the symmetric N/2 layout.
 
@@ -75,11 +75,11 @@ These observed values are exactly what the code computes: `writeQuorum := dataDr
 
 **Question:** If a drive suddenly becomes unavailable while data is being written, what error does MinIO return, and does the write succeed or fail?
 
-**Answer (short):** It depends on whether **write quorum still holds**. MinIO is *availability-optimized by default*: for each offline drive it transparently **upgrades parity** and the write **succeeds**. It only **fails** once enough drives are offline to break write quorum — and then the client receives S3 **`SlowDownWrite`** with **HTTP 503**.
+**Answer (short):** It depends on whether **write quorum still holds**. MinIO is *availability-optimized by default*: for each offline drive it *attempts* to add a parity block — but this raise is **capped at `N/2`** (`cmd/erasure-object.go:1311-1313`), and the object is tagged `x-minio-internal-erasure-upgraded` **only when the parity count actually changes** (`cmd/erasure-object.go:1315-1316`). In the observed default 4-drive **EC:2** layout parity is already at the `N/2` cap, so the increment is clamped straight back, **no upgrade tag is emitted**, and the one-drive-down PUT **succeeds simply because write quorum (3) still holds**. The write only **fails** once enough drives are offline to break write quorum — and then the client receives S3 **`SlowDownWrite`** with **HTTP 503**.
 
 ### Observed artifacts
 
-**A.1 — One drive down → PUT SUCCEEDS (parity upgraded).** With `d2` made inaccessible (`chmod 000`), 3 of 4 drives online (write tolerance = 1):
+**A.1 — One drive down → PUT SUCCEEDS (write quorum still holds).** With `d2` made inaccessible (`chmod 000`), 3 of 4 drives online (write tolerance = 1). The HTTP 200 below is the observed success; per the code walk-through, in this EC:2 layout the object is *not* parity-upgraded or tagged (parity is already at the `N/2` cap):
 
 ```json
 {"ok": true, "op": "put", "etag": "\"f355e88429668fb4136572cad096b4b6\"",
@@ -103,7 +103,7 @@ Error: Storage resources are insufficient for the write operation
 
 ### Why this happens (code walk-through)
 
-During a PUT, MinIO inspects every drive in the erasure set. When the default **availability-optimized** storage class is active, it enters the parity-upgrade branch and, for each offline drive, increments the parity count:
+During a PUT, MinIO inspects every drive in the erasure set. When the default **availability-optimized** storage class is active, it enters the availability-optimization branch and, for each offline drive, *tentatively* increments the parity count — a raise that is then bounded by the `N/2` cap:
 
 ```go
 // cmd/erasure-object.go:1291
@@ -120,8 +120,10 @@ if !opts.MaxParity && globalStorageClass.AvailabilityOptimized() {
     if offlineDrives >= (len(storageDisks)+1)/2 {   // :1304  majority offline?
         return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)  // :1308  -> hard fail
     }
-    ...
-    if parityOrig != parityDrives {
+    if parityDrives >= len(storageDisks)/2 {        // :1311  CAP: parity can never exceed N/2
+        parityDrives = len(storageDisks) / 2        // :1312  (clamps the increments above back down)
+    }
+    if parityOrig != parityDrives {                 // :1315  emit tag ONLY if parity actually changed
         userDefined[minIOErasureUpgraded] = strconv.Itoa(parityOrig) + "->" + strconv.Itoa(parityDrives)  // :1316
     }
 }
@@ -132,7 +134,7 @@ if dataDrives == parityDrives {                  // :1324
 }
 ```
 
-- **Parity upgrade (success path).** Each offline drive bumps `parityDrives` (`cmd/erasure-object.go:1298`). The object is written with extra parity and tagged `x-minio-internal-erasure-upgraded` = `"orig->new"` (`cmd/erasure-object.go:1316`; constant `minIOErasureUpgraded` at `cmd/erasure-metadata.go:38`). This is *why* the 1-down PUT in A.1 returned HTTP 200 — MinIO raised parity to absorb the missing drive instead of rejecting the write.
+- **Parity-upgrade *attempt*, then the `N/2` cap (success path).** Each offline drive *tentatively* bumps `parityDrives` (`cmd/erasure-object.go:1298`), but the result is immediately **clamped to `len(storageDisks)/2`** (`cmd/erasure-object.go:1311-1313`). The object is tagged `x-minio-internal-erasure-upgraded` = `"orig->new"` (constant `minIOErasureUpgraded` at `cmd/erasure-metadata.go:38`) **only when the parity count actually changed** — i.e. `parityOrig != parityDrives` (`cmd/erasure-object.go:1315-1316`). **In the observed default 4-drive EC:2 case this tag is _not_ emitted:** `parityOrig = 2` (`DefaultParityBlocks(4) == 2`, `internal/config/storageclass/storage-class.go:355`); one offline drive bumps parity to 3, the cap at `:1311-1313` resets it to 2, so `parityOrig == parityDrives` and the `if` at `:1315` is false. **The 1-down PUT in A.1 therefore returned HTTP 200 not because of a parity upgrade, but simply because write quorum (3) still held** — the 3 online drives meet the 3-writer success threshold (see the encode-time gate below). The upgrade tag appears only for storage-class configurations with parity *headroom* (`parityOrig < len(storageDisks)/2`); for example the test fixture at `cmd/erasure-healing-common_test.go:684` records a real `"x-minio-internal-erasure-upgraded": "5->6"` (parity raised from 5 to 6, a configuration sitting below its `N/2` cap).
 - **Immediate quorum failure.** If offline drives reach `(N+1)/2`, MinIO does not even try to encode; it returns `errErasureWriteQuorum` right away (`cmd/erasure-object.go:1304`, `cmd/erasure-object.go:1308`). For N=4 that threshold is 2 — exactly the A.2 case.
 - **Encode-time gate.** When encoding does proceed, success requires the count of successful shard writers to reach the quorum; otherwise the encode returns a wrapped read/write-quorum error annotated with the offline-disk count:
 
@@ -164,10 +166,10 @@ errErasureWriteQuorum  "Write failed. Insufficient number of drives online"   cm
 | Drives offline (N=4) | Write quorum (3) | Result | Client sees |
 |----------------------|------------------|--------|-------------|
 | 0 | held | **SUCCEEDS** | HTTP 200 |
-| 1 | held (parity upgraded) | **SUCCEEDS** | HTTP 200 (object tagged `erasure-upgraded`) |
+| 1 | held | **SUCCEEDS** | HTTP 200 (no upgrade tag — EC:2 parity already at `N/2` cap) |
 | ≥ 2 | **lost** | **FAILS** | S3 `SlowDownWrite`, HTTP 503 |
 
-**Rationale.** MinIO favors availability: rather than reject a write the moment a drive disappears, it raises parity to keep the object safely reconstructable, and only refuses once a true majority of drives is unreachable — because below quorum it can no longer guarantee a durable, reconstructable object.
+**Rationale.** MinIO favors availability: rather than reject a write the moment a drive disappears, it *tries* to raise parity to keep the object safely reconstructable — but never beyond the `N/2` cap (`cmd/erasure-object.go:1311-1313`). In a storage class with parity *headroom* that raise is real and is recorded with the `erasure-upgraded` tag (`cmd/erasure-object.go:1315-1316`); in the default symmetric EC:2 layout parity is already at the cap, so no tag is written and the write succeeds purely because **write quorum still holds**. Either way MinIO only refuses once a true majority of drives is unreachable — because below quorum it can no longer guarantee a durable, reconstructable object.
 
 
 ---
@@ -471,7 +473,7 @@ minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
 
 All four behaviors are consequences of one model: **MinIO shards each object into N/2 data + N/2 parity blocks and gates every operation on quorum** (`docs/erasure/README.md:3`, `docs/erasure/README.md:9`; parity configurable via `EC:M`, `docs/erasure/storage-class/README.md:3`).
 
-- **Writes (A)** are availability-optimized: parity is upgraded per offline drive so the write succeeds while a *majority* of drives is reachable; once offline ≥ (N+1)/2, the write hard-fails with `SlowDownWrite`/503 (`cmd/erasure-object.go:1291-1325`).
+- **Writes (A)** are availability-optimized: MinIO *attempts* to raise parity per offline drive, but the raise is capped at `N/2` (`cmd/erasure-object.go:1311-1313`) and is tagged `erasure-upgraded` only when parity actually changes (`:1315-1316`). A write therefore succeeds while a *majority* of drives is reachable — in the observed EC:2 layout the 1-down PUT succeeds because write quorum still holds, with no upgrade tag emitted. Once offline ≥ (N+1)/2, the write hard-fails with `SlowDownWrite`/503 (`cmd/erasure-object.go:1291-1325`).
 - **Reads (B)** reconstruct from any `dataBlocks` surviving shards, so pre-existing objects stay readable through the loss of up to N/2 drives; below that they fail with `SlowDownRead`/503 (`cmd/erasure-decode.go:123`, `cmd/erasure-decode.go:234`).
 - Both A and B route through the **same internal→S3 translation chain**, differing only in the final S3 `Code` (`cmd/api-errors.go:2314-2317`, `cmd/api-errors.go:869-877`).
 - **Healing (C)** restores the redundancy that A and B depend on, via a proactive 10-second fresh-disk monitor (`cmd/background-newdisks-heal-ops.go:40,384,419`) and reactive MRF inline heal on access (`cmd/mrf.go:78,220`).
@@ -495,8 +497,10 @@ Every `file:line` referenced in this document, re-verified against HEAD `c07e5b4
 | A/B errors | `cmd/storage-errors.go` | 38, 53, 65, 104 | `errUnformattedDisk` / `errDiskNotFound` / `errFaultyDisk` / `errFileCorrupt` |
 | A/B errors | `cmd/object-api-errors.go` | 152-153, 164-165, 229, 241-242, 246, 253-254 | `toObjectErr` → `Insufficient{Read,Write}Quorum` types + `Unwrap` |
 | A/B errors | `cmd/api-errors.go` | 869-872, 874-877, 2314-2317 | S3 `SlowDownRead`/`SlowDownWrite` Code/Description/HTTP 503; `toAPIErrorCode` mapping |
-| A write | `cmd/erasure-object.go` | 1291, 1293, 1296, 1298, 1299, 1304, 1308, 1316, 1319, 1323-1325 | Parity-upgrade branch, majority precheck, write-quorum value |
+| A write | `cmd/erasure-object.go` | 1291, 1293, 1296, 1298, 1299, 1304, 1308, 1311-1313, 1315, 1316, 1319, 1323-1325 | Parity-upgrade *attempt* branch, majority precheck, **`N/2` parity cap**, conditional upgrade tag, write-quorum value |
 | A write | `cmd/erasure-metadata.go` | 38 | `minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"` |
+| A write | `cmd/erasure-healing-common_test.go` | 684 | Real `erasure-upgraded` value `"5->6"` — confirms the tag is emitted only with parity headroom (`parityOrig < N/2`) |
+| A write | `internal/config/storageclass/storage-class.go` | 327-333, 355 | `AvailabilityOptimized()` default; `DefaultParityBlocks` (4 drives → parity 2) |
 | A write | `cmd/erasure-encode.go` | 59, 60, 64, 65 | Encode-time quorum gate + `(offline-disks=x/y)` wrap |
 | A/B quorum | `cmd/erasure-metadata-utils.go` | 150, 156 | `reduceReadQuorumErrs` / `reduceWriteQuorumErrs` |
 | B read | `cmd/erasure-decode.go` | 116, 123, 234 | `canDecode` threshold (`>= dataBlocks`); read-quorum wrap |
