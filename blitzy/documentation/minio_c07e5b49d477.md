@@ -234,7 +234,7 @@ $ python3 -c "import sys;sys.stdout.buffer.write(bytes(i&0xFF for i in range(629
 d740f660753a4a38a24d739d768410e9  -
 ```
 
-The live single-part `PutObject` returned this same value as the object **ETag** (`local_md5 == etag == d740f660753a4a38a24d739d768410e9`), confirming `ETag == md5(content)`. On each of the 4 drives the backend layout is **one `part.1` shard of 3 145 920 bytes plus an `xl.meta` of 364 bytes** (2 data + 2 parity); the shard's `nonzero_bytes` count is 3 133 632 because the deterministic payload contains exactly `3145920 / 256 = 12288` naturally-zero bytes:
+The live single-part `PutObject` returned this same value as the object **ETag** (`local_md5 == etag == d740f660753a4a38a24d739d768410e9`), confirming `ETag == md5(content)`. On each of the 4 drives the backend layout is **one `part.1` shard of 3 145 920 bytes plus an `xl.meta` of 364 bytes** (2 data + 2 parity); the shard's `nonzero_bytes` count is 3 133 632 because the deterministic payload places a zero byte once in every 256 (`byte[i] = i mod 256`), so each `3 145 920`-byte shard holds exactly `3 145 920 / 256 = 12288` zero bytes (`3 145 920 − 12 288 = 3 133 632`, measured identical on all four drives):
 
 ```text
 /tmp/d1/healbucket/obj.bin/<data-dir>/part.1   3145920   (nonzero_bytes=3133632)
