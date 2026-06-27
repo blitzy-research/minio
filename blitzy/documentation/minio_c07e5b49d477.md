@@ -274,9 +274,9 @@ Source references for the write path:
 Example — a small excerpt of the storage trace illustrating temp-write-then-rename for a `PutObject`:
 
 ```text
-STORAGE storage.Mkdir       .minio.sys/tmp/<uuid>
-STORAGE storage.OpenFileW   .minio.sys/tmp/<uuid>/xl.meta
-STORAGE storage.Mkdir       first-bucket/hello.txt
+OS      os.Mkdir        .minio.sys/tmp/<uuid>
+OS      os.OpenFileW    .minio.sys/tmp/<uuid>/xl.meta
+OS      os.Mkdir        first-bucket/hello.txt
 STORAGE storage.RenameData  .minio.sys/tmp/<uuid> -> first-bucket hello.txt   (~1.9ms)
 ```
 
@@ -324,7 +324,7 @@ For the small objects in this flow, the data is **inlined into `xl.meta`** rathe
 - The `xl.meta` `MetaSys` carries `x-minio-internal-inline-data: true`.
 - **No `part.*` files exist** for these objects. For larger objects, MinIO instead stores the data as `part.N` under a data-directory UUID (per the tree comment at `cmd/xl-storage-format-v2.go:L90-L103`).
 
-On the **read** side, the inline flag is resolved via `fi.InlineData()` while the object's file-info is loaded: `cmd/erasure-object.go:L902` — inside `getObjectFileInfo` (the file-info resolver used by `GetObject`), `if err == nil && (fi.InlineData() || len(fi.Data) > 0) { break }` — and the inline bytes are loaded alongside the metadata in `cmd/xl-storage.go:L1713-L1722` — inside `ReadVersion`, where `fi.InlineData()` short-circuits the read and `fi.SetInlineData()` marks the version inline. The accessors themselves are defined in `cmd/storage-datatypes.go`: `InlineData()` at `cmd/storage-datatypes.go:L361` and `SetInlineData()` at `cmd/storage-datatypes.go:L371`. (Note: `cmd/erasure-object.go:L155`/`L178` also call `fi.InlineData()`, but those lines are inside `CopyObject` — they preserve the inline flag during a metadata update, and are **not** the `GetObject` read path.)
+On the **read** side, the inline flag is resolved via `fi.InlineData()` while the object's file-info is loaded: `cmd/erasure-object.go:L902` — inside `getObjectFileInfo` (the file-info resolver used by `GetObject`), `if err == nil && (fi.InlineData() || len(fi.Data) > 0) { break }` — and the inline bytes are loaded alongside the metadata in `cmd/xl-storage.go:L1713-L1722` — inside `ReadVersion`, where `fi.InlineData()` short-circuits the read and `fi.SetInlineData()` marks the version inline. The accessors themselves are defined in `cmd/storage-datatypes.go`: `InlineData()` at `cmd/storage-datatypes.go:L361` and `SetInlineData()` at `cmd/storage-datatypes.go:L371`. (Note: `cmd/erasure-object.go:L155` (`inlineData := fi.InlineData()`) reads the inline flag and `cmd/erasure-object.go:L178` (`if inlineData {`) branches on it, but those lines are inside `CopyObject` — they preserve the inline flag during a metadata update, and are **not** the `GetObject` read path.)
 
 ### 8.5 The `.minio.sys/` system tree
 
