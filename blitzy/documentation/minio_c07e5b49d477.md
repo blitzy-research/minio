@@ -283,7 +283,7 @@ The accounting closes with **zero residual**: 2,804 attempts = 2,804 `403` + 0 +
 
 **Metadata observable without reading object bytes:**
 - `ListObjectsV2` (Variant B) exposes per object: **Key, Size, ETag, LastModified, StorageClass, Owner** (DisplayName + canonical ID).
-- `HeadObject` exposes more: **Content-Length, ETag, LastModified, Content-Type, VersionId** (versioning on), **StorageClass, user metadata**.
+- `HeadObject` exposes more: **Content-Length, ETag, LastModified, Content-Type, VersionId** (versioning on), and **tagging count** (`x-amz-tagging-count`); **user metadata** (`x-amz-meta-*`) and **StorageClass** (`x-amz-storage-class`) appear only when set — the latter is omitted for the default `STANDARD` class, as the captured HEAD trace confirms.
 - Neither surface returns object **bytes**; reading bytes requires `s3:GetObject`, which is a *granted read*, not a mutation.
 
 Listing is therefore a genuine, separately-gated privilege — not implied by read access.
