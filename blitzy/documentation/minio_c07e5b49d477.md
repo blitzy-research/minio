@@ -731,15 +731,24 @@ The table below consolidates the behavior at each online-drive count for the fou
 | 4/4 | met | met | ✅ | ✅ | 200 | 200 |
 | 3/4 (Scenario A) | met | met | ✅ | ✅ | 200 | 200 |
 | 2/4 (Scenario B) | **not met** | met | ❌ 503 SlowDownWrite | ✅ | **503** | 200 |
-| 1/4 (observed) | not met | **not met** | ❌ 503 SlowDownWrite | ❌ 503 SlowDownRead | 503 | 503 |
+| 1/4 (EXTRAPOLATED) | not met | **not met** | ❌ 503 SlowDownWrite | ❌ 503 SlowDownRead | 503 | 503 |
 
 At **1/4 online** the read quorum is breached: a single online drive cannot satisfy a read
-(`1 >= 2` is false), so both writes and reads fail and both cluster probes return `503`. This row was
-**directly observed** — a signed `GET` of an existing object returned HTTP `503` with the S3 wire code
-`SlowDownRead` ("Resource requested is unreadable, please reduce your request rate"), which is the
-surface mapping of the internal `errErasureReadQuorum` sentinel (`cmd/api-errors.go:2191`,
-`cmd/api-errors.go:869-873`), and the server logged `Read quorum could not be established on pool: 0,
-set: 0, expected read quorum: 2, drives-online: 1`. All four rows are therefore directly observed.
+(`1 >= 2` is false), so both writes and reads fail and both cluster probes return `503`. **This row is
+`EXTRAPOLATED` from the code, not directly observed.** The user-requested demonstration deliberately
+covered exactly two cases — the above-threshold case (3/4, Scenario A) and the below-threshold case
+(2/4, Scenario B); a third drive was never removed, so the 1/4 behavior is projected from the
+read-quorum formula and the code's error mapping rather than captured at runtime. By that code path a
+read attempted below read quorum surfaces the internal `errErasureReadQuorum` sentinel, which maps to
+the S3 wire code `SlowDownRead` ("Resource requested is unreadable, please reduce your request rate")
+(`cmd/api-errors.go:2191`, `cmd/api-errors.go:869-873`); and the same `Health()` evaluation that
+produced the write-quorum verdict and shortfall log directly observed in Scenario B
+(`cmd/erasure-server-pool.go:2791`, `cmd/erasure-server-pool.go:2793-2795`) carries a symmetric
+read-quorum comparison and failure log (`cmd/erasure-server-pool.go:2799`,
+`cmd/erasure-server-pool.go:2802`) that would fire at one online drive, driving
+`/minio/health/cluster/read` to `503`. In summary, the 4/4 baseline, 3/4 (Scenario A), and 2/4
+(Scenario B) rows were **directly observed** at runtime, whereas the 1/4 row is **`EXTRAPOLATED`** from
+the source code.
 
 **Closing rationale.**
 
