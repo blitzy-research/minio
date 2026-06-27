@@ -334,8 +334,10 @@ Heal events are emitted through `healingLogEvent` (`cmd/logging.go:83`), which c
 ```text
 Healing drive '/tmp/minio-obs/d2' - 'mc admin heal alias/ --verbose' to check the current status.
 Healing drive '/tmp/minio-obs/d2' - use 4 parallel workers.
-Healing of drive '/tmp/minio-obs/d2' is finished (healed: 13, skipped: 0).
+Healing of drive '/tmp/minio-obs/d2' is finished (healed: 10, skipped: 0).
 ```
+
+> **Note on the counts.** The `healed`/`skipped` integers are **run-dependent**: they count the items rebuilt onto the fresh drive, which varies with how many objects and `.minio.sys` metadata entries reside on the erasure set at heal time. The log *string* (the format) is fixed in the source (`cmd/background-newdisks-heal-ops.go:520`); only the numbers differ between runs. The block above is the exact console output captured in this validation run; a re-run on a cluster with a different object population will print a different (often smaller) `healed` count.
 
 These map to the following source strings (line numbers re-verified at authoring time — note these corrected lines, **not** L459/L519):
 
@@ -359,7 +361,7 @@ Error: unable to read /tmp/minio-obs/d2/.minio.sys/buckets/.healing.bin:
        open /tmp/minio-obs/d2/.minio.sys/buckets/.healing.bin: permission denied
 ```
 
-**Rationale.** A replaced drive comes up *unformatted* (or carries a stale `.healing.bin`); the 10-second fresh-disk monitor detects this and hands the set to `healFreshDisk`, which rebuilds the missing shards (our run reported `healed: 13, skipped: 0`). In parallel, any read that hits a still-missing shard enqueues an MRF partial-op for immediate object-level heal. MinIO thus heals both **proactively** (fresh-disk monitor) and **reactively** (MRF on access).
+**Rationale.** A replaced drive comes up *unformatted* (or carries a stale `.healing.bin`); the 10-second fresh-disk monitor detects this and hands the set to `healFreshDisk`, which rebuilds the missing shards (this validation run reported `healed: 10, skipped: 0`; the exact count is run-dependent — see the note above). In parallel, any read that hits a still-missing shard enqueues an MRF partial-op for immediate object-level heal. MinIO thus heals both **proactively** (fresh-disk monitor) and **reactively** (MRF on access).
 
 
 ---
