@@ -102,7 +102,7 @@ flowchart TD
     B -- no --> D[Refuse write: HTTP 503 SlowDownWrite]
     D --> E{online drives >= read quorum 2 ?}
     E -- yes --> F[Reads still served from remaining shards]
-    E -- no --> G[Reads also fail: InsufficientReadQuorum]
+    E -- no --> G[Reads also fail: HTTP 503 SlowDownRead]
     C --> H[Health endpoint /minio/health/cluster returns 200]
     D --> I[Health endpoint /minio/health/cluster returns 503]
 ```
@@ -286,8 +286,10 @@ boundary.
 
 ### 4.1 Scenario A — ABOVE threshold (lose 1 disk → 3/4 online, AT write quorum 3)
 
-`drive4` was taken offline with `chmod 000`. After the background monitor detected the change
-(~15–20 s), the system sits exactly **at** write quorum (3 online ≥ 3 required).
+`drive4` was taken offline with `chmod 000`, leaving **3 of 4 drives online** — exactly **at** write
+quorum (3 online ≥ 3 required). The health-checked storage layer reflects the lost drive within about a
+second (the cluster verdict is recomputed live from current per-disk reachability on each probe, not on
+a fixed timer), and because the set is still at write quorum the cluster endpoint stays `200`.
 
 Health:
 
@@ -369,7 +371,28 @@ Error: unable to read /tmp/minio-run/drive4/.minio.sys/buckets/.healing.bin: ope
        x: cmd/erasure.go:301:cmd.erasureObjects.getOnlineDisksWithHealingAndInfo.func1()
 ```
 
-The error also carries a structured field naming the drive, `endpoint="/tmp/minio-run/drive4"`.
+Emitted alongside that record — as part of the same drive-failure detection — is a **second, sibling
+log record** that names the drive through a structured `endpoint=` field rather than inside the message
+text:
+
+```
+API: SYSTEM.peers
+Error: drive access denied (cmd.StorageErr)
+       endpoint="/tmp/minio-run/drive4"
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()          (printEndpointError)
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+```
+
+The two records come from **different code paths and even different logger subsystems**. The
+`.healing.bin` *permission denied* error above is logged by `Healing()` through `internalLogIf` (API
+`SYSTEM.internal`) and embeds the drive path in its message; it does **not** itself carry the
+`endpoint=` tag. The `endpoint=`-bearing record is the `drive access denied` storage error
+(`errDiskAccessDenied = StorageErr("drive access denied")`, `cmd/storage-errors.go:68`) logged by the
+reconnect monitor: `connectDisks` (`cmd/erasure-sets.go:230`) calls `printEndpointError`
+(`cmd/prepare-storage.go:35`), which attaches the `endpoint` tag via
+`AppendTags("endpoint", endpoint.String())` and emits through `peersLogAlwaysIf` (API `SYSTEM.peers`).
+Either way, the failing drive is named **by its full path** — by two independent witnesses.
 
 **Code.** The path in that message is provably constructed in `xl-storage.go`'s `Healing()`. The
 function is declared at `cmd/xl-storage.go:430`, and the `internalLogIf(...)` line that emits this
@@ -452,16 +475,24 @@ This new-disk heal monitor is wired up by `initAutoHeal` (`cmd/background-newdis
 which launches `monitorLocalDisksAndHeal` (`cmd/background-newdisks-heal-ops.go:386`).
 
 **Runtime witness.** After `chmod 755` restored `drive3` and `drive4`, with **no restart and no
-`mc admin heal`**, within ~25 s the cluster endpoint returned to healthy on its own and writes
-succeeded again:
+`mc admin heal`**, the cluster endpoint returned to healthy on its own **within a second or two** and
+writes succeeded again:
 
 ```
 GET /minio/health/cluster  -> HTTP/1.1 200 OK   (X-Minio-Write-Quorum: 3)
 PUT post-recovery.txt      -> OK
 ```
 
-The unattended return to `200` is the empirical proof of polling re-detection — it lines up with the
-~15 s reconnect interval.
+The unattended return to `200` is the empirical proof of automatic re-detection: nothing external
+pushed the drive back. The recovery is fast — in fact **faster than the ~15 s reconnect interval** —
+because the cluster-health verdict is not gated by that timer loop. `Health()` recomputes the verdict
+**live on every probe** from the current online-drive count (`cmd/erasure-server-pool.go:2694`,
+`cmd/erasure-server-pool.go:2791`), and a drive's online/offline state is tracked continuously by the
+health-checked storage layer (`cmd/xl-storage-disk-id-check.go`). So once permissions are restored the
+drive's reachability clears within about a second and the endpoint immediately reports `200` again. The
+~15 s `monitorAndConnectEndpoints` loop and the ~10 s new-disk heal monitor still run on their own
+cadence — they fold a fully disconnected drive back into the set topology and drive healing — but the
+cluster-health endpoint recovers ahead of them.
 
 **Rationale.** Because reconnection is implemented as a server-side timer loop, an operator (or an
 orchestrator like Kubernetes) does **not** have to notify MinIO that a drive is back. The server
@@ -700,11 +731,15 @@ The table below consolidates the behavior at each online-drive count for the fou
 | 4/4 | met | met | ✅ | ✅ | 200 | 200 |
 | 3/4 (Scenario A) | met | met | ✅ | ✅ | 200 | 200 |
 | 2/4 (Scenario B) | **not met** | met | ❌ 503 SlowDownWrite | ✅ | **503** | 200 |
-| 1/4 (extrapolated) | not met | **not met** | ❌ | ❌ InsufficientReadQuorum | 503 | 503 |
+| 1/4 (observed) | not met | **not met** | ❌ 503 SlowDownWrite | ❌ 503 SlowDownRead | 503 | 503 |
 
-The **1/4 row is extrapolated from the code**, not directly captured: because the read quorum is 2, a
-single online drive cannot satisfy a read (`1 >= 2` is false), so both writes and reads would fail and
-both cluster probes would return `503`. The other three rows are directly observed.
+At **1/4 online** the read quorum is breached: a single online drive cannot satisfy a read
+(`1 >= 2` is false), so both writes and reads fail and both cluster probes return `503`. This row was
+**directly observed** — a signed `GET` of an existing object returned HTTP `503` with the S3 wire code
+`SlowDownRead` ("Resource requested is unreadable, please reduce your request rate"), which is the
+surface mapping of the internal `errErasureReadQuorum` sentinel (`cmd/api-errors.go:2191`,
+`cmd/api-errors.go:869-873`), and the server logged `Read quorum could not be established on pool: 0,
+set: 0, expected read quorum: 2, drives-online: 1`. All four rows are therefore directly observed.
 
 **Closing rationale.**
 
@@ -718,11 +753,14 @@ both cluster probes would return `503`. The other three rows are directly observ
   `SlowDownWrite`) while `2 >= 2` holds (reads served). MinIO degrades to read-only rather than going
   fully offline, preserving availability of existing data.
 - **Why recovery is polling-based.** Reconnection and new-disk healing are server-side timer loops
-  (`cmd/erasure-sets.go:283` at ~15 s; `cmd/background-newdisks-heal-ops.go:40` at ~10 s). A restored
-  drive is rediscovered on the next tick with no external push, which is why cluster health returned
-  to `200` unattended after permissions were restored. Object-shard reconstruction for data written
-  during the outage is then completed by the heal subsystem (`cmd/mrf.go:220`,
-  `cmd/erasure-healing.go:258`). The availability-optimized parity path
+  (`cmd/erasure-sets.go:283` at ~15 s; `cmd/background-newdisks-heal-ops.go:40` at ~10 s), so a
+  restored drive is folded back into the set and healed with no external push. The cluster-health
+  endpoint itself recovers even sooner — within a second or two — because `Health()` recomputes its
+  verdict live from current per-disk reachability on each probe (`cmd/erasure-server-pool.go:2694`,
+  `cmd/erasure-server-pool.go:2791`) rather than waiting on those timer ticks, which is why cluster
+  health returned to `200` unattended almost immediately after permissions were restored. Object-shard
+  reconstruction for data written during the outage is then completed by the heal subsystem
+  (`cmd/mrf.go:220`, `cmd/erasure-healing.go:258`). The availability-optimized parity path
   (`cmd/erasure-object.go:1291-1318`) can add parity on larger sets, but on this four-drive `EC:2` set
   it is a no-op — parity is already at the `len(storageDisks)/2` cap — so durability here rests on the
   standard `EC:2` shards plus healing.
