@@ -685,7 +685,7 @@ There are **two independent reasons** self-promotion fails.
   identity via
   `newUserIdentity(auth.Credentials{AccessKey: accessKey, SecretKey: ureq.SecretKey, Status: ...})`
   at **`cmd/iam-store.go:L2672`** and **never reads `ureq.PolicyName`**. Verified by scanning
-  the entire function body (`L2659-L2706`): the token `PolicyName` does not appear anywhere.
+  the entire function body (`L2659-L2692`): the token `PolicyName` does not appear anywhere.
   The submitted `PolicyName:"consoleAdmin"` is therefore **silently ignored** at the store
   layer. (`newUserIdentity` helper is at `cmd/iam-store.go:L163`; `CreateUser` is at
   `cmd/iam.go:L1340`.)
