@@ -337,8 +337,10 @@ mc: <ERROR> Failed to remove `q2b/lockbucket/worm.txt`. Object, 'worm.txt (Versi
 | `cmd/object-api-errors.go:339-341` | `return "Object is WORM protected and cannot be overwritten: " + e.Bucket + "/" + e.Object + "(" + e.VersionID + ")"` |
 | `cmd/api-errors.go:1059-1063` | `ErrObjectLocked: { Code: "InvalidRequest", Description: "Object is WORM protected and cannot be overwritten", HTTPStatusCode: http.StatusBadRequest }` — **HTTP 400** |
 | `cmd/api-errors.go:2298-2299` | `case ObjectLocked:` … `apiErr = ErrObjectLocked` |
-| `cmd/object-handlers.go:2509` | `func (api objectAPIHandlers) DeleteObjectHandler(...)` — calls the bypass check |
-| `cmd/bucket-handlers.go:416` | `func (api objectAPIHandlers) DeleteMultipleObjectsHandler(...)` — calls the bypass check |
+| `cmd/object-handlers.go:2509` | `func (api objectAPIHandlers) DeleteObjectHandler(...)` — the single-object delete **handler definition** (its body calls the bypass check) |
+| `cmd/object-handlers.go:2601` | `err := enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{` — the actual bypass-check **call site** inside `DeleteObjectHandler` |
+| `cmd/bucket-handlers.go:416` | `func (api objectAPIHandlers) DeleteMultipleObjectsHandler(...)` — the batch delete **handler definition** (its body calls the bypass check) |
+| `cmd/bucket-handlers.go:573` | `if err := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); err != nil {` — the actual bypass-check **call site** inside `DeleteMultipleObjectsHandler` |
 
 ### Reasoning
 
@@ -381,38 +383,142 @@ deliberate security property: the lock enforcement path fails closed.
 (`minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4`, EC 2+2). The single-disk FS backend has no parity
 and **cannot** detect or heal bitrot.
 
-**Answer (what actually happened):** on GET, the corrupted shard fails bitrot verification and
-yields `errFileCorrupt`; the erasure decoder **tolerates** the failure and reconstructs the object
-from parity, so the client still receives correct bytes (md5 matches). The GET path **enqueues a
-heal** carrying `BitrotScan: true`, and a scan / deep-heal subsequently rewrites the damaged shard
-so its state returns `[Yellow ->  Green]`. The corruption is both **detected** and **repaired**
-without client-visible data loss.
+**Answer (what actually happened):** on GET, MinIO ran a per-part bitrot verification
+(`storage.CheckParts` on all four drives) and the corrupted data shard failed that check — at the
+**source level** this failure is the `errFileCorrupt` value (the literal `"file is corrupted"`,
+`cmd/storage-errors.go:103-104`). The erasure decoder **tolerated** the failure and reconstructed the
+object from parity, so the client still received correct bytes: the GET returned **`200 OK`** with
+`Content-Length: 5242880` and the original `ETag: "e4a96e3e2e460b38ffae9cce573ac65a"`, and the
+downloaded md5 matched. The GET **triggered an inline heal** (`[HEALING heal.Object] … mode=0`), and
+an explicit **deep / bitrot-scan heal** (`mc admin heal --scan deep`) then rewrote the damaged shard —
+the object transitioned `[Yellow ->  Green]` and the on-disk shard was **byte-restored** to its exact
+pre-corruption hash. The corruption is both **detected** and **repaired** without client-visible data
+loss.
 
-### Setup + evidence (verbatim)
+> **Runtime-vs-source note (important for Q3(b)).** MinIO does **not** emit a log/trace line
+> containing the literal `errFileCorrupt` / `"file is corrupted"` on the GET path — a full-text search
+> of both the server stderr log and the complete `mc admin trace -a -v` capture returned **zero**
+> matches for `corrupt`/`bitrot` (shown below). That literal is an **internal control-flow value**, not
+> a logged message. The runtime-observable evidence of the verification failure is the
+> `storage.CheckParts` + `HEALING heal.Object` activity and the deep-heal `[Yellow ->  Green]`
+> transition; the string `"file is corrupted"` itself is proven only at the **source level**.
+
+### Exact commands run (verbatim)
+
+The complete, reproducible sequence that produced every line quoted below (all paths local /
+throwaway):
 
 ```
-# 5MB object sharded across 4 drives (EC 2+2), each data part.1 ~2.5MB
-orig md5 = 069a994b70e2316ea7202f1560393fa6
+# 1) erasure server (EC 2+2 over four drives), server stderr captured to server.log
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+  ./minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4 --address 127.0.0.1:9000 > server.log 2>&1 &
+# boot banner (server.log): "Formatting 1st pool, 1 set(s), 4 drives per set."
 
-# after flipping bytes in a data shard on /tmp/d4, GET (--call storage) shows:
-/tmp/d4 ecbucket ec_object.bin/453d30ce-4b5b-42b1-b0a7-d86323a46900/part.1 total-errs-availability=0 total-errs-timeout=0 39.615µs 2.5 MiB
-/tmp/d3 ecbucket ec_object.bin/453d30ce-4b5b-42b1-b0a7-d86323a46900/part.1 total-errs-availability=0 total-errs-timeout=0 47.966µs 2.5 MiB
-/tmp/d1 ecbucket ec_object.bin/453d30ce-4b5b-42b1-b0a7-d86323a46900/part.1 total-errs-availability=0 total-errs-timeout=0 46.261µs 2.0 MiB
-# ^ d4 (corrupt data shard) + d3 (data) read; d1 PARITY pulled (2.0 MiB) to reconstruct
-downloaded md5 matched (069a994b70e2316ea7202f1560393fa6)   # client still received correct bytes
+# 2) client alias + verbose trace of ALL call types (so storage/healing are captured), to trace_all.log
+mc alias set localec http://127.0.0.1:9000 minioadmin minioadmin
+mc admin trace -a -v localec > trace_all.log 2>&1 &      # equivalently: --call storage,healing
 
-# self-heal enqueued/triggered on GET (HEALING trace):
-127.0.0.1:9000  [HEALING heal.Object] [2026-07-01T03:36:16.046] ecbucket/ec_object.bin disks=4 dry=false mode=0 remove=true version-id=null 288.274µs 5.0 MiB
+# 3) create bucket + upload a 5 MiB object (a unique ASCII token is embedded so the *data* shard is
+#    findable on disk)
+mc mb localec/ecbucket
+head -c 5242880 /dev/urandom > ec_object.bin
+printf 'BITROT_TOKEN_Q3_8f3ab21c...' | dd of=ec_object.bin bs=1 seek=0 conv=notrunc
+md5sum ec_object.bin                       # e4a96e3e2e460b38ffae9cce573ac65a
+mc cp ec_object.bin localec/ecbucket/ec_object.bin
 
-# deep-scan heal detected + repaired the bitrot:
-[Yellow ->  Green] ecbucket/ec_object.bin ; Healed: 1/1 objects; 5 MiB in 1s
-# d4 shard byte-restored to original after heal (hash before-corruption == hash after-heal)
+# 4) locate the DATA shard on disk (the part.1 that contains the ASCII token) and CORRUPT it
+SHARD=$(find /tmp/d3 -path '*ecbucket*' -name part.1)     # /tmp/d3/ecbucket/ec_object.bin/f973ed23-.../part.1
+sha256sum "$SHARD"                         # d1b1028772ccbb06dddcfd59dbc535b63df90101b79bae3f520883f654e5f110  (pre-corruption)
+printf 'CORRUPTIONxCORRUPTIONx...' | dd of="$SHARD" bs=1 seek=1310720 conv=notrunc   # flip 66 bytes mid-shard
+sha256sum "$SHARD"                         # f2c03081b42494d5865e5ccce9a36d845537cd680802fa90d530fd4873c40d55  (shard changed on disk)
+
+# 5) GET the object back (forces a fresh disk read + bitrot verification)
+mc cp localec/ecbucket/ec_object.bin dl.bin
+md5sum dl.bin                              # e4a96e3e2e460b38ffae9cce573ac65a  (== original: reconstructed from parity)
+
+# 6) explicit deep / bitrot-scan heal to rewrite the damaged shard
+mc admin heal -r --verbose --scan deep localec/ecbucket
+sha256sum "$SHARD"                         # d1b1028772ccbb06dddcfd59dbc535b63df90101b79bae3f520883f654e5f110  (== pre-corruption: shard byte-restored)
 ```
 
-A subtlety worth recording: the corrupted shard must be a **data shard that is actually in the read
-set**. The normal-mode GET heal (`mode=0`) serves the object from parity and **enqueues** a repair;
-it is the subsequent **deep / scan heal** that rewrites the shard, producing the `[Yellow ->  Green]`
-transition above.
+### Evidence 1 — GET returns correct bytes (reconstructed from parity)
+
+```
+127.0.0.1:9000 [REQUEST s3.GetObject] [2026-07-01T07:12:51.492] [Client IP: 127.0.0.1]
+127.0.0.1:9000 GET /ecbucket/ec_object.bin
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 Content-Length: 5242880
+127.0.0.1:9000 ETag: "e4a96e3e2e460b38ffae9cce573ac65a"
+# client-side: downloaded md5 = e4a96e3e2e460b38ffae9cce573ac65a  (== original -> correct bytes despite the on-disk corruption)
+```
+
+### Evidence 2 — bitrot verification + inline auto-heal on GET (`storage` / `healing` trace)
+
+```
+127.0.0.1:9000  [STORAGE storage.CheckParts] [2026-07-01T07:12:52.498] /tmp/d1 ecbucket ec_object.bin total-errs-availability=0 total-errs-timeout=0 27.593µs
+127.0.0.1:9000  [STORAGE storage.CheckParts] [2026-07-01T07:12:52.498] /tmp/d2 ecbucket ec_object.bin total-errs-availability=0 total-errs-timeout=0 10.878µs
+127.0.0.1:9000  [STORAGE storage.CheckParts] [2026-07-01T07:12:52.498] /tmp/d3 ecbucket ec_object.bin total-errs-availability=0 total-errs-timeout=0 10.118µs
+127.0.0.1:9000  [STORAGE storage.CheckParts] [2026-07-01T07:12:52.498] /tmp/d4 ecbucket ec_object.bin total-errs-availability=0 total-errs-timeout=0 8.41µs
+127.0.0.1:9000  [HEALING heal.Object] [2026-07-01T07:12:52.498] ecbucket/ec_object.bin disks=4 dry=false mode=0 remove=true version-id=null 349.177µs 5.0 MiB
+```
+
+The four `storage.CheckParts` calls are the per-drive part-integrity (bitrot) verification;
+immediately afterwards the GET path fired an inline `heal.Object` (`mode=0`) for the object.
+
+### Evidence 3 — deep heal repairs the shard (`[Yellow ->  Green]`)
+
+```
+$ mc admin heal -r --verbose --scan deep localec/ecbucket
+[Green  ->  Green] ecbucket/
+[Yellow ->  Green] ecbucket/ec_object.bin
+Healed:	1/1 objects; 5 MiB in 1s
+
+# corresponding healing trace (mode=2 = HealDeepScan):
+127.0.0.1:9000  [HEALING heal.Object] [2026-07-01T07:14:09.094] ecbucket/ec_object.bin disks=4 dry=false mode=2 remove=false version-id=null 14.98624ms 5.0 MiB
+
+# the /tmp/d3 data shard was restored to its EXACT pre-corruption bytes:
+sha256(part.1) before corruption = d1b1028772ccbb06dddcfd59dbc535b63df90101b79bae3f520883f654e5f110
+sha256(part.1) after deep heal   = d1b1028772ccbb06dddcfd59dbc535b63df90101b79bae3f520883f654e5f110   # identical
+```
+
+The `[Yellow ->  Green]` transition means the object was found degraded (Yellow) and repaired to fully
+healthy (Green); `Healed:\t1/1 objects` confirms the single object was rebuilt.
+
+### Runtime-vs-source note — the "verification-failure log" for Q3(b)
+
+Stated honestly and exactly, as the prompt requires: **MinIO does not emit a runtime log/trace line
+containing the literal `errFileCorrupt` or `"file is corrupted"` on the GET path.** A full-text search
+of *both* the server stderr log and the complete `mc admin trace -a -v` capture returned **zero**
+matches:
+
+```
+$ grep -icE 'corrupt|bitrot' server.log      # -> 0
+$ grep -icE 'corrupt|bitrot' trace_all.log   # -> 0
+```
+
+This is by design, grounded in the source:
+
+- The bitrot verifier returns `errFileCorrupt` **silently** — no log — in the streaming path
+  (`cmd/bitrot-streaming.go:184-185`, the default `HighwayHash256S` verifier) and in the single-stream
+  path (`cmd/bitrot.go:165-166`).
+- On GET the decoder detects it (`bitrotHeal = 1`, `cmd/erasure-decode.go:197`), **tolerates** it, and
+  uses it **only** to enqueue a heal (`BitrotScan: errors.Is(err, errFileCorrupt)`,
+  `cmd/erasure-object.go:407`); the error is then `nil`'d for the client, not logged.
+- Even the heal-time verifier `VerifyFile` logs a part error **only** when the result is
+  `checkPartUnknown` (`cmd/xl-storage.go:3126`), but `convPartErrToInt(errFileCorrupt)` returns the
+  **known** value `checkPartFileCorrupt` (`cmd/erasure-healing-common.go:265-266`) — so a corrupt part
+  is deliberately **not** logged as a line.
+
+**Conclusion for Q3(b):** the verification failure is real and is what drives the heal, but at runtime
+it surfaces as `storage.CheckParts` + `HEALING heal.Object` activity and the deep-heal
+`[Yellow ->  Green]` transition (Evidence 2 & 3) — **not** as a logged `"file is corrupted"` string.
+The literal `"file is corrupted"` is verified only at the **source level**
+(`cmd/storage-errors.go:103-104`).
+
+A further subtlety worth recording: the corrupted shard must be a **data shard that is actually in the
+read set**. The normal-mode GET heal (`mode=0`) serves the object from parity and **enqueues** a
+repair; it is the subsequent **deep / scan heal** (`mode=2`, `HealDeepScan`) that rewrites the shard,
+producing the `[Yellow ->  Green]` transition above.
 
 ### Citations
 
@@ -422,8 +528,11 @@ transition above.
 | `cmd/bitrot.go:40-43` | algorithm literals `SHA256: "sha256"`, `BLAKE2b512: "blake2b"`, `HighwayHash256: "highwayhash256"`, `HighwayHash256S: "highwayhash256S"` |
 | `cmd/bitrot.go:158` | `func bitrotVerify(r io.Reader, wantSize, partSize int64, algo BitrotAlgorithm, want []byte, shardSize int64) error` (its doc comment is on line 157) |
 | `cmd/bitrot.go:165-166` | `if !bytes.Equal(h.Sum(nil), want) {` … `return errFileCorrupt` |
-| `cmd/bitrot-streaming.go:184-185` | `if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {` … `return 0, errFileCorrupt` |
+| `cmd/bitrot-streaming.go:184-185` | `if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {` … `return 0, errFileCorrupt` (the streaming verifier — the default path) |
+| `cmd/xl-storage-format-v1.go:158` | `DefaultBitrotAlgorithm = HighwayHash256S` — the default erasure bitrot algorithm actually exercised on GET |
 | `cmd/erasure-decode.go:197` | `case errors.Is(err, errFileCorrupt):` — tolerated so parity reconstruction proceeds |
+| `cmd/xl-storage.go:3126-3128` | `if resp.Results[i] == checkPartUnknown && err != errFileAccessDenied {` … `storageLogOnceIf(ctx, err, partPath)` — VerifyFile logs **only** unknown errors (a corrupt part is not logged) |
+| `cmd/erasure-healing-common.go:265-266` | `case errFileCorrupt:` … `return checkPartFileCorrupt` — a corrupt part is a **known** result, not `checkPartUnknown`, so it is not surfaced as a log line |
 | `cmd/erasure-object.go:387-412` | after `erasure.Decode`, on `errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt)` it calls `healOnce.Do(...)` → `globalMRFState.addPartialOp(PartialOperation{ … })` |
 | `cmd/erasure-object.go:407` | `BitrotScan: errors.Is(err, errFileCorrupt),` — the `BitrotScan` flag assignment |
 | `cmd/mrf.go:109` | `healingLogEvent(context.Background(), "Saving MRF healing data (%d entries)", len(m.opCh))` |
@@ -440,12 +549,16 @@ compares it to the stored value; a mismatch returns `errFileCorrupt` — the lit
 
 On GET the erasure decoder tolerates `errFileCorrupt` (`cmd/erasure-decode.go:197`) and serves the
 object from parity — a self-healing read, which is why the downloaded md5 still equals the original
-`069a994b70e2316ea7202f1560393fa6`. Because the decode saw corruption, the read path enqueues a heal
-via `globalMRFState.addPartialOp(...)` with `BitrotScan: errors.Is(err, errFileCorrupt)`
-(`cmd/erasure-object.go:407`, within the block at `cmd/erasure-object.go:387-412`); the MRF
-subsystem logs `Saving MRF healing data (%d entries)` (`cmd/mrf.go:109`). The damaged shard is later
-rewritten by `healObject` (`cmd/global-heal.go:591`), completing the `[Yellow ->  Green]` transition.
-Corruption is therefore both **detected** and **repaired** with no client-visible data loss.
+`e4a96e3e2e460b38ffae9cce573ac65a` (Evidence 1). Because the decode saw corruption, the read path
+enqueues a heal via `globalMRFState.addPartialOp(...)` with `BitrotScan: errors.Is(err, errFileCorrupt)`
+(`cmd/erasure-object.go:407`, within the block at `cmd/erasure-object.go:387-412`) — observed as the
+inline `[HEALING heal.Object] … mode=0` event (Evidence 2). (The MRF subsystem's own
+`healingLogEvent("Saving MRF healing data (%d entries)", …)` at `cmd/mrf.go:109` fires on MRF
+**shutdown** when unsaved ops remain and was **not** part of this GET capture — it is cited here only as
+the source-level MRF logging path.) The damaged shard is finally rewritten by `healObject`
+(`cmd/global-heal.go:591`) under the deep scan, completing the observed `[Yellow ->  Green]` transition
+and byte-restoring the on-disk shard (Evidence 3). Corruption is therefore both **detected** and
+**repaired** with no client-visible data loss.
 
 ---
 
@@ -480,41 +593,62 @@ and `TestSTSWithGroupPolicy` (`cmd/sts-handlers_test.go:478`). The test harness 
 ### (B) Live demo (verbatim)
 
 Parent user policy = Allow `[s3:GetObject, s3:PutObject, s3:ListBucket]` on `stsbucket`; the inline
-session policy passed to `AssumeRole` = Allow `[s3:GetObject, s3:ListBucket]` **only** (no `Put`).
+session policy passed to `AssumeRole` = Allow `[s3:ListBucket, s3:GetObject]` **only** (no `Put`).
+
+> **All snippets below come from a single `AssumeRole` call and therefore share one temporary
+> `AccessKeyId` — `STHREZDCMOVLQHFEK41Z`.** The same value appears in (1) the demo summary, (2) the
+> `<AssumeRoleResponse>` XML in the server trace, (3) the decoded JWT `accessKey` claim, and (4) the
+> `Credential=…` / `X-Amz-Security-Token` of the denied `PutObject`. Secret key and session token are
+> truncated (`…`) — they are local, throwaway, and non-reusable; the `AccessKeyId` of a temporary
+> credential is a non-secret identifier and is shown in full to prove the four snippets are one capture.
+
+Demo summary (from the boto3 driver, verbatim):
 
 ```
-STS creds obtained: AccessKeyID=J61ZZFHOJZMIE5480GUW SessionToken.len=539
---- [1] ListObjects (parent:Allow, session:Allow) ---
+=== STS creds obtained (single AssumeRole call) ===
+AccessKeyID   = STHREZDCMOVLQHFEK41Z
+SessionToken.len = 539
+=== decoded JWT outer claim ===
+{"accessKey": "STHREZDCMOVLQHFEK41Z", "exp": 1782894124, "parent": "stsuser", "sessionPolicy": "<base64,len=220>"}
+=== sessionPolicy claim (base64 -> JSON) ===
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::stsbucket","arn:aws:s3:::stsbucket/*"]}]}
+=== [1] ListObjects (parent:Allow, session:Allow) ===
 ListObjects RESULT: ALLOWED (1 object(s))
---- [2] GetObject seed.txt (parent:Allow, session:Allow) ---
+=== [2] GetObject seed.txt (parent:Allow, session:Allow) ===
 GetObject RESULT: ALLOWED
---- [3] PutObject new.txt (parent:Allow, session:ABSENT) ---
-PutObject RESULT: DENIED err=Access Denied.
-=== Q4 live demo complete ===
+=== [3] PutObject new.txt (parent:Allow, session:ABSENT) ===
+PutObject RESULT: DENIED  Code=AccessDenied HTTP=403
+=== Q4 live demo complete; AccessKeyId used for all ops = STHREZDCMOVLQHFEK41Z ===
 ```
 
-Server trace of the `AssumeRole` call and the session-denied `PutObject`:
+Server trace of the `AssumeRole` call — the response carries the **same** `AccessKeyId`:
 
 ```
-127.0.0.1:9000 [REQUEST sts.AssumeRole] [2026-07-01T03:44:26.310] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST sts.AssumeRole] [2026-07-01T07:22:04.249] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /
-127.0.0.1:9000 Action=AssumeRole&DurationSeconds=3600&Policy=%7B%22Version%22%3A%222012-10-17%22...%22s3%3AGetObject%22%2C%22s3%3AListBucket%22...&Version=2011-06-15
-<AssumeRoleResponse ...><Credentials><AccessKeyId>0QJPNE3WXNY9SEDD6RMY</AccessKeyId>...<SessionToken>eyJhbGc...</SessionToken><Expiration>2026-07-01T04:44:26Z</Expiration></Credentials>...
+127.0.0.1:9000 Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3Aminio%3Arole%2Fstsparent&RoleSessionName=q4session&DurationSeconds=3600&Policy=%7B%22Version%22%3A+%222012-10-17%22%2C+%22Statement%22%3A+%5B%7B%22Effect%22%3A+%22Allow%22%2C+%22Action%22%3A+%5B%22s3%3AListBucket%22%2C+%22s3%3AGetObject%22%5D...%7D%5D%7D
+<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult>...<Credentials><AccessKeyId>STHREZDCMOVLQHFEK41Z</AccessKeyId><SecretAccessKey>…</SecretAccessKey><SessionToken>eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9…</SessionToken><Expiration>2026-07-01T08:22:04Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>18BE197C5346DED7</RequestId></ResponseMetadata></AssumeRoleResponse>
+```
 
-127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-01T03:44:26.337] [Client IP: 127.0.0.1]
+Server trace of the session-denied `PutObject` — signed with the **same** `AccessKeyId` and carrying
+the session-policy JWT, rejected `403`:
+
+```
+127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-01T07:22:04.296] [Client IP: 127.0.0.1]
 127.0.0.1:9000 PUT /stsbucket/new.txt
-127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9...(JWT session token)...
-127.0.0.1:9000 [RESPONSE] [2026-07-01T03:44:26.337] [ Duration 155µs TTFB 146.834µs ↑ 140 B  ↓ 323 B ]
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=STHREZDCMOVLQHFEK41Z/20260701/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm;x-amz-security-token, Signature=…
+127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJTVEhSRVpEQ01PVkxRSEZFSzQxWiI…(JWT session token; accessKey=STHREZDCMOVLQHFEK41Z)…
 127.0.0.1:9000 403 Forbidden
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>new.txt</Key><BucketName>stsbucket</BucketName>...</Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>new.txt</Key><BucketName>stsbucket</BucketName><Resource>/stsbucket/new.txt</Resource><RequestId>18BE197C56140118</RequestId>...</Error>
 ```
 
-Decoded JWT session token — proving the session policy is embedded as a base64 claim:
+Decoded JWT session token — proving the session policy is embedded as a base64 claim and the token's
+`accessKey` matches the `AccessKeyId` above:
 
 ```
-outer claim: {"accessKey":"0QJPNE3WXNY9SEDD6RMY","exp":1782881066,"parent":"stsuser","sessionPolicy":"<base64, len=220>"}
+outer claim: {"accessKey":"STHREZDCMOVLQHFEK41Z","exp":1782894124,"parent":"stsuser","sessionPolicy":"<base64,len=220>"}
 sessionPolicy claim (base64 -> JSON):
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::stsbucket","arn:aws:s3:::stsbucket/*"]}]}
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::stsbucket","arn:aws:s3:::stsbucket/*"]}]}
 ```
 
 ### Citations
@@ -633,7 +767,8 @@ Server traces — all three admin paths return 403:
 | `cmd/admin-handlers-users.go:499` | self-update path — `checkDenyOnly = true` when `accessKey == cred.AccessKey` |
 | `cmd/iam.go:1340` | `func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) (updatedAt time.Time, err error)` |
 | `cmd/iam.go:1357` | `updatedAt, err = sys.store.AddUser(ctx, accessKey, ureq)` |
-| `cmd/iam-store.go:2659` | `func (store *IAMStoreSys) AddUser(...)` — applies **only** `ureq.SecretKey` and `ureq.Status`; it **never** references `ureq.Policy` (the `Policy` field with json tag `policy` on `AddOrUpdateUserReq`, `cmd/utils.go:75`, is never consumed by the store) |
+| `cmd/iam-store.go:2659-2691` | `func (store *IAMStoreSys) AddUser(...)` — the store consumes **only** `ureq.SecretKey` (`cmd/iam-store.go:2674`) and `ureq.Status` (mapped to `auth.AccountOn` / `auth.AccountOff`); it **never** references `ureq.Policy`, so a caller-supplied policy on self-update is silently ignored |
+| *(external module — not a repo `file:line`)* `github.com/minio/madmin-go/v3@v3.0.77/user-commands.go:255-259` | `type AddOrUpdateUserReq struct { SecretKey string; Policy string; Status AccountStatus }` where the `Policy` field carries the json tag `policy,omitempty` (line 257) — this type is defined in the **external `madmin-go` module**, *not* in the MinIO source tree; the MinIO server's `AddUser` never reads its `Policy` field |
 
 ### Reasoning
 
@@ -649,8 +784,12 @@ denied by the admin-action gate **before any mutation occurs**: each handler cal
 Even the narrow self-service `add-user` path (where `checkDenyOnly = true` for one's own access key,
 `cmd/admin-handlers-users.go:499`) cannot self-grant a policy: `CreateUser` (`cmd/iam.go:1340`)
 delegates to `sys.store.AddUser` (`cmd/iam.go:1357`), and `IAMStoreSys.AddUser`
-(`cmd/iam-store.go:2659`) writes **only** the secret key and status — it never reads `ureq.Policy`.
-This is Layer 2.
+(`cmd/iam-store.go:2659-2691`) writes **only** the secret key (`ureq.SecretKey`, `cmd/iam-store.go:2674`)
+and status — it never reads `ureq.Policy`. The `Policy` field itself lives on the request type
+`AddOrUpdateUserReq`, which is defined in the **external `madmin-go` module**
+(`github.com/minio/madmin-go/v3@v3.0.77/user-commands.go:255-259`, `Policy` at line 257) — *not* in the
+MinIO repository — so there is no MinIO-side `file:line` for that field; the point is precisely that the
+MinIO store ignores it. This is Layer 2.
 
 **Root cause:** privilege escalation is prevented by two independent layers — (1) the admin-action
 authorization gate blocks admin actions for non-admins, and (2) the user-mapping store never applies
@@ -674,9 +813,9 @@ Every distinct sub-part of every question, and whether it is answered:
 | **Q2** | (c) HTTP status code | ✓ | HTTP **400 Bad Request** (single) / HTTP **200 OK** with per-object error (batch) |
 | **Q2** | (d) governance vs. compliance vs. legal hold | ✓ | legal hold + compliance non-bypassable; governance bypassable only with header + `s3:BypassGovernanceRetention` |
 | **Q2** | (e) fail-closed NTP time | ✓ | `UTCNowNTP()` failure → warning + `ObjectLocked{}` (L114/L116-117) |
-| **Q3** | (a) response to unauthorized on-disk corruption | ✓ | detected via bitrot verify; served from parity; heal enqueued |
-| **Q3** | (b) verification-failure logs | ✓ | `errFileCorrupt` / `"file is corrupted"`; storage-call trace |
-| **Q3** | (c) heal / reconstruction | ✓ | `BitrotScan: true` (L407), `[HEALING heal.Object]`, `[Yellow ->  Green]`, `Healed: 1/1 objects` |
+| **Q3** | (a) response to unauthorized on-disk corruption | ✓ | detected via bitrot verify (`storage.CheckParts`); served from parity (GET md5 == original); inline heal fired |
+| **Q3** | (b) verification-failure logs | ✓ (with stated limitation) | **Runtime:** `storage.CheckParts` + `[HEALING heal.Object] mode=0` on GET; **no** literal `"file is corrupted"` log is emitted (verified: `grep -icE 'corrupt\|bitrot'` on server.log **and** trace = **0**). **Source-level:** the failure is `errFileCorrupt` / `"file is corrupted"` (`cmd/storage-errors.go:103-104`). See the Runtime-vs-source note. |
+| **Q3** | (c) heal / reconstruction | ✓ | `BitrotScan: errors.Is(err, errFileCorrupt)` (L407); inline `[HEALING heal.Object] mode=0`; deep `mode=2` heal → `[Yellow ->  Green]`, `Healed: 1/1 objects`; shard byte-restored (sha256 match) |
 | **Q3** | (d) supported algorithms | ✓ | `sha256`, `blake2b`, `highwayhash256`, `highwayhash256S` (L40-43) |
 | **Q4** | (a) session policy enforced on temporary credentials | ✓ | passing suite + live `403 AccessDenied` on `PutObject` |
 | **Q4** | (b) test output proving effective = parent ∩ session | ✓ | `--- PASS: … (3.51s)` + live demo (Put denied, Get/List allowed); `iam.go:2312` intersection |
@@ -688,11 +827,17 @@ Every distinct sub-part of every question, and whether it is answered:
 ## Cleanup & read-only confirmation
 
 - All live MinIO servers started for this investigation were stopped.
-- All throwaway data directories (`/tmp/q1b`, `/tmp/q2b`, `/tmp/d1..d4`, and the `/tmp/minio_bin`
-  / `/tmp/gobin` build/tool artifacts, etc.) and all temporary observation scripts were **removed
-  after capture**.
-- The repository working tree was verified unchanged — `git status --porcelain` returned empty on
-  branch `minio_c07e5b49d477`, HEAD `c07e5b49d477b0774f23db3b290745aef8c01bd2`.
+- All throwaway data directories (`/tmp/q1b`, `/tmp/q2b`, `/tmp/d1..d4`, the erasure/STS work dirs
+  `/tmp/q3work` and `/tmp/q4work`, and the `/tmp/minio_bin` / `/tmp/gobin` build/tool artifacts, etc.)
+  and all temporary observation scripts (e.g. the boto3 STS driver) were **removed after capture**.
+- **Read-only scope — source vs. destination context (to avoid confusion).** The MinIO code *under
+  investigation* is the **source** branch `minio_c07e5b49d477` at commit
+  `c07e5b49d477b0774f23db3b290745aef8c01bd2`; against that source tree, `git status --porcelain`
+  returned **empty** — the read-only baseline, proving the build/run/observe steps touched **no**
+  repository source file. This answer document is the *only* new artifact and is committed separately on
+  the **destination** branch (the branch that carries `blitzy/documentation/`); that destination commit
+  is expected and is not part of the source tree under investigation. In other words: *source tree =
+  unchanged; destination = one added file, this document.*
 - **No repository source file was modified.** This document —
   `blitzy/documentation/minio_c07e5b49d477.md` — is the only artifact produced by the investigation.
 
