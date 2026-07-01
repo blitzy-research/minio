@@ -23,7 +23,7 @@ All `file:line` citations are valid against **HEAD commit `c07e5b49d477b0774f23d
   /root/minio-run/minio server /root/minio-run/data --address ":9000" --console-address ":9001"
   ```
 
-  SNSD initializes the **`ErasureSDSetupType`** backend (`cmd/setup-type.go:31`); its `String()` method (`cmd/setup-type.go:44`) returns `globalMinioModeErasureSD`, defined as `"mode-server-xl-single"` (`cmd/globals.go:82`). The server version banner token observed was `DEVELOPMENT.GOGET (go1.23.12 linux/amd64)`.
+  SNSD initializes the **`ErasureSDSetupType`** backend (`cmd/setup-type.go:31`); its `String()` method (`cmd/setup-type.go:44-45`) returns `globalMinioModeErasureSD`, defined as `"mode-server-xl-single"` (`cmd/globals.go:82`). The server version banner token observed was `DEVELOPMENT.GOGET (go1.23.12 linux/amd64)`.
 
 - **Client.** A Python client using **botocore SigV4 signing** — the same signer `boto3` uses (`signature_version="s3v4"`, path-style addressing) — plus the `requests` library for exact raw header/body capture. Target `http://127.0.0.1:9000`, region `us-east-1`, credentials `minioadmin` / `minioadmin`.
 
