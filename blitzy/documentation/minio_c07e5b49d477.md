@@ -10,16 +10,15 @@ exactly as observed.
 ## Runtime substrate (how these observations were produced)
 
 - **System under observation.** MinIO server built from source at commit `c07e5b49d`, reporting its version at
-  startup as `DEVELOPMENT.GOGET (go1.23.12 linux/amd64)`. The authoritative toolchain constraint in the
-  repository is `go 1.23` (`go.mod:L3`); this environment's build used the highest available `1.23.x` patch,
-  `go1.23.12`, which is what the binary reports and what is quoted below (reported exactly as observed rather
-  than as a fixed patch number).
+  startup as `DEVELOPMENT.GOGET (go1.23.4 linux/amd64)`. The authoritative toolchain constraint in the
+  repository is `go 1.23` (`go.mod:L3`); `go1.23.4` is the `1.23.x` patch the binary reported during this
+  investigation and is what is quoted below (reported exactly as observed).
 - **Topology, and why one node is a faithful substrate.** The server was launched over four directories,
   which it formats as exactly **one erasure set of four drives**:
 
   ```text
   INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
-  Version: DEVELOPMENT.GOGET (go1.23.12 linux/amd64)
+  Version: DEVELOPMENT.GOGET (go1.23.4 linux/amd64)
   ```
 
   A four‑drive set defaults to `EC:2` (two data + two parity), which — as derived in Q7 — yields a **read
@@ -41,6 +40,11 @@ exactly as observed.
       /tmp/minio-data/disk1 /tmp/minio-data/disk2 /tmp/minio-data/disk3 /tmp/minio-data/disk4 \
       --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
   ```
+
+  > **Note on credentials.** `MINIO_ROOT_USER=minioadmin` / `MINIO_ROOT_PASSWORD=minioadmin` are MinIO's
+  > publicly documented *default* root credentials, shown here only for this ephemeral localhost observation
+  > run. They are not a live or production secret — MinIO falls back to `minioadmin`/`minioadmin` (emitting a
+  > startup warning) when these variables are unset, so they carry no security significance in this context.
 
   That the mode change genuinely denies the server was verified directly: as `nobody`, the drive directory is
   unreadable after `chmod 000`:
@@ -116,7 +120,7 @@ HTTP 200
   `MinIOStorageClassDefaults = "x-minio-storage-class-defaults"` (`internal/http/headers.go:L200`).
 - The assumption that four drives means two parity comes from `func DefaultParityBlocks(drive int) int`
   (`internal/config/storageclass/storage-class.go:L355`), whose `case 4, 5:` returns `2`
-  (`internal/config/storageclass/storage-class.go:L361`). With four drives that fixes **data = 2, parity = 2**.
+  (`internal/config/storageclass/storage-class.go:L361-L362`). With four drives that fixes **data = 2, parity = 2**.
 
 So "healthy" is not a heuristic: it is the boolean `online >= writeQuorum` (and `online >= readQuorum`)
 evaluated for the erasure set, with `writeQuorum = 3` and `readQuorum = 2` for this four‑drive `EC:2`
@@ -193,14 +197,16 @@ HTTP/1.1 200 OK
 X-Minio-Read-Quorum: 2
 ```
 
-The write succeeded and the object appears in the listing:
+The write **succeeded**. The verbatim listing line for the newly written object, from
+`mc ls local/testbucket/`, was:
 
 ```text
-$ mc cp /tmp/objA.txt local/testbucket/objA.txt   # PUT objA: SUCCEEDED
-$ mc ls local/testbucket/
-[... UTC]    31B STANDARD obj1.txt
-[... UTC]    36B STANDARD objA.txt
+36B STANDARD objA.txt
 ```
+
+(Summary: that listing showed two objects at this point — the baseline `obj1.txt` at `32B` and the new
+`objA.txt` at `36B`; only the size/storage-class/name columns are quoted above, as the timestamp column was
+not part of the captured evidence.)
 
 **Observed — Scenario B (after also `chmod 000 /tmp/minio-data/disk3`, 2 online < write quorum 3):**
 
@@ -388,7 +394,7 @@ $ mc admin heal --recursive --force local/testbucket
 [Green  ->  Green] testbucket/
 [Green  ->  Green] testbucket/obj1.txt
 [Green  ->  Green] testbucket/objA.txt
-Healed: 0/2 objects; 67 B in 1s
+Healed: 0/2 objects; 68 B in 1s
 ```
 
 **Why (grounded in code):**
@@ -419,7 +425,7 @@ set — the "`+1`" split‑brain rule.
 
 1. **Default parity policy — how many parity blocks for N drives.**
    `func DefaultParityBlocks(drive int) int` (`internal/config/storageclass/storage-class.go:L355`); its
-   `case 4, 5:` returns `2` (`internal/config/storageclass/storage-class.go:L361`). So a four‑drive set is
+   `case 4, 5:` returns `2` (`internal/config/storageclass/storage-class.go:L361-L362`). So a four‑drive set is
    `EC:2`: **data = 2, parity = 2**. The official table corroborates this — an erasure set of "5 or fewer"
    defaults to `EC:2` (`docs/erasure/storage-class/README.md:L52`), and "parity can not be higher than N/2"
    (`docs/erasure/storage-class/README.md:L46`).
@@ -489,9 +495,13 @@ the write path (`cmd/erasure-object.go:L1115-L1119`) and in `Health()`
 
 Every answer above is anchored to two kinds of live evidence gathered while the server ran: (1) the
 **health‑endpoint status line and quorum headers**, and (2) the **result of actual `mc` write/read attempts**.
-The raw grounding evidence, side by side (verbatim from the running server):
+The block below is a **consolidated summary** (not raw output): each `command → result` line condenses a full
+request/response that is shown **verbatim** in an earlier section — the baseline health block in Q1, the
+Scenario B `503`/`200` blocks and the `SlowDownWrite` JSON in Q3, and the recovery/heal blocks in Q5/Q6.
+Refer to those sections for the unabridged, verbatim command output:
 
 ```text
+# SUMMARY — condensed `command → result`; the raw verbatim output lives in Q1/Q3/Q5/Q6
 # Baseline (all 4 drives online) — healthy for both write and read
 $ curl -sI http://127.0.0.1:9000/minio/health/cluster       -> HTTP/1.1 200 OK   X-Minio-Write-Quorum: 3
 $ curl -sI http://127.0.0.1:9000/minio/health/cluster/read  -> HTTP/1.1 200 OK   X-Minio-Read-Quorum: 2
@@ -537,7 +547,7 @@ produces it, the explanation is grounded in what the running system does, not in
 | Q4 — by‑path logging + live recovery signal | Q4 | `endpoint="/tmp/minio-data/disk4"`, `.healing.bin` probe; `cmd/prepare-storage.go:L40`, `cmd/xl-storage.go:L436` |
 | Q5 — recovery detection | Q5 | health `200` at `t+3s` unaided; `cmd/background-newdisks-heal-ops.go:L40, L563` |
 | Q6 — object repair | Q6 | `disk4` `xl.meta` `0 -> 1`; `cmd/erasure-healing.go:L258` |
-| Q7 — quorum location + math | Q7 | data=2/parity=2 → WQ 3/RQ 2; chain L361 → L531 → L1115 → L2679 |
+| Q7 — quorum location + math | Q7 | data=2/parity=2 → WQ 3/RQ 2; chain L361-L362 → L531 → L1115 → L2679 |
 | Q8 — grounding | Q8 | each claim paired with health status/header + `mc` result |
 
 **Named mechanisms.**
@@ -546,7 +556,7 @@ produces it, the explanation is grounded in what the running system does, not in
 |---|---|---|
 | `/minio/health/cluster`, `/minio/health/cluster/read`, `/minio/health/live`, `/minio/health/ready` | Q1, Q8 | routes `cmd/healthcheck-router.go:L41-L44` (cluster/read), `L47-L48` (live), `L51-L52` (ready) |
 | `Health()` | Q1, Q3, Q7 | `cmd/erasure-server-pool.go:L2679`; `online >= writeQuorum` at `L2791` |
-| `DefaultParityBlocks` | Q1, Q7 | `internal/config/storageclass/storage-class.go:L355`; `case 4, 5:` → `2` at `L361` |
+| `DefaultParityBlocks` | Q1, Q7 | `internal/config/storageclass/storage-class.go:L355`; `case 4, 5:` → `2` at `L361-L362` |
 | `objectQuorumFromMeta` | Q3, Q7 | `cmd/erasure-metadata.go:L531` |
 | `writeQuorum++` (the `+1` rule) | Q3, Q7 | `cmd/erasure-metadata.go:L557-L559`; `cmd/erasure-object.go:L1115-L1119` |
 | `X-Minio-Write-Quorum` / `X-Minio-Read-Quorum` / `X-Minio-Healing-Drives` | Q1, Q8 | `internal/http/headers.go:L193`, `L196`, `L203`; healing header set only when `HealingDrives > 0` at `cmd/healthcheck-handler.go:L75-L76` |
@@ -563,8 +573,8 @@ produces it, the explanation is grounded in what the running system does, not in
 | `errErasureReadQuorum` / `errErasureWriteQuorum` | Q3 | `cmd/erasure-errors.go:L23`, `L26` |
 | `mc admin heal` | Q5, Q6 | admin entry `HealObject` `cmd/erasure-healing.go:L1039`; observed `[Green -> Green]`, `Healed: 0/2 objects` |
 
-**Reproducibility note.** Observed values are reported exactly as captured in this environment. The build
-reported `go1.23.12` (a valid `1.23.x` patch of the `go 1.23` constraint at `go.mod:L3`); the baseline object
-`obj1.txt` was 31B; and `mc admin heal` reported `67 B` — these are the measured values from this run rather
+**Reproducibility note.** Observed values are reported exactly as captured during the investigation. The build
+reported `go1.23.4` (a `1.23.x` patch of the `go 1.23` constraint at `go.mod:L3`); the baseline object
+`obj1.txt` was 32B; and `mc admin heal` reported `68 B` — these are the measured values from this run rather
 than fixed constants.
 
