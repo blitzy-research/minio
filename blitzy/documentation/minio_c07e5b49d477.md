@@ -47,6 +47,61 @@ ls: cannot open directory '/tmp/mtest2/data2': Permission denied
 
 **Observation tooling (temporary, removed afterward).** S3 `PUT`/`GET` were issued via a small `boto3` script (`s3v4` signing, path-style addressing, endpoint `http://127.0.0.1:9000`, credentials `minioadmin:minioadmin`, bucket `testbucket`); the health endpoints were probed with `curl`; the raw `503` XML body was captured via `boto3` with the `botocore.parsers` DEBUG logger enabled. All observation scripts, the built binary, the data directories, and the captured logs live outside the repository under `/tmp` and were removed afterward, so the repository is left unchanged apart from this document.
 
+The S3 client tool referenced throughout as `python3 s3put.py <all|put|get> <key>` is the following script (`/tmp/s3put.py`). It PUTs a deterministic per-key payload (`key + " erasure-set payload"`, which is 33 bytes for `obj-1down.txt` and 36 bytes for `obj-baseline.txt`) and prints the HTTP status, the `ETag` on `PUT`, and the byte count on `GET`, verbatim:
+
+```python
+#!/usr/bin/env python3
+import sys, boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+ENDPOINT = "http://127.0.0.1:9000"
+BUCKET   = "testbucket"
+s3 = boto3.client(
+    "s3", endpoint_url=ENDPOINT,
+    aws_access_key_id="minioadmin", aws_secret_access_key="minioadmin",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    region_name="us-east-1",
+)
+
+def body_for(key):                       # deterministic payload => reproducible ETag/bytes
+    return (key + " erasure-set payload").encode()
+
+def mb():
+    try:
+        s3.create_bucket(Bucket=BUCKET); print("CREATE_BUCKET code=OK http=200")
+    except ClientError as e:
+        print("CREATE_BUCKET code=%s http=%s" % (
+            e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"]))
+
+def put(key):
+    try:
+        r = s3.put_object(Bucket=BUCKET, Key=key, Body=body_for(key))
+        print('PUT key=%s status=%s etag=%s' % (
+            key, r["ResponseMetadata"]["HTTPStatusCode"], r["ETag"]))
+    except ClientError as e:
+        print("PUT key=%s ERROR http=%s Code=%s Message=%s" % (
+            key, e.response["ResponseMetadata"]["HTTPStatusCode"],
+            e.response["Error"]["Code"], e.response["Error"]["Message"]))
+
+def get(key):
+    try:
+        r = s3.get_object(Bucket=BUCKET, Key=key); n = len(r["Body"].read())
+        print("GET key=%s status=%s bytes=%d" % (
+            key, r["ResponseMetadata"]["HTTPStatusCode"], n))
+    except ClientError as e:
+        print("GET key=%s ERROR http=%s Code=%s" % (
+            key, e.response["ResponseMetadata"]["HTTPStatusCode"], e.response["Error"]["Code"]))
+
+cmd = sys.argv[1]; key = sys.argv[2] if len(sys.argv) > 2 else "obj.txt"
+if   cmd == "all": mb(); put(key); get(key)
+elif cmd == "put": put(key)
+elif cmd == "get": get(key)
+elif cmd == "mb":  mb()
+```
+
+The health endpoints were probed with `curl -s -o /dev/null -D - <url>` (headers) or `curl -s -o /dev/null -w "%{http_code}" <url>` (status only). Drive degradation/recovery used `chmod 000`/`chmod 755` on the data directories. The `xl.meta` shard map used a shell loop over `/tmp/mtest2/data{1..4}` (shown in Q6). Each of these commands is repeated inline next to the output it produced.
+
 ## Q1 — How does MinIO decide it is "healthy", and what does it assume about the required number of disks?
 
 **Answer.** For four drives, MinIO auto-selects the default erasure config `EC:2` (2 data + 2 parity), which sets **read quorum = 2** and **write quorum = 3**. It reports the cluster healthy-for-writes only while at least `write quorum` drives (3) are online, and healthy-for-reads while at least `read quorum` drives (2) are online. The write-quorum threshold is surfaced directly on the health endpoint as the header `X-Minio-Write-Quorum: 3`.
@@ -123,7 +178,7 @@ Output:
 
 ```
 CREATE_BUCKET code=BucketAlreadyOwnedByYou http=409
-PUT key=obj-1down.txt status=200 etag="0a4fcb361b128d4478de49fe82d56576"
+PUT key=obj-1down.txt status=200 etag="78620bf84c381a7f6e03ff7efe1edc70"
 GET key=obj-1down.txt status=200 bytes=33
 ```
 
@@ -133,7 +188,16 @@ A prior object remains readable — command `python3 s3put.py get obj-baseline.t
 GET key=obj-baseline.txt status=200 bytes=36
 ```
 
-**Code.** The per-object write path applies the quorum computed by `objectQuorumFromMeta` — `cmd/erasure-object.go:103` `readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)`. With 3 online ≥ `writeQuorum` 3, the write proceeds.
+**Code.** The S3 `PUT` is routed to the object's erasure set by `cmd/erasure-sets.go:747` `func (s *erasureSets) PutObject(...)` → `set := s.getHashedSet(object)` (`cmd/erasure-sets.go:748`) → `return set.PutObject(...)` (`cmd/erasure-sets.go:749`), which lands in `cmd/erasure-object.go:1240` `func (er erasureObjects) PutObject(...)` → `return er.putObject(...)` (`cmd/erasure-object.go:1241`). The write path itself is `cmd/erasure-object.go:1245` `func (er erasureObjects) putObject(...)`, which computes the write quorum for this PUT at `cmd/erasure-object.go:1323-1325`:
+
+```go
+writeQuorum := dataDrives          // L1323
+if dataDrives == parityDrives {    // L1324  (2 == 2)
+    writeQuorum++                  // L1325  -> 3
+}
+```
+
+and enforces it when erasure-encoding the shards at `cmd/erasure-object.go:1425` `n, erasureErr := erasure.Encode(ctx, toEncode, writers, buffer, writeQuorum)`. The threshold is applied inside the encoder's per-stripe writer `cmd/erasure-encode.go:59-65` — `nilCount := countErrs(p.errs, nil)` then `if nilCount >= p.writeQuorum { return nil }`, otherwise `reduceWriteQuorumErrs(ctx, p.errs, objectOpIgnoredErrs, p.writeQuorum)` returns a quorum error. With 3 drives online ≥ `writeQuorum` 3, enough shard writes succeed, so the PUT returns `200`.
 
 **Rationale.** Because write quorum is 3 and three drives remain online, MinIO can still place enough shards to satisfy durability, so it does not draw a hard line — it writes the object (with the shard that would have gone to the down disk queued for later healing; see Q6).
 
@@ -155,11 +219,38 @@ Output:
 PUT key=obj-2down.txt ERROR http=503 Code=SlowDownWrite Message=Resource requested is unwritable, please reduce your request rate
 ```
 
-Raw `503` XML body (command: `boto3` PUT with the `botocore.parsers` DEBUG logger) — HTTP status `503`:
+Raw `503` XML body — captured with this `boto3` script (`/tmp/raw503.py`), which attaches the `botocore.parsers` DEBUG logger (that logger records the verbatim response body) and then does a `PUT`:
+
+```python
+#!/usr/bin/env python3
+import logging, io, sys, boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+buf = io.StringIO(); h = logging.StreamHandler(buf); h.setLevel(logging.DEBUG)
+logging.getLogger("botocore.parsers").addHandler(h)
+logging.getLogger("botocore.parsers").setLevel(logging.DEBUG)
+
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000",
+    aws_access_key_id="minioadmin", aws_secret_access_key="minioadmin",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    region_name="us-east-1")
+key = sys.argv[1]
+try:
+    s3.put_object(Bucket="testbucket", Key=key, Body=(key + " erasure-set payload").encode())
+except ClientError as e:
+    print("HTTP", e.response["ResponseMetadata"]["HTTPStatusCode"])
+for line in buf.getvalue().splitlines():           # print the logged raw XML body
+    i = line.find("<?xml")
+    if i != -1: print(line[i:].rstrip("'\""))
+```
+
+Run as `python3 raw503.py obj-raw503.txt`; it prints `HTTP 503` and the exact XML body MinIO returned (`RequestId` is server-assigned per request; `HostId` is deployment-stable):
 
 ```
+HTTP 503
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>obj-raw503.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/obj-raw503.txt</Resource><RequestId>18BE0D41F2545B83</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>obj-raw503.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/obj-raw503.txt</Resource><RequestId>18BE16B2A0630378</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
 Reads are still served — command `python3 s3put.py get obj-baseline.txt`:
@@ -197,7 +288,7 @@ HTTP/1.1 200 OK                       (/minio/health/live)
 
 **Observed evidence (one-down state, `/tmp/minio.log`).**
 
-Reconnect loop naming the endpoint by path (this *is* the live recovery attempt):
+Reconnect loop naming the endpoint by path (this *is* the live recovery attempt) — extracted with `grep -B3 -A6 "drive access denied" /tmp/minio.log` (the `API`/`Time`/`DeploymentID` lines precede the `Error:` line; intermediate stack frames trimmed for brevity):
 
 ```
 API: SYSTEM.peers
@@ -209,7 +300,7 @@ Error: drive access denied (cmd.StorageErr)
        1: .../cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
 ```
 
-Per-disk `Healing()` probe naming the full path:
+Per-disk `Healing()` probe naming the full path — extracted with `grep -A6 "healing.bin: permission denied" /tmp/minio.log`:
 
 ```
 Error: unable to read /tmp/mtest2/data2/.minio.sys/buckets/.healing.bin: open /tmp/mtest2/data2/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
@@ -238,10 +329,37 @@ Error: unable to read /tmp/mtest2/data2/.minio.sys/buckets/.healing.bin: open /t
 Post-recovery write succeeds — command `python3 s3put.py put obj-postrecover.txt`:
 
 ```
-PUT key=obj-postrecover.txt status=200 etag="25d82c7f382bcbb739191df2007bb338"
+PUT key=obj-postrecover.txt status=200 etag="d47ddcdb4c23bbe43bc3d054fb6f8f3a"
 ```
 
-Timed cycle (`chmod 000` → poll `/minio/health/cluster` → `chmod 755` → poll) — measured:
+Timed cycle measured with this script (`/tmp/timing.py`), which drops below write quorum (`chmod 000` on two drives), polls `/minio/health/cluster` until it flips to `503`, then restores (`chmod 755`) and polls until it flips back to `200`:
+
+```python
+#!/usr/bin/env python3
+import os, time, urllib.request, urllib.error
+URL = "http://127.0.0.1:9000/minio/health/cluster"
+D2, D3 = "/tmp/mtest2/data2", "/tmp/mtest2/data3"
+
+def code():
+    try:    return urllib.request.urlopen(URL, timeout=2).getcode()
+    except urllib.error.HTTPError as e: return e.code
+    except Exception: return 0
+
+os.chmod(D2, 0o755); os.chmod(D3, 0o755)           # ensure healthy
+while code() != 200: time.sleep(0.02)
+t0 = time.time()                                   # DETECTION: drop below quorum
+os.chmod(D2, 0); os.chmod(D3, 0)
+while code() != 503: time.sleep(0.005)
+det = time.time() - t0
+t1 = time.time()                                   # RECOVERY: restore
+os.chmod(D2, 0o755); os.chmod(D3, 0o755)
+while code() != 200: time.sleep(0.005)
+rec = time.time() - t1
+print("DETECTION: /minio/health/cluster flipped 200 -> 503 after %.2fs" % det)
+print("RECOVERY:  /minio/health/cluster flipped 503 -> 200 after %.2fs" % rec)
+```
+
+Running `python3 timing.py` (timings vary slightly run-to-run; detection tracks the 1-second DiskInfo cache TTL, recovery is near-instant) — a representative cycle measured:
 
 ```
 DETECTION: /minio/health/cluster flipped 200 -> 503 after 1.04s
@@ -266,7 +384,17 @@ Autonomous polling is visible in the log without any client action: the reconnec
 
 **Observed evidence.**
 
-Shard map immediately after recovery (before any access):
+Shard map immediately after recovery (before any access) — produced by this shell loop (a shard exists on a drive iff that drive holds an `xl.meta` for the object) plus an `ls` on the recovered drive:
+
+```bash
+for d in data1 data2 data3 data4; do
+  [ -e "/tmp/mtest2/$d/testbucket/obj-1down.txt/xl.meta" ] && s=YES || s=no
+  printf "%s=%s  " "$d" "$s"
+done; echo
+ls /tmp/mtest2/data2/testbucket/obj-1down.txt/
+```
+
+Output:
 
 ```
 obj-1down.txt:  data1=YES  data2=no  data3=YES  data4=YES
@@ -280,11 +408,12 @@ After a `GET` (`python3 s3put.py get obj-1down.txt` → `status=200 bytes=33`), 
 obj-1down.txt:  data1=YES  data2=YES  data3=YES  data4=YES
 ```
 
-Heal integrity: the healed `data2` `xl.meta` is `468` bytes, equal to the known-good `data1` `xl.meta` (`468` bytes). The per-drive `md5` legitimately differs — `d0de9ab8...` vs `c0b7e1b0...` — which is **expected**, because each drive's `xl.meta` stores that drive's own erasure shard; equal size plus a correct `bytes=33` read confirm a valid reconstruction.
+Heal integrity — measured per drive with `stat -c %s /tmp/mtest2/<d>/testbucket/obj-1down.txt/xl.meta` and `md5sum` on the same file: the healed `data2` `xl.meta` is `468` bytes, equal to the known-good `data1` `xl.meta` (`468` bytes). The per-drive `md5` legitimately differs — `data1=2756ef70...` vs `data2=1cc65bca...` — which is **expected**, because each drive's `xl.meta` stores that drive's own erasure shard; equal size plus a correct `bytes=33` read confirm a valid reconstruction.
 
 **Code (the repair mechanisms).**
 
-- Degraded writes are queued for repair: `cmd/erasure-object.go:2112` `func (er erasureObjects) addPartial(bucket, object, versionID string)` → `globalMRFState.addPartialOp(PartialOperation{...})` (`cmd/erasure-object.go:2113`; also enqueued directly from the write paths at `cmd/erasure-object.go:400` and `cmd/erasure-object.go:805`).
+- Degraded writes are queued for repair **from the upload path itself**: while finishing a `PutObject`, `cmd/erasure-object.go:1566-1576` loops over the target disks and, if any disk "was initially or becomes offline during this upload", calls `er.addPartial(bucket, object, fi.VersionID)` at `cmd/erasure-object.go:1574`. That helper is `cmd/erasure-object.go:2112` `func (er erasureObjects) addPartial(bucket, object, versionID string)` → `globalMRFState.addPartialOp(PartialOperation{...})` (`cmd/erasure-object.go:2113`). This is the enqueue site for the object we wrote while `data2` was down.
+- Distinct from the above, MinIO also enqueues heals from the **read** path when a `GET`/decode discovers a missing or corrupt shard: `cmd/erasure-object.go:400` (in `getObjectWithFileInfo`, `cmd/erasure-object.go:307`) calls `globalMRFState.addPartialOp(...)` after `erasure.Decode` if data blocks were missing, and `cmd/erasure-object.go:805` (in `getObjectFileInfo`, `cmd/erasure-object.go:705`) enqueues when reconstructable metadata is missing. These are read-triggered healing paths — **not** the degraded-write enqueue — and are exactly what healed the `data2` shard on the `GET` observed above.
 - MRF (Most-Recent-Failures) queue: `cmd/mrf.go:78` `func (m *mrfState) addPartialOp(op PartialOperation)`; `cmd/mrf.go:220` `func (m *mrfState) healRoutine(z *erasureServerPools)`, which calls `healObject(...)` (`cmd/mrf.go:272` and `cmd/mrf.go:276`). Note: the `healObject` invoked by MRF is the free function `cmd/global-heal.go:591` `func healObject(bucket, object, versionID string, scan madmin.HealScanMode) error`, distinct from the `erasureObjects` method `cmd/erasure-healing.go:258` `func (er *erasureObjects) healObject(...)` (documented at `cmd/erasure-healing.go:257`, "Heals an object by re-writing corrupt/missing erasure blocks."); the exported entry point is `cmd/erasure-healing.go:1039` `func (er erasureObjects) HealObject(...)`, and the per-disk decision is `cmd/erasure-healing.go:156` `func shouldHealObjectOnDisk(...)`.
 - A returned or replaced drive is also healed by the new-disk poller `cmd/background-newdisks-heal-ops.go:563` `monitorLocalDisksAndHeal` → `healFreshDisk` (`cmd/background-newdisks-heal-ops.go:419`).
 
@@ -294,7 +423,7 @@ Heal integrity: the healed `data2` `xl.meta` is `468` bytes, equal to the known-
 
 **Answer.** The per-object quorum decision lives in `objectQuorumFromMeta()` at **`cmd/erasure-metadata.go:531`**. For the four-drive `EC:2` set it computes **read quorum = 2** and **write quorum = 3**; the "enough vs stop" rule is: writes need ≥ 3 online drives, reads need ≥ 2.
 
-**Observed evidence.** The computed write-quorum threshold is directly observable at runtime — no source reading required to confirm the number. The healthy-state header (captured in [Q1](#q1--how-does-minio-decide-it-is-healthy-and-what-does-it-assume-about-the-required-number-of-disks)) exposes it, and the below-threshold server log (captured in [The quorum math](#the-quorum-math-consolidated)) shows the same value being enforced:
+**Observed evidence.** The computed write-quorum threshold is directly observable at runtime — no source reading required to confirm the number. The two lines below are re-quoted from evidence captured elsewhere in this document: the header was produced by `curl -s -o /dev/null -D - http://127.0.0.1:9000/minio/health/cluster` (shown in full in [Q1](#q1--how-does-minio-decide-it-is-healthy-and-what-does-it-assume-about-the-required-number-of-disks)), and the below-threshold server log was extracted with `grep "Write quorum could not be established" /tmp/minio.log` (shown in [The quorum math](#the-quorum-math-consolidated)). Together they show the same value being enforced:
 
 ```
 X-Minio-Write-Quorum: 3
@@ -317,7 +446,7 @@ return dataBlocks, writeQuorum, nil               // L564  -> (2, 3)
 ```
 
 - `parityBlocks` originates from the default parity table `internal/config/storageclass/storage-class.go:355` `DefaultParityBlocks` (`case 4, 5: return 2`).
-- The same "+1 when parity == data" rule is duplicated in the multipart path at `cmd/erasure-object.go:1116-1118` (`writeQuorum := dataDrives; if dataDrives == parityDrives { writeQuorum++ }`) and in the cluster-health quorum computation at `cmd/erasure-server-pool.go:2722-2727`.
+- The same "+1 when parity == data" rule is duplicated in the **multipart upload** path at `cmd/erasure-multipart.go:443-445` (`writeQuorum := dataDrives; if dataDrives == parityDrives { writeQuorum++ }`, inside `func (er erasureObjects) newMultipartUpload(...)` at `cmd/erasure-multipart.go:376`); in the **metacache-object** write path at `cmd/erasure-object.go:1116-1118` (inside `putMetacacheObject`, `cmd/erasure-object.go:1098` — an internal listing-cache object writer, not the multipart path); and in the **cluster-health** quorum computation at `cmd/erasure-server-pool.go:2722-2727`.
 
 **Rationale.** Read quorum equals `dataBlocks` because you need at least the data-block count of shards to reconstruct the object. Write quorum is normally also `dataBlocks`, but when parity **equals** data (the `EC:2`-on-four-drives case, 2 == 2) MinIO bumps it by one (`writeQuorum++`) so a write must land on a strict majority (3 of 4). This prevents a split-brain where two half-sets each believe they hold the object. That single `if dataBlocks == parityBlocks { writeQuorum++ }` is the exact place the "enough disks to proceed vs. stop" threshold is set.
 
@@ -325,7 +454,7 @@ return dataBlocks, writeQuorum, nil               // L564  -> (2, 3)
 
 **Answer.** Every claim above is anchored to observed `/minio/health/*` responses and real S3 `PUT`/`GET` attempts; the consolidated picture is the [Evidence matrix](#evidence-matrix) below, which reproduces the captured `curl` and S3 outcomes quoted in Q1–Q6.
 
-**Observed evidence.** Rather than re-quote, this answer references the already-captured runtime output: the healthy-state `curl` headers with `X-Minio-Write-Quorum: 3` ([Q1](#q1--how-does-minio-decide-it-is-healthy-and-what-does-it-assume-about-the-required-number-of-disks)); the one-down `PUT ... status=200` ([Q2](#q2--when-one-directory-becomes-inaccessible-during-operation-does-minio-adapt-and-keep-going-or-refuse-to-write)); and the decisive two-down side-by-side — the write attempt returns `503 SlowDownWrite` while the health probes disagree by concern (captured in [Q3](#q3--contrast-still-above-threshold-one-disk-lost-vs-below-threshold-a-second-disk-lost)):
+**Observed evidence.** Rather than re-quote in full, this answer references the already-captured runtime output and its producing commands: the healthy-state `curl` headers with `X-Minio-Write-Quorum: 3`, produced by `curl -s -o /dev/null -D - http://127.0.0.1:9000/minio/health/cluster` ([Q1](#q1--how-does-minio-decide-it-is-healthy-and-what-does-it-assume-about-the-required-number-of-disks)); the one-down `PUT ... status=200`, produced by `python3 s3put.py all obj-1down.txt` ([Q2](#q2--when-one-directory-becomes-inaccessible-during-operation-does-minio-adapt-and-keep-going-or-refuse-to-write)); and the decisive two-down side-by-side — the write attempt returns `503 SlowDownWrite` (produced by `python3 s3put.py put obj-2down.txt`) while the health probes disagree by concern. The three probe lines below were produced by `curl -s -o /dev/null -D - http://127.0.0.1:9000/minio/health/cluster` (and `/cluster/read`, `/live`), shown in full in [Q3](#q3--contrast-still-above-threshold-one-disk-lost-vs-below-threshold-a-second-disk-lost):
 
 ```
 HTTP/1.1 503 Service Unavailable      (/minio/health/cluster; header still X-Minio-Write-Quorum: 3)
@@ -357,7 +486,7 @@ Tied directly to code:
   - 3 online → still ≥ 3 → writes OK (**adapt**).
   - 2 online → < 3 → writes rejected with `503 SlowDownWrite`, but reads OK (≥ 2).
   - The header `X-Minio-Write-Quorum: 3` exposes the threshold to clients.
-- Cluster `Health()` (`cmd/erasure-server-pool.go:2679`) applies the same per-pool quorums (`cmd/erasure-server-pool.go:2722-2727`, tested at `cmd/erasure-server-pool.go:2783`) and, when write quorum is unmet, logs (captured verbatim, with the `maintenance="false"` tag) from `cmd/erasure-server-pool.go:2794`:
+- Cluster `Health()` (`cmd/erasure-server-pool.go:2679`) applies the same per-pool quorums (`cmd/erasure-server-pool.go:2722-2727`, tested at `cmd/erasure-server-pool.go:2783`) and, when write quorum is unmet, logs (with the `maintenance="false"` tag) from `cmd/erasure-server-pool.go:2794`. The line below was extracted verbatim from the server log with `grep "Write quorum could not be established" /tmp/minio.log`:
 
 ```
 Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2
@@ -391,7 +520,7 @@ All eight sub-questions are answered explicitly; none is omitted.
 - **Single-node modeling.** The user's "distributed mode with four directories" is realized as a single-node, four-drive erasure set — the faithful local equivalent for observing per-set quorum behavior, since quorum is a per-erasure-set property. Standing up a multi-host cluster is unnecessary to answer these questions and is out of scope.
 - **Honest limits (what differs from a naive expectation / could not be verified).**
   - The recovery time observed for a permission flip is **near-instant (~0.01 s)**, *not* the ~10 s one might expect from the new-disk poller. This is because a `chmod` failure does not tear down the local `xlStorage` object; the 10 s (`monitorLocalDisksAndHeal`) and 15 s (`monitorAndConnectEndpoints`) pollers govern fully-dropped or replaced drives, not the permission-restore fast path.
-  - The `md5` of a healed `xl.meta` legitimately **differs** per drive (`d0de9ab8...` vs `c0b7e1b0...`) because each drive stores its own erasure shard; size equality (`468` bytes) plus a successful `bytes=33` read confirm the heal rather than an md5 match.
+  - The `md5` of a healed `xl.meta` legitimately **differs** per drive (`data1=2756ef70...` vs `data2=1cc65bca...`) because each drive stores its own erasure shard; size equality (`468` bytes) plus a successful `bytes=33` read confirm the heal rather than an md5 match.
   - The maintenance-mode `412` path (`cmd/healthcheck-handler.go:83`) exists but was **not** exercised by the permission scenario, which never sets `maintenance=true`.
 - **Read-only scope.** This document is the **only** repository change. MinIO source, tests, docs, configuration, and build files were consulted read-only as reference to ground the citations and were left byte-for-byte unchanged. All temporary build/run artifacts (the Go toolchain, the built binary, the observation scripts, the `/tmp` data directories, the captured logs, the module caches, and the test OS user) live outside the repository tree and were removed afterward; `git status` showed the repository unchanged apart from this document.
 - **Versions.** Built and run with **Go 1.23.2** (the project pins `go 1.23` in `go.mod`); the server banner reports version `DEVELOPMENT.GOGET (go1.23.2 linux/amd64)`.
