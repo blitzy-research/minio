@@ -94,18 +94,21 @@ mandates SSE.
 
 ### The runtime execution sequence (in order, grounded)
 
-**Step 1 — the request enters through the outermost middleware, the tracer, so the entire request
-lifecycle is traced.** `httpTracerMiddleware` is the first entry in the generic middleware list, and
-the source comment states it "needs to be the first middleware to catch all requests." It is
-registered immediately **before** the auth middleware (`setAuthMiddleware`):
+**Step 1 — the request is traced early, *before* auth.** `httpTracerMiddleware` is registered
+**immediately after** `addCustomHeadersMiddleware` (the middleware that sets the `x-amz-request-id`
+header) and **before** the auth middleware (`setAuthMiddleware`). It is deliberately **not** the
+very first entry: the source comment explains the tracer "needs to be the first middleware to catch
+all requests returned early by any other middleware (**but after the middleware that sets the amz
+request id**)," which is exactly why it sits second — right after the request-id middleware:
 
 ```go
-// cmd/routers.go:53-65 (excerpt)
+// cmd/routers.go:54-66 (excerpt)
 var globalMiddlewares = []mux.MiddlewareFunc{
 	// set x-amz-request-id header and others
-	addCustomHeadersMiddleware,
+	addCustomHeadersMiddleware,    // cmd/routers.go:56
 	// The generic tracer needs to be the first middleware to catch all requests
-	// ...
+	// returned early by any other middleware (but after the middleware that
+	// sets the amz request id).
 	httpTracerMiddleware,          // cmd/routers.go:60
 	// Auth middleware verifies incoming authorization headers ...
 	setAuthMiddleware,             // cmd/routers.go:66
@@ -113,8 +116,9 @@ var globalMiddlewares = []mux.MiddlewareFunc{
 }
 ```
 
-- Claim: the tracer is registered first, before auth → [`cmd/routers.go:60`] (`httpTracerMiddleware,`)
-  precedes [`cmd/routers.go:66`] (`setAuthMiddleware,`).
+- Claim: the tracer is registered **after** `addCustomHeadersMiddleware` and **before** auth →
+  [`cmd/routers.go:56`] (`addCustomHeadersMiddleware,`) precedes [`cmd/routers.go:60`]
+  (`httpTracerMiddleware,`), which in turn precedes [`cmd/routers.go:66`] (`setAuthMiddleware,`).
 - Claim: trace is emitted by the tracer middleware → `func httpTracerMiddleware(h http.Handler) http.Handler`
   at [`cmd/http-tracer.go:69`], publishing via `globalTrace.Publish(t)` at [`cmd/http-tracer.go:172`],
   gated on an attached subscriber at [`cmd/http-tracer.go:92`].
@@ -280,7 +284,7 @@ enforced independently and later, which is what "takes precedence" means here.
 | Bucket-level encryption requirement | `mc encrypt set sse-s3`; `Apply` sets `AES256` at [`internal/bucket/encryption/bucket-sse-config.go:148`] |
 | User's broad write permission (`s3:PutObject` / `readwrite`) | `mc admin policy attach local readwrite --user writer`; gate at [`cmd/object-handlers.go:1836`] |
 | Unencrypted upload | `REQUEST SSE headers actually sent by client: NONE` + `HTTP status: 200` |
-| Runtime execution sequence | tracer [`cmd/routers.go:60`] → auth gate [`cmd/object-handlers.go:1836`] → SSE apply [`cmd/object-handlers.go:1895`] → header inject [`internal/bucket/encryption/bucket-sse-config.go:148`] |
+| Runtime execution sequence | tracer (registered after `addCustomHeadersMiddleware` [`cmd/routers.go:56`], before auth) [`cmd/routers.go:60`] → auth gate [`cmd/object-handlers.go:1836`] → SSE apply [`cmd/object-handlers.go:1895`] → header inject [`internal/bucket/encryption/bucket-sse-config.go:148`] |
 | Server trace logs | `mc admin trace -v --call s3`; emission at [`cmd/http-tracer.go:69`], publish [`cmd/http-tracer.go:172`], subscriber gate [`cmd/http-tracer.go:92`] |
 | Injected header value | `X-Amz-Server-Side-Encryption: AES256` → [`internal/http/headers.go:142`],[`internal/http/headers.go:152`] |
 | Supporting: bucket-encryption REST handlers | `PutBucketEncryptionHandler` [`cmd/bucket-encryption-handlers.go:43`]; `GetBucketEncryptionHandler` [`cmd/bucket-encryption-handlers.go:129`] |
@@ -745,65 +749,109 @@ sessionPolicyArgs.IsOwner = false   // :2417
 - `func (sts *stsAPIHandlers) AssumeRole(...)` → [`cmd/sts-handlers.go:256`], which calls
   `claims.populateSessionPolicy(r.Form)` at [`cmd/sts-handlers.go:296`].
 
-**The in-repo test that proves it.** `TestSTSWithDenyDeleteVersion`
-([`cmd/sts-handlers_test.go:180`]) creates a parent policy that **Allows** a set of object actions
-(`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:GetObjectVersion`, …) plus an explicit
-**`Deny`** on `s3:DeleteObjectVersion`, assumes a role, and asserts the deny is enforced under the
-assumed credentials (`c.mustNotDelete(ctx, minioClient, bucket, versions[0])`). Its runner is
-`TestIAMInternalIDPSTSServerSuite` ([`cmd/sts-handlers_test.go:52`]), which invokes
-`suite.TestSTSWithDenyDeleteVersion(c)` at [`cmd/sts-handlers_test.go:45`].
+**Two distinct mechanisms, proven separately.** STS credentials (i) inherit the **parent** policy
+and (ii) can be further constrained by an **inline session policy**. These are different mechanisms;
+this document proves each with its own evidence and does **not** conflate them.
+
+**(i) Permanent in-repo test — STS credentials honor the *parent* policy (it uses no inline session
+policy).** `TestSTSWithDenyDeleteVersion` ([`cmd/sts-handlers_test.go:180`]) builds a **parent** IAM
+policy that **Allows** a set of object actions (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`,
+`s3:GetObjectVersion`, …) at [`cmd/sts-handlers_test.go:197`] plus an explicit **`Deny`** on
+`s3:DeleteObjectVersion` ([`cmd/sts-handlers_test.go:214`], action at
+[`cmd/sts-handlers_test.go:216`]), assumes a role, and asserts the deny is enforced under the assumed
+credentials (`c.mustNotDelete(...)` at [`cmd/sts-handlers_test.go:275`]). Its `AssumeRole` call passes
+**only** `AccessKey`, `SecretKey`, and `Location` — the optional inline-policy field is **not** set
+(`cr.STSAssumeRoleOptions{ AccessKey, SecretKey, Location }` at
+[`cmd/sts-handlers_test.go:253`]–[`cmd/sts-handlers_test.go:257`]). It therefore proves STS
+credentials **inherit and honor the parent policy's `Deny`**; by itself it does **not** demonstrate
+inline session-policy enforcement. Its runner is `TestIAMInternalIDPSTSServerSuite`
+([`cmd/sts-handlers_test.go:52`]), which invokes `suite.TestSTSWithDenyDeleteVersion(c)` at
+[`cmd/sts-handlers_test.go:45`].
+
+**(ii) Inline session-policy enforcement — an assume-role call that actually sets a session policy.**
+To exercise the **intersection** at [`cmd/iam.go:2312`], a role must be assumed **with** an inline
+session policy. On the client that is the optional `Policy` field of `STSAssumeRoleOptions`; on the
+server it arrives as the STS form value named `"Policy"` (`stsPolicy = "Policy"`
+[`cmd/sts-handlers.go:50`]) and is parsed by `populateSessionPolicy` via `form.Get(stsPolicy)`
+([`cmd/sts-handlers.go:99`]), invoked from `AssumeRole` at [`cmd/sts-handlers.go:296`].
+`TestSTSWithDenyDeleteVersion` does **not** set this field, so inline session-policy enforcement is
+proven separately by the probe in "Verbatim evidence (b)" below, which does set
+`STSAssumeRoleOptions.Policy`.
 
 ### Reproduction
 
-The behavior was exercised through MinIO's in-process harness via a **focused wrapper** — a
-temporary probe test (since **removed**, so the working tree is left clean) that reused the in-repo
+The behavior was exercised through MinIO's in-process harness via two **focused probe tests** in a
+temporary file (since **removed**, so the working tree is left clean). Both reuse the in-repo
 `TestSuiteIAM` (`newTestSuiteIAM`, `TestSuiteCommon{serverType:"ErasureSD", signer:signerV4}`):
 
+- **(a)** `TestBlitzyProbeQ4STSDenyDeleteVersion` boots the suite and calls the **real in-repo
+  method** `suite.TestSTSWithDenyDeleteVersion(c)` — proving STS credentials honor the **parent**
+  policy's `Deny`.
+- **(b)** `TestBlitzyProbeQ4SessionPolicyIntersection` boots the suite, attaches a **parent** policy
+  that Allows `s3:PutObject`, `s3:GetObject` **and** `s3:DeleteObject`, then assumes a role **with an
+  inline session policy** (`STSAssumeRoleOptions.Policy`) that Allows **only** `s3:PutObject` and
+  `s3:GetObject` (it **omits** `s3:DeleteObject`) — proving the **intersection**.
+
 ```bash
-go test ./cmd/ -run "TestBlitzyProbe" -v -count=1 -vet=off
+CI=true go test -tags kqueue,dev ./cmd/ -run 'TestBlitzyProbeQ4' -v -count=1
 ```
 
 ### Verbatim evidence
 
-**(a) The real suite method passing** (the probe invoked `TestSTSWithDenyDeleteVersion` on the
-harness):
+**(a) STS credentials honor the *parent* policy** — the probe boots the suite and runs the real
+in-repo `TestSTSWithDenyDeleteVersion` (parent policy only, **no** inline session policy):
 
 ```text
 === RUN   TestBlitzyProbeQ4STSDenyDeleteVersion
---- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.47s)
+--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.54s)
 ```
 
-- Claim: the explicit-`Deny` session/parent policy is enforced under assumed STS credentials →
-  `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.47s)`.
+- Claim: STS temporary credentials inherit and enforce the **parent** policy's explicit `Deny` on
+  `s3:DeleteObjectVersion` → `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.54s)`. (This is a
+  **parent-policy** proof; it does **not** use an inline session policy.)
 
-**(b) Explicit intersection proof** — parent policy Allows Put/Get/Delete; the inline **session**
-policy Allows only Put/Get:
+**(b) Inline session-policy enforcement (the intersection)** — the probe assumes a role **with** an
+inline session policy set via `STSAssumeRoleOptions.Policy`; the **parent** Allows Put/Get/Delete
+while the inline **session** policy Allows only Put/Get (it omits Delete):
 
 ```text
 === RUN   TestBlitzyProbeQ4SessionPolicyIntersection
-    zz_blitzy_probe_test.go:79: Q4b PUT allowed (parent AND session both permit s3:PutObject) -> OK
-    zz_blitzy_probe_test.go:82: Q4b DELETE (parent allows, session omits) -> err = Access Denied.
---- PASS: TestBlitzyProbeQ4SessionPolicyIntersection (0.63s)
+    blitzy_adhoc_test_q4_test.go:110: Q4b PUT allowed (parent AND session both permit s3:PutObject) -> OK
+    blitzy_adhoc_test_q4_test.go:117: Q4b DELETE (parent allows, session omits) -> err = Access Denied.
+    blitzy_adhoc_test_q4_test.go:119: Q4b DELETE error detail -> Code="AccessDenied" Message="Access Denied." StatusCode=403
+--- PASS: TestBlitzyProbeQ4SessionPolicyIntersection (0.31s)
 ```
 
-- Claim: an action permitted by **both** parent and session policy is allowed →
+(The file `blitzy_adhoc_test_q4_test.go` shown in the log prefixes is the temporary probe, which has
+since been **removed**; the lines above are its verbatim runtime output, not a permanent source
+reference.)
+
+- Claim: an action permitted by **both** the parent and the inline session policy is allowed →
   `Q4b PUT allowed (parent AND session both permit s3:PutObject) -> OK`.
-- Claim: an action the parent allows but the session policy **omits** is denied →
+- Claim: an action the parent allows but the inline session policy **omits** is denied — i.e. the
+  session policy is enforced as the intersection →
   `Q4b DELETE (parent allows, session omits) -> err = Access Denied.`
+- Claim: the exact denial literal is HTTP `403` with `Code="AccessDenied"` and
+  `Message="Access Denied."` →
+  `Q4b DELETE error detail -> Code="AccessDenied" Message="Access Denied." StatusCode=403`.
 
 **(c) Overall runner result:**
 
 ```text
-ok  	github.com/minio/minio/cmd	2.248s
+PASS
+ok  	github.com/minio/minio/cmd	1.130s
 ```
 
 with `TEST_EXIT=0`.
 
 ### Rationale / conclusion
 
-`PutObject` is permitted because **both** the parent and the session policy allow it; `DeleteObject`
-is denied (`Access Denied.`) because the session policy **omits** it even though the parent allows
-it — proving the session policy is enforced as the **intersection** at [`cmd/iam.go:2312`]. Because
+Evidence (a) and (b) prove two distinct things. **(a)** shows STS credentials **inherit** the parent
+policy: the parent's `Deny` on `s3:DeleteObjectVersion` is enforced under the assumed credentials.
+**(b)** shows the **inline session policy** is independently enforced: `PutObject` is permitted
+because **both** the parent and the session policy allow it, while `DeleteObject` is denied
+(`Access Denied.`, HTTP `403`) because the session policy **omits** it even though the parent allows
+it — proving the session policy is applied as the **intersection** at [`cmd/iam.go:2312`]. Because
 `isAllowedBySessionPolicy` forces `IsOwner=false` ([`cmd/iam.go:2417`]), even a root/owner-derived
 principal is restricted by an attached session policy.
 
@@ -811,14 +859,16 @@ principal is restricted by an attached session policy.
 
 | Named item | Evidence / citation |
 | --- | --- |
-| Temporary credentials (STS `AssumeRole`) | `AssumeRole` [`cmd/sts-handlers.go:256`]; probe assumes a role via `cr.STSAssumeRole` |
-| Session policy enforcement | `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.47s)` |
-| Intersection semantics | `Q4b DELETE (parent allows, session omits) -> err = Access Denied.`; [`cmd/iam.go:2312`] |
-| Runtime TEST output (PASS markers + assertion lines) | the `=== RUN` / `--- PASS` markers and `zz_blitzy_probe_test.go:79/82` lines above; `ok github.com/minio/minio/cmd 2.248s` |
+| Temporary credentials (STS `AssumeRole`) | `AssumeRole` [`cmd/sts-handlers.go:256`]; both probes assume a role via `cr.STSAssumeRole` |
+| Session policy **enforcement** (inline, intersection) | `Q4b DELETE (parent allows, session omits) -> err = Access Denied.` (`Code="AccessDenied"`, HTTP `403`) from `TestBlitzyProbeQ4SessionPolicyIntersection`, which sets `STSAssumeRoleOptions.Policy`; decision at [`cmd/iam.go:2312`] |
+| Intersection semantics (allow ∩ allow → allow) | `Q4b PUT allowed (parent AND session both permit s3:PutObject) -> OK` |
+| Parent-policy inheritance by STS creds (distinct from the session policy) | `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.54s)` — runs `TestSTSWithDenyDeleteVersion`, which uses a **parent** policy only |
+| Inline session-policy plumbing | form value `stsPolicy = "Policy"` [`cmd/sts-handlers.go:50`], read by `populateSessionPolicy` via `form.Get(stsPolicy)` [`cmd/sts-handlers.go:99`], invoked from `AssumeRole` [`cmd/sts-handlers.go:296`] |
+| Runtime TEST output (PASS markers + assertion lines) | the `=== RUN` / `--- PASS` markers and `Q4b …` log lines above; `ok github.com/minio/minio/cmd 1.130s`, `TEST_EXIT=0` |
 | `IsAllowedSTS` | [`cmd/iam.go:2242`] |
 | `IsOwner=false` behavior | [`cmd/iam.go:2417`] |
 | `maxSTSSessionPolicySize = 2048` | [`cmd/sts-handlers.go:89`] |
-| `TestSTSWithDenyDeleteVersion` / `TestIAMInternalIDPSTSServerSuite` | [`cmd/sts-handlers_test.go:180`] / [`cmd/sts-handlers_test.go:52`] (invoked at [`cmd/sts-handlers_test.go:45`]) |
+| `TestSTSWithDenyDeleteVersion` (parent-policy proof) / `TestIAMInternalIDPSTSServerSuite` | [`cmd/sts-handlers_test.go:180`] / [`cmd/sts-handlers_test.go:52`] (invoked at [`cmd/sts-handlers_test.go:45`]) |
 
 ---
 
@@ -1026,7 +1076,7 @@ Self-promotion is blocked at admin authorization; there is **no special-case byp
 ---
 
 
-## Final Coverage Pass
+## Coverage Checklist / Final Coverage Pass
 
 Re-reading each question and confirming every named item is addressed, with the exact evidence
 line(s) and `file:line` citation(s) that answer it.
@@ -1038,7 +1088,8 @@ line(s) and `file:line` citation(s) that answer it.
   [`cmd/object-handlers.go:1836`], defined [`cmd/auth-handler.go:749`].
 - Unencrypted upload still encrypted → `REQUEST SSE headers actually sent by client: NONE`,
   `HTTP status: 200`, `RESPONSE x-amz-server-side-encryption: AES256`.
-- Runtime execution sequence in the trace → tracer first [`cmd/routers.go:60`] → auth gate
+- Runtime execution sequence in the trace → tracer (after `addCustomHeadersMiddleware`
+  [`cmd/routers.go:56`], before auth) [`cmd/routers.go:60`] → auth gate
   [`cmd/object-handlers.go:1836`] → SSE apply [`cmd/object-handlers.go:1895`]; trace emission
   [`cmd/http-tracer.go:69`],[`cmd/http-tracer.go:172`], subscriber gate [`cmd/http-tracer.go:92`].
 - Injected header literal `X-Amz-Server-Side-Encryption: AES256` →
@@ -1068,13 +1119,20 @@ line(s) and `file:line` citation(s) that answer it.
 
 **Q4 — STS session policy enforcement (test output):**
 - Temporary credentials via `AssumeRole` [`cmd/sts-handlers.go:256`].
-- Session policy enforced (intersection) → `Q4b DELETE (parent allows, session omits) -> err =
-  Access Denied.`; decision at [`cmd/iam.go:2312`].
-- Test output → `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.47s)`,
-  `--- PASS: TestBlitzyProbeQ4SessionPolicyIntersection (0.63s)`,
-  `ok  github.com/minio/minio/cmd  2.248s`.
+- Inline **session policy** enforced as the intersection → `Q4b DELETE (parent allows, session
+  omits) -> err = Access Denied.` (`Code="AccessDenied"`, HTTP `403`) from
+  `TestBlitzyProbeQ4SessionPolicyIntersection`, which sets `STSAssumeRoleOptions.Policy`; decision at
+  [`cmd/iam.go:2312`].
+- Parent policy honored by STS credentials (a **distinct** proof) →
+  `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.54s)` — runs `TestSTSWithDenyDeleteVersion`,
+  which uses a parent policy only, **no** inline session policy.
+- Test output → `--- PASS: TestBlitzyProbeQ4STSDenyDeleteVersion (0.54s)`,
+  `--- PASS: TestBlitzyProbeQ4SessionPolicyIntersection (0.31s)`,
+  `ok  github.com/minio/minio/cmd  1.130s`, `TEST_EXIT=0`.
 - `IsAllowedSTS` [`cmd/iam.go:2242`]; `IsOwner=false` [`cmd/iam.go:2417`];
-  `maxSTSSessionPolicySize = 2048` [`cmd/sts-handlers.go:89`]; `TestSTSWithDenyDeleteVersion`
+  `maxSTSSessionPolicySize = 2048` [`cmd/sts-handlers.go:89`]; inline-policy parse
+  `populateSessionPolicy` via `form.Get(stsPolicy)` [`cmd/sts-handlers.go:99`],
+  [`cmd/sts-handlers.go:296`]; `TestSTSWithDenyDeleteVersion` (parent-policy proof)
   [`cmd/sts-handlers_test.go:180`] / runner [`cmd/sts-handlers_test.go:52`].
 
 **Q5 — Basic user cannot self-promote via user mappings (test output + root cause):**
@@ -1099,6 +1157,9 @@ line(s) and `file:line` citation(s) that answer it.
   added to, or deleted.
 - **(c)** The **only** file added to the repository is this document
   (`blitzy/documentation/minio_c07e5b49d477.md`). Temporary observation artifacts — the server data
-  directories, the deliberately corrupted shard files, and the temporary Go probe test
-  (`zz_blitzy_probe_test.go`) — were removed, and **`go.mod` / `go.sum` are untouched**.
+  directories, the deliberately corrupted shard files, and the temporary Go probe tests
+  (`blitzy_adhoc_test_q4_test.go` for Q4 and `zz_blitzy_probe_test.go` for Q5, whose verbatim
+  runtime output is quoted above) — were removed, and **`go.mod` / `go.sum` are untouched**. The
+  probe file names appearing in the `=== RUN` / log-prefix lines above are these removed temporary
+  files, not permanent source references; a clean `git status` was verified after removal.
 
