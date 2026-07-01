@@ -44,14 +44,27 @@ MinIO deliberately distinguishes **absence** from **corruption**. Only `errFileN
 
 ### 1.4 The governing decision flow
 
-The pivot between "reconstruct" and "abandon" is the `cannotHeal` predicate (`cmd/erasure-healing.go:L428`):
+The reconstruct‑vs‑abandon decision has **two gates in sequence**. The *first* gate is read quorum on the metadata itself: `healObject` calls `objectQuorumFromMeta` at `cmd/erasure-healing.go:L307`, and if it returns an error (the metadata is below read quorum), the object is routed **straight** to `deleteIfDangling` at `cmd/erasure-healing.go:L309` — before any per‑drive analysis, `disksToHealCount`, or `cannotHeal` is reached (this is the path the full‑shard‑wipe case of Section 6 takes). *Only if* quorum resolves does the *second* gate apply — the `cannotHeal` predicate (`cmd/erasure-healing.go:L428`), which decides reconstruct vs abandon for the drives that still need healing:
 
 ```go
 // cmd/erasure-healing.go:L428
 cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks
 ```
 
-For a normal (non‑legacy `XLV1`, non‑`Deleted`) object on `EC:2`, `cannotHeal` becomes true only when **more than 2** of the 4 drives need healing — i.e. only 1 intact shard remains. The following flowchart mirrors the exercised code paths:
+For a normal (non‑legacy `XLV1`, non‑`Deleted`) object on `EC:2`, `cannotHeal` becomes true only when **more than 2** of the 4 drives need healing — i.e. only 1 intact shard remains.
+
+One nuance to keep in mind: `cannotHeal` is not the final word. Immediately after it is computed there is an **escape hatch** — if `cannotHeal` is true but a quorum ETag was resolved, `cannotHeal` is reset to `false` and reconstruction is attempted anyway (`cmd/erasure-healing.go:L429-L433`):
+
+```go
+// cmd/erasure-healing.go:L429-L433
+if cannotHeal && quorumETag != "" {
+    // This is an object that is supposed to be removed by the dangling code
+    // but we noticed that ETag is the same for all objects, let's give it a shot
+    cannotHeal = false
+}
+```
+
+In every case observed in this investigation the escape hatch did **not** change the outcome (for the partial‑WRITE object of Section 8.1 the object was still purged via the `cannotHeal` branch, evidenced by its `caller` tag pointing at `cmd/erasure-healing.go:L438`), but it is part of the governing decision and is noted here for completeness. The following flowchart mirrors the exercised code paths:
 
 ```mermaid
 flowchart TD
@@ -85,14 +98,14 @@ The runtime investigation was performed against a purpose‑built 4‑drive `EC:
 |--------|------------------|
 | Commit | `c07e5b49d477b0774f23db3b290745aef8c01bd2` (branch `minio_c07e5b49d477`) |
 | Build command | `CGO_ENABLED=0 go build -tags kqueue` |
-| Go toolchain | Go 1.23.4 (go.mod requires `go 1.23`, `go.mod:L3`) |
-| Server banner | `minio version DEVELOPMENT.GOGET (go1.23.4 linux/amd64)` |
+| Go toolchain | Go 1.23.12 (go.mod requires `go 1.23`, `go.mod:L3`) |
+| Server banner | `minio version DEVELOPMENT.GOGET (go1.23.12 linux/amd64)` |
 | Client | `mc version RELEASE.2025-08-13T08-35-41Z` |
 | Topology | 4‑drive standalone erasure set: `minio server .../data/{1,2,3,4}` with `MINIO_CI_CD=1` + root credentials |
 | Startup log | `INFO: Formatting 1st pool, 1 set(s), 4 drives per set.` |
 | On‑disk layout (small object) | only `xl.meta` per drive (data inlined) |
 | On‑disk layout (≥1 MiB object) | `xl.meta` + `<dataDirUUID>/part.1` per drive |
-| `xl-meta` decode (small object) | `EcM: 2`, `EcN: 2`, `Size: 31` (tool at `docs/debugging/xl-meta/main.go`) |
+| `xl-meta` decode (small object) | `EcM: 2`, `EcN: 2`, `Size: 35` (tool at `docs/debugging/xl-meta/main.go`) |
 | Audit capture | Audit webhook → local sink used to capture dangling‑purge audit events |
 
 The startup banner and the `xl-meta` decode confirm the `EC:2` shape used throughout — `EcM: 2` (data) and `EcN: 2` (parity):
@@ -102,13 +115,32 @@ INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
 ```
 
 ```text
-# docs/debugging/xl-meta decode of the small object
+# docs/debugging/xl-meta decode of the small object (35-byte objA.txt)
 EcM: 2
 EcN: 2
-Size: 31
+Size: 35
 ```
 
-`mc admin info` reports the same set as `EC:2`. All investigation artifacts (the built binary, the `mc` client, the scenario data directories, and every temporary observation script) resided under `/tmp` and were deleted when the investigation concluded.
+`mc admin info` reports the same set as `EC:2`, verbatim:
+
+```text
+$ mc admin info inv
+●  127.0.0.1:9000
+   Uptime: 10 seconds
+   Version: <development>
+   Network: 1/1 OK
+   Drives: 4/4 OK
+   Pool: 1
+
+┌──────┬──────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage         │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 1.1% (total: 48 TiB) │ 4                   │ 1            │
+└──────┴──────────────────────┴─────────────────────┴──────────────┘
+
+4 drives online, 0 drives offline, EC:2
+```
+
+The final line — `4 drives online, 0 drives offline, EC:2` — is the client‑side confirmation of the 2‑data/2‑parity geometry, matching `EcM: 2`/`EcN: 2` above. All investigation artifacts (the built binary, the `mc` client, the scenario data directories, and every temporary observation script) resided under `/tmp` and were deleted when the investigation concluded.
 
 
 ---
@@ -140,8 +172,8 @@ after  states: ['ok', 'ok', 'ok', 'ok']              (color green, online 4)
 Two damaged shards equal parity (`2 == ParityBlocks`), so `cannotHeal` is false and reconstruction proceeds. Integrity was confirmed by re‑download:
 
 ```text
-downloaded object sha256 == original: d23669027eaccb1129fa31c71c74629cfb9c74597905295e7f0ce396483105a9
-drive-1 part.1 first bytes now random: 71 73 51 ca ...
+downloaded object sha256 == original: 8c94c3b39fb86be1b2b4ce7efeef9821221e77a836704eab8bed4568b3603304
+drive-1 part.1 first bytes now random: 04 8e 7b f7 ...
 zero bytes in first 4096 of drive-1 part.1: 14  (was 4096 before heal)  => shard rebuilt
 ```
 
@@ -156,17 +188,30 @@ $ mc cat inv/testbucket/objC.txt
 mc: <ERROR> ... We encountered an internal error, please try again.: cause(file is corrupted).
 ```
 
-Healing did nothing — it neither rebuilt nor removed the object:
+Healing did nothing — it neither rebuilt nor removed the object. The verbatim `mc admin heal --json` object line (full `HealResultItem`, before/after `drives[]` arrays intact):
 
 ```json
-{"status":"success","detail":"file is corrupted","type":"object","name":"testbucket/objC.txt","before":{"drives":"4x ok"},"after":{"drives":"4x ok"}}
+{"status":"success","detail":"file is corrupted","type":"object","name":"testbucket/objC.txt","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio_run/data/1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/minio_run/data/1","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/2","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/3","state":"ok"},{"uuid":"","endpoint":"/tmp/minio_run/data/4","state":"ok"}]},"size":0}
+```
+
+```json
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":0,"duration":1}
+```
+
+**As‑seen nuance — the per‑drive `before`/`after` states are all `"ok"` even though `xl.meta` was garbage on 3 of 4 drives.** The heal does not flag the drives individually as `corrupt`/`missing`; instead the *object‑level* `"detail":"file is corrupted"` is the signal, and `objects_healed:0` confirms nothing was rebuilt. The decision indicator here is therefore `before == after` (no per‑drive state improvement) together with the corruption detail — reported exactly as observed rather than adjusted toward an intuitive "3 drives corrupt" rendering.
+
+Crucially, **no `DeleteDanglingObject` audit event was emitted** for this object. This is a runtime claim, so it is backed by the audit sink directly: during the `objC.txt` heal the sink recorded a `HealObject` event (whose own `error` field says `file is corrupted`) but **no** `DeleteDanglingObject` event:
+
+```json
+{"version":"1","deploymentid":"1d6e8ab7-8cec-4398-8d51-b89f6a9d360a","time":"2026-07-01T22:34:24.175742424Z","event":"HealObject","trigger":"HealObject","api":{"bucket":"testbucket","objects":[{"objectName":"objC.txt","versionId":"null"}],"rx":0,"tx":0},"tags":{"healObject":"name=objC.txt,pool=1,set=1"},"error":"file is corrupted"}
 ```
 
 ```text
-heal summary: objects_healed:0
+$ grep -c '"event":"DeleteDanglingObject".*objC' /tmp/blitzy_evidence/audit.log
+0
 ```
 
-Crucially, **no `DeleteDanglingObject` audit event was emitted** for this object. The rationale is the non‑actionable guard in `isObjectDangling` (`cmd/erasure-healing.go:L1008`):
+The `HealObject` event proves the heal actually ran and was audited; the absence of any companion `DeleteDanglingObject` event is the observed signal that MinIO chose *not* to remove the object. (For contrast, the only three `DeleteDanglingObject` events the sink captured during the whole investigation were for `objB.txt`, `objE3.bin`, and `objD.bin` — the genuinely‑purged objects of Sections 5, 6, and 8.1 — never `objC.txt`.) The rationale is the non‑actionable guard in `isObjectDangling` (`cmd/erasure-healing.go:L1008`):
 
 ```go
 // cmd/erasure-healing.go:L1008
@@ -249,7 +294,7 @@ MinIO does **not** always reconstruct. Across the three scenarios above, the sam
 }
 ```
 
-The transition of drive 2 from `"state": "missing"` (before) to `"state": "ok"` (after) **is** the decision indicator: it shows the subsystem chose to reconstruct that shard. A purge, by contrast, produces no such per‑drive recovery (the object is gone), and a leave‑degraded produces `before` == `after` with no state improvement (as in Scenario C, where both were `4x ok` and `objects_healed:0`).
+The transition of drive 2 from `"state": "missing"` (before) to `"state": "ok"` (after) **is** the decision indicator: it shows the subsystem chose to reconstruct that shard. A purge, by contrast, produces no such per‑drive recovery (the object is gone), and a leave‑degraded produces `before` == `after` with no state improvement (as in Scenario C, where both `before` and `after` reported all four drives `state:"ok"` and `objects_healed:0`).
 
 ### 4.1 Where the shape is defined
 
@@ -346,7 +391,7 @@ For the Scenario‑B purge (`objB.txt`, `xl.meta` deleted on drives 1–3), the 
     "ddisk-3": "<nil>",
     "merrs": "",
     "derrs": "map[]",
-    "sz": "42",
+    "sz": "40",
     "caller": ".../cmd/erasure-healing.go:309"
   }
 }
@@ -358,7 +403,7 @@ For the Scenario‑B purge (`objB.txt`, `xl.meta` deleted on drives 1–3), the 
 - **`ddisk-0/1/2 = "file version not found"`** — three drives reported the object's version as genuinely absent. These are the "not found" errors counted by `danglingMetaErrsCount` (`cmd/erasure-healing.go:L934`); three of them exceed `ParityBlocks = 2`, which is precisely the dangling condition.
 - **`ddisk-3 = "<nil>"`** — drive 4 still held a valid copy (no error), i.e. only 1 intact of 4.
 - **`merrs` / `derrs`** — the metadata‑error and data‑error summaries (`merrs = ""`, `derrs = "map[]"` here).
-- **`sz = "42"`** — the object size.
+- **`sz = "40"`** — the object size (the 40‑byte payload `objB payload for dangling purge scenario`).
 - **`caller = ".../cmd/erasure-healing.go:309"`** — the call site that triggered the purge. Here it is **`L309`**, the `deleteIfDangling` invocation reached when `objectQuorumFromMeta` returned an error (metadata was below read quorum), not the `cannotHeal` site at `L438`. This distinguishes the two purge entry points at runtime:
 
 ```go
@@ -373,7 +418,7 @@ m, err := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, dataErrs
 
 The `caller` tag is populated from `runtime.Caller(1)` at `cmd/erasure-object.go:L526` and formatted into `tags["caller"]` at `cmd/erasure-object.go:L528`, so the audit trail names the *exact source line* that decided the purge — an unusually precise "why".
 
-By contrast, in **Scenario C (leave‑degraded)** no `DeleteDanglingObject` event was emitted at all — the absence of the event is itself the signal that MinIO chose *not* to remove the object. And in **Scenario A (reconstruct)** the "why restore" is carried by the heal‑result transition (Section 4) and the optional healing trace metric `healingMetricObject` (`cmd/erasure-healing.go:L44`), hooked via `healTrace(healingMetricObject, ...)` at `cmd/erasure-healing.go:L272`.
+By contrast, in **Scenario C (leave‑degraded)** no `DeleteDanglingObject` event was emitted at all — the absence of the event is itself the signal that MinIO chose *not* to remove the object. This is evidenced directly from the same audit sink in Section 3(C): the `objC.txt` heal produced a `HealObject` event with `"error":"file is corrupted"` but **zero** `DeleteDanglingObject` events (`grep -c '...DeleteDanglingObject...objC' audit.log` → `0`). And in **Scenario A (reconstruct)** the "why restore" is carried by the heal‑result transition (Section 4) and the optional healing trace metric `healingMetricObject` (`cmd/erasure-healing.go:L44`), hooked via `healTrace(healingMetricObject, ...)` at `cmd/erasure-healing.go:L272`.
 
 
 ---
@@ -393,10 +438,33 @@ The verbatim per‑case markers:
 ```text
 N_wiped=1 intact=3 -> before ['missing','ok','ok','ok'] after ['ok','ok','ok','ok'] healed_ok=True | on-disk=present
 N_wiped=2 intact=2 -> before ['missing','missing','ok','ok'] after ['ok','ok','ok','ok'] healed_ok=True | on-disk=present
-N_wiped=3 intact=1 -> purged=True detail='Object not found: testbucket/objE3.txt' | on-disk=gone   (caller erasure-healing.go:309, d:p 2:2)
+N_wiped=3 intact=1 -> purged=True detail='Object not found: testbucket/objE3.bin' | on-disk=gone   (caller erasure-healing.go:309, d:p 2:2)
 ```
 
-**Reasoning.** Healing succeeds while `intact >= 2` (== `DataBlocks`) because Reed‑Solomon reconstruction needs at least `DataBlocks` shards of any kind (data or parity) to rebuild the object. At `intact = 1` (so `disksToHealCount = 3`), the `cannotHeal` predicate `disksToHealCount > ParityBlocks` (`3 > 2`) becomes true (`cmd/erasure-healing.go:L428`) and the object is abandoned/purged rather than reconstructed. This is corroborated by Scenario A3, where 2 intact shards (with the other 2 bit‑rot corrupt) were successfully healed, and by a control object (`objG`, 2‑of‑4 wiped) that reconstructed and round‑tripped its exact original content. **Minimum intact shards for success = 2 (== `DataBlocks`).**
+**Reasoning.** Healing succeeds while `intact >= 2` (== `DataBlocks`) because Reed‑Solomon reconstruction needs at least `DataBlocks` shards of any kind (data or parity) to rebuild the object. At `intact = 1`, the object is abandoned/purged rather than reconstructed — but the exact code path that decides this matters, and the captured `caller` tag pins it down.
+
+Because a **full‑shard wipe** (`xl.meta` + data‑dir) removes the metadata too, wiping 3 of 4 drives leaves only **1 valid `xl.meta`**, which is below the read quorum of 2. `healObject` therefore fails at the very first quorum check — `objectQuorumFromMeta` returns an error at `cmd/erasure-healing.go:L307` — and calls `deleteIfDangling` **immediately** at `cmd/erasure-healing.go:L309`, *before* `latestMeta`, `disksToHealCount`, or the `cannotHeal` predicate at `cmd/erasure-healing.go:L428` are ever reached. Inside, `isObjectDangling` returns dangling via the normal‑object **META gate** (`notFoundMetaErrs = 3 > ParityBlocks = 2`, `cmd/erasure-healing.go:L1025`) and the object is purged. This is exactly what the audit `caller` tag shows for the `N=3` case — **`caller erasure-healing.go:309`, not `L428`** (see the marker above and the verbatim event in Section 5):
+
+```text
+N_wiped=3 -> DeleteDanglingObject caller=.../cmd/erasure-healing.go:309  d:p=2:2  (metadata below read quorum -> L307/L309 path)
+```
+
+The `cannotHeal` predicate at `cmd/erasure-healing.go:L428` (and its `deleteIfDangling` call at `cmd/erasure-healing.go:L438`) governs a **different** situation — one where the metadata is still readable (quorum holds) but the *data* is missing beyond parity. That path is exercised separately by the partial‑WRITE object `objD.bin` in Section 8.1, whose purge carries `caller=.../cmd/erasure-healing.go:438`. In short: a **full‑shard wipe** (metadata gone) purges via the quorum‑error path at `L309`; a **parts‑only loss** (metadata intact) purges via the `cannotHeal` path at `L438`.
+
+The success side of the boundary is corroborated by Scenario A3 (2 intact shards, the other 2 bit‑rot corrupt, healed) and by a live‑server control object `objG` (3 MiB, 2‑of‑4 full shards wiped) that reconstructed and round‑tripped its exact original content:
+
+```text
+$ mc admin heal --json --scan deep inv/testbucket/objG.bin   # object line, states decoded
+before: ['missing', 'missing', 'ok', 'ok']  (color red,   online 2)
+after : ['ok', 'ok', 'ok', 'ok']            (color green, online 4)   size 3145728
+
+$ sha256sum objG.src ; mc cp inv/testbucket/objG.bin objG.dl ; sha256sum objG.dl
+objG original   sha256: 73f82abefeb62bf80847b336de820dc700bc7afc7839bfe584229970504559f3
+objG downloaded sha256: 73f82abefeb62bf80847b336de820dc700bc7afc7839bfe584229970504559f3
+match: YES
+```
+
+The 2‑of‑4 wipe (`intact = 2 == DataBlocks`) reconstructed to all‑`ok` and the downloaded bytes were sha256‑identical to the original, confirming that 2 intact shards suffice. **Minimum intact shards for success = 2 (== `DataBlocks`).**
 
 
 ---
@@ -474,12 +542,53 @@ A normal object is therefore dangling when **either** metadata is missing beyond
 
 ### 8.2 Partial DELETE (delete marker)
 
-In a versioned bucket, `mc rm` created a delete marker on top of a prior PUT:
+In a versioned bucket, `mc rm` creates a delete marker (a zero‑byte `Deleted` version) on top of the prior PUT. To build a *partially failed* delete, the delete marker was then removed from a subset of drives (by restoring each drive's pre‑`rm` `xl.meta`, so those drives never "saw" the delete), leaving the marker present on only some drives. Two cases were run and healed with `mc admin heal --json` — the marker at/above read quorum (present on 3 of 4 drives) and below read quorum (present on 1 of 4 drives).
+
+**Case 1 — delete marker present on 3/4 drives (at/above read quorum 2):**
 
 ```text
-delete marker versionId=05ce1afe-2e48-4bf3-896b-f8019a729239   (v2, DEL)
-prior PUT     versionId=ae6ff823-...                            (v1)
+delete marker versionId=f21da1bf-5417-4284-972f-b4e6d6baabee   (v2, DEL)
+prior PUT     versionId=fe5cf35a-b6d3-413b-9fb3-95a1124c1572   (v1)
+
+$ mc ls --versions inv/verbucket/objPabove.txt        # BEFORE heal (marker missing on drive1)
+[2026-07-01 23:01:31 UTC]     0B STANDARD f21da1bf-5417-4284-972f-b4e6d6baabee v2 DEL objPabove.txt
+[2026-07-01 23:01:31 UTC]    50B STANDARD fe5cf35a-b6d3-413b-9fb3-95a1124c1572 v1 PUT objPabove.txt
+on-disk xl.meta size: drive1=487 (v1-only)  drive2=592  drive3=592  drive4=592
+
+$ mc admin heal --json inv/verbucket/objPabove.txt    # summary line
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":0,"duration":1}
+DeleteDanglingObject events for objPabove.txt during heal = 0
+
+$ mc stat inv/verbucket/objPabove.txt                 # AFTER heal
+mc: <ERROR> Unable to stat `inv/verbucket/objPabove.txt`. Object does not exist.
 ```
+
+With the marker on 3 of 4 drives (≥ read quorum 2) the delete is **honored** — the object reads as gone — the heal reports `objects_healed:0`, and **no `DeleteDanglingObject` event fires**.
+
+**Case 2 — delete marker present on 1/4 drives (below read quorum 2):**
+
+```text
+delete marker versionId=36c72d13-d1a7-4c8f-8b61-7ad634287c3a   (v2, DEL, on drive4 only)
+prior PUT     versionId=63462eba-8f0c-4578-b08c-47556b95f4e5   (v1)
+
+$ mc ls --versions inv/verbucket/objPbelow.txt        # BEFORE heal (quorum view: marker not visible)
+[2026-07-01 23:01:33 UTC]    50B STANDARD 63462eba-8f0c-4578-b08c-47556b95f4e5 v1 PUT objPbelow.txt
+on-disk xl.meta size: drive1=487  drive2=487  drive3=487  drive4=592 (marker present only here)
+
+$ mc admin heal --json inv/verbucket/objPbelow.txt    # summary line
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":0,"duration":0}
+DeleteDanglingObject events for objPbelow.txt during heal = 0
+
+$ mc stat inv/verbucket/objPbelow.txt                 # AFTER heal (resolves to the prior PUT)
+Name      : objPbelow.txt
+Size      : 50 B
+VersionID : 63462eba-8f0c-4578-b08c-47556b95f4e5
+Type      : file
+```
+
+With the marker on only 1 of 4 drives (< read quorum 2) the delete is **not honored** — the object resolves back to the prior 50‑byte PUT (`v1`) — the heal again reports `objects_healed:0`, and again **no `DeleteDanglingObject` event fires**.
+
+**Observed contrast with the partial WRITE.** In *both* delete cases MinIO emitted **zero** `DeleteDanglingObject` events and healed nothing (`objects_healed:0`); the read outcome was decided purely by whether the delete‑marker metadata reached read quorum (honored at 3/4, ignored at 1/4). This is the opposite of the partial WRITE in Section 8.1, where the incomplete *normal* object was actively **purged** and **audited** (`DeleteDanglingObject`, `caller=...:438`, `derrs="map[0:[4 4 4 1]]"`). The reason for the divergence is in the source:
 
 A delete marker takes the `validMeta.Deleted` branch of `isObjectDangling`, which uses a **different** threshold and **ignores parts entirely**:
 
@@ -548,7 +657,23 @@ Reported honestly and **not** smoothed over: three healing tests **failed** when
     error: Storage resources are insufficient for the read operation bucket/object
 ```
 
-The failure message is the `InsufficientReadQuorum` wrapper (`cmd/object-api-errors.go:L236-237`), which `Unwrap()`s to `errErasureReadQuorum` (`cmd/object-api-errors.go:L241-243`). These failures are **environment‑specific** to the sandbox filesystem, not a contradiction of the reconstruction behavior: the live‑server control proved reconstruction works — object `objG` (2‑of‑4 shards wiped) reconstructed and round‑tripped its exact original content (Section 6), and Scenario A3 (2 corrupt parts, deep scan) rebuilt to a byte‑identical `sha256`. Where the sandbox unit tests and the live server disagree, **the live‑server reconstruction is treated as authoritative** for this document, and the unit‑test failures are recorded here exactly as observed.
+The failure message is the `InsufficientReadQuorum` wrapper (`cmd/object-api-errors.go:L236-237`), which `Unwrap()`s to `errErasureReadQuorum` (`cmd/object-api-errors.go:L241-243`). These failures are **environment‑specific** to the sandbox filesystem, not a contradiction of the reconstruction behavior: the live‑server control proved reconstruction works — object `objG` (2‑of‑4 shards wiped) reconstructed and round‑tripped its exact original content (Section 6), and Scenario A3 (2 corrupt parts, deep scan) rebuilt to a byte‑identical `sha256`. Where the sandbox unit tests and the live server disagree, **the live‑server reconstruction is treated as authoritative** for this document, and the unit‑test failures are recorded here exactly as observed. The two live‑server reconstruction controls that justify treating reconstruction as authoritative are pasted verbatim below (same runs as Section 6):
+
+```text
+$ mc admin heal --json --scan deep inv/testbucket/objG.bin   # 2-of-4 full shards wiped
+before: ['missing', 'missing', 'ok', 'ok']  (color red,   online 2)
+after : ['ok', 'ok', 'ok', 'ok']            (color green, online 4)   size 3145728
+objG original   sha256: 73f82abefeb62bf80847b336de820dc700bc7afc7839bfe584229970504559f3
+objG downloaded sha256: 73f82abefeb62bf80847b336de820dc700bc7afc7839bfe584229970504559f3
+match: YES
+
+# Scenario A3 (2 corrupt parts, deep scan) — same download-and-compare round-trip
+A3 original   sha256: 8c94c3b39fb86be1b2b4ce7efeef9821221e77a836704eab8bed4568b3603304
+A3 downloaded sha256: 8c94c3b39fb86be1b2b4ce7efeef9821221e77a836704eab8bed4568b3603304
+match: YES
+```
+
+Both controls lost exactly 2 of the 4 shards (`intact = 2 == DataBlocks`), reconstructed to all‑`ok`, and returned byte‑identical content on download — which is why the sandbox‑specific unit‑test failures above are read as an environment artifact rather than a reconstruction defect.
 
 ---
 
@@ -558,8 +683,8 @@ Every sub‑question of the prompt, answered by name, with its evidence location
 
 | Sub‑question | Answer (short) | Where in this document | Key evidence / citation |
 |--------------|----------------|------------------------|-------------------------|
-| **(1)** Ambiguous‑state resolution | Three‑way decision: reconstruct / leave‑degraded / purge | §1.3, §3 (A/C/B) | `cannotHeal` `L428`; `isObjectDangling` `L968` |
-| **(2)** Reconstruct vs abandon — always? | **Not always** — A reconstructs, C degrades, B purges | §3 summary table | `L428`, `L1008`, `L1025` |
+| **(1)** Ambiguous‑state resolution | Three‑way decision: reconstruct / leave‑degraded / purge | §1.3, §3 (A/C/B) | quorum‑error purge `L307`→`L309`; `cannotHeal` `L428`/`L438`; `isObjectDangling` `L968` |
+| **(2)** Reconstruct vs abandon — always? | **Not always** — A reconstructs, C degrades, B purges | §3 summary table | `L309`/`L428`/`L438`, `L1008`, `L1025` |
 | **(3)** Per‑case runtime evidence | Verbatim output for each outcome | §3 (A1/A3, C, B) | before/after states; `mc cat` errors; audit event |
 | **(4)** Decision‑revealing output | Per‑drive `before→after` `State` on `HealResultItem` | §4 | JSON `before/after` drives; states set at `L384-392`, `L651` |
 | &nbsp;&nbsp;→ literal `ok` | `DriveStateOk="ok"` | §4.2 | `heal-commands.go:L120`; set at `erasure-healing.go:L385/L651` |
@@ -570,9 +695,9 @@ Every sub‑question of the prompt, answered by name, with its evidence location
 | &nbsp;&nbsp;→ tag `d:p` | `DataBlocks:ParityBlocks` = `2:2` | §5 | audit tag |
 | &nbsp;&nbsp;→ tag `ddisk-N` | per‑disk error reason | §5 | `ddisk-0/1/2="file version not found"`, `ddisk-3="<nil>"` |
 | &nbsp;&nbsp;→ tags `merrs`/`derrs` | meta/data error summaries | §5, §8.1 | `derrs="map[0:[4 4 4 1]]"` (write case) |
-| &nbsp;&nbsp;→ tag `sz` | object size | §5 | `sz="42"` / `sz="2097152"` |
+| &nbsp;&nbsp;→ tag `sz` | object size | §5 | `sz="40"` / `sz="2097152"` |
 | &nbsp;&nbsp;→ tag `caller` | exact source line of the purge | §5 | `caller=".../erasure-healing.go:309"` |
-| **(a)** Min valid shards for success | **2** (== `DataBlocks`) | §6 | N_wiped table; `cannotHeal` `L428` |
+| **(a)** Min valid shards for success | **2** (== `DataBlocks`) | §6 | N_wiped table; full‑shard‑wipe `N=3` purges via quorum‑error path `L307`→`deleteIfDangling` `L309` (audit `caller=...:309`), META gate `L1025` |
 | **(b)** Exact unrecoverable error | `errErasureReadQuorum` = "Read failed. Insufficient number of drives online" → `SlowDownRead` HTTP 503 | §7 | `erasure-errors.go:L23`; `api-errors.go:L2190-2191`, `L869-872` |
 | **(c)** WRITE vs DELETE divergence | Differ: WRITE gates on `ParityBlocks` (meta `L1025` + parts `L1030`); DELETE gates on `(len(errs)+1)/2`, parts ignored | §8 | `erasure-healing.go:L1012-1016`, `L1025`, `L1030` |
 | &nbsp;&nbsp;→ example "some drives valid shards" | intact drives reported `ok` / `<nil>` | §3(A), §5 | `['...,'ok',...]`; `ddisk-3="<nil>"` |
