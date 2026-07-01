@@ -818,9 +818,9 @@ Every distinct sub-part of every question, and whether it is answered:
 | **Q3** | (c) heal / reconstruction | ✓ | `BitrotScan: errors.Is(err, errFileCorrupt)` (L407); inline `[HEALING heal.Object] mode=0`; deep `mode=2` heal → `[Yellow ->  Green]`, `Healed: 1/1 objects`; shard byte-restored (sha256 match) |
 | **Q3** | (d) supported algorithms | ✓ | `sha256`, `blake2b`, `highwayhash256`, `highwayhash256S` (L40-43) |
 | **Q4** | (a) session policy enforced on temporary credentials | ✓ | passing suite + live `403 AccessDenied` on `PutObject` |
-| **Q4** | (b) test output proving effective = parent ∩ session | ✓ | `--- PASS: … (3.51s)` + live demo (Put denied, Get/List allowed); `iam.go:2312` intersection |
+| **Q4** | (b) test output proving effective = parent ∩ session | ✓ | `--- PASS: … (3.51s)` + live demo (Put denied, Get/List allowed); `cmd/iam.go:2312` intersection |
 | **Q5** | (a) test output: basic user cannot self-attach `consoleAdmin` | ✓ | `--- PASS: … (3.47s)` + live `403` on attach/add-user/create-policy |
-| **Q5** | (b) root cause of user-mappings-modification behavior | ✓ | two layers — admin-action gate (L189/L206) + store ignores `Policy` (`iam-store.go:2659`) |
+| **Q5** | (b) root cause of user-mappings-modification behavior | ✓ | two layers — admin-action gate (L189/L206) + store ignores `Policy` (`cmd/iam-store.go:2659`) |
 
 ---
 
