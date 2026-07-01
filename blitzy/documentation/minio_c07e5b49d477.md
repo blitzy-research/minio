@@ -505,7 +505,7 @@ This is by design, grounded in the source:
   uses it **only** to enqueue a heal (`BitrotScan: errors.Is(err, errFileCorrupt)`,
   `cmd/erasure-object.go:407`); the error is then `nil`'d for the client, not logged.
 - Even the heal-time verifier `VerifyFile` logs a part error **only** when the result is
-  `checkPartUnknown` (`cmd/xl-storage.go:3126`), but `convPartErrToInt(errFileCorrupt)` returns the
+  `checkPartUnknown` (`cmd/xl-storage.go:3126-3127`), but `convPartErrToInt(errFileCorrupt)` returns the
   **known** value `checkPartFileCorrupt` (`cmd/erasure-healing-common.go:265-266`) — so a corrupt part
   is deliberately **not** logged as a line.
 
@@ -531,7 +531,7 @@ producing the `[Yellow ->  Green]` transition above.
 | `cmd/bitrot-streaming.go:184-185` | `if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {` … `return 0, errFileCorrupt` (the streaming verifier — the default path) |
 | `cmd/xl-storage-format-v1.go:158` | `DefaultBitrotAlgorithm = HighwayHash256S` — the default erasure bitrot algorithm actually exercised on GET |
 | `cmd/erasure-decode.go:197` | `case errors.Is(err, errFileCorrupt):` — tolerated so parity reconstruction proceeds |
-| `cmd/xl-storage.go:3126-3128` | `if resp.Results[i] == checkPartUnknown && err != errFileAccessDenied {` … `storageLogOnceIf(ctx, err, partPath)` — VerifyFile logs **only** unknown errors (a corrupt part is not logged) |
+| `cmd/xl-storage.go:3126-3129` | `if resp.Results[i] == checkPartUnknown && err != errFileAccessDenied {` … `storageLogOnceIf(ctx, err, partPath)` — VerifyFile logs **only** unknown errors (a corrupt part is not logged) |
 | `cmd/erasure-healing-common.go:265-266` | `case errFileCorrupt:` … `return checkPartFileCorrupt` — a corrupt part is a **known** result, not `checkPartUnknown`, so it is not surfaced as a log line |
 | `cmd/erasure-object.go:387-412` | after `erasure.Decode`, on `errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt)` it calls `healOnce.Do(...)` → `globalMRFState.addPartialOp(PartialOperation{ … })` |
 | `cmd/erasure-object.go:407` | `BitrotScan: errors.Is(err, errFileCorrupt),` — the `BitrotScan` flag assignment |
