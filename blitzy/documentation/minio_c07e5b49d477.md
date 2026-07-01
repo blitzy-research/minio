@@ -677,11 +677,11 @@ The one **operational caveat** — not a MinIO defect, but a policy-design consi
 | Authorization library | `github.com/minio/pkg/v3 v3.0.22` (vendored; `go.mod:55`) — unmodified |
 | Backend | single pool, 1 set, 4 drives/set (erasure-coded); objects stored as `xl.meta` directories |
 | Endpoint / health | `http://127.0.0.1:9000`; `GET /minio/health/live` → `200` |
-| S3 client | `boto3`/`botocore` 1.43.36 (SigV4); raw `S3SigV4Auth` + `requests` 2.34.2 for verbatim wire capture |
+| S3 client | `boto3`/`botocore` 1.43.37 (SigV4); raw `S3SigV4Auth` + `requests` 2.34.2 for verbatim wire capture |
 | Control plane | `mc` (built from source) for `admin policy`/`user`; `mc admin trace` for server-side corroboration |
 | Root credentials | `MINIO_ROOT_USER=minioadmin` / `MINIO_ROOT_PASSWORD=minioadmin` (disposable, local) |
 
-> Note on tooling versions: the running `boto3`/`botocore` was **1.43.36** (as observed), and `mc`, built from `@latest`, bootstrapped a newer Go for its own compilation — neither affects the system under test, which is the source-built MinIO server on `go1.23.12`.
+> Note on tooling versions: the running `boto3`/`botocore` was **1.43.37** (as observed), and `mc`, built from `@latest`, bootstrapped a newer Go for its own compilation — neither affects the system under test, which is the source-built MinIO server on `go1.23.12`.
 
 ## Appendix B — Observation scripts (ephemeral, external to the repository)
 
