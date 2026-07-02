@@ -10,15 +10,15 @@ exactly as observed.
 ## Runtime substrate (how these observations were produced)
 
 - **System under observation.** MinIO server built from source at commit `c07e5b49d`, reporting its version at
-  startup as `DEVELOPMENT.GOGET (go1.23.4 linux/amd64)`. The authoritative toolchain constraint in the
-  repository is `go 1.23` (`go.mod:L3`); `go1.23.4` is the `1.23.x` patch the binary reported during this
+  startup as `DEVELOPMENT.GOGET (go1.23.12 linux/amd64)`. The authoritative toolchain constraint in the
+  repository is `go 1.23` (`go.mod:L3`); `go1.23.12` is the `1.23.x` patch the binary reported during this
   investigation and is what is quoted below (reported exactly as observed).
 - **Topology, and why one node is a faithful substrate.** The server was launched over four directories,
   which it formats as exactly **one erasure set of four drives**:
 
   ```text
   INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
-  Version: DEVELOPMENT.GOGET (go1.23.4 linux/amd64)
+  Version: DEVELOPMENT.GOGET (go1.23.12 linux/amd64)
   ```
 
   A four‑drive set defaults to `EC:2` (two data + two parity), which — as derived in Q7 — yields a **read
@@ -220,7 +220,10 @@ HTTP/1.1 200 OK
 X-Minio-Read-Quorum: 2
 ```
 
-The `PUT` was refused; `mc cp --json` reported the exact S3 error `Code`:
+The `PUT` was refused; `mc cp --json` reported the exact S3 error `Code`. The salient, reproducible fields of
+the JSON error object are shown below; the full object additionally carries per‑request identifiers
+(`RequestID`, `HostID`) and static boilerplate (`Resource`, `Region`, `Server`) plus a trailing
+`"type":"error"`, which are elided here because the per‑request identifiers differ on every call:
 
 ```json
 {"status":"error","error":{"message":"Failed to copy `/tmp/objB.txt`.","cause":{"message":"Resource requested is unwritable, please reduce your request rate","error":{"Code":"SlowDownWrite","Message":"Resource requested is unwritable, please reduce your request rate","BucketName":"testbucket","Key":"objB.txt"}}}}
@@ -294,7 +297,7 @@ healing marker, which is itself permission‑denied on the downed drive):
 
 ```text
 Error: unable to read /tmp/minio-data/disk4/.minio.sys/buckets/.healing.bin: open /tmp/minio-data/disk4/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
-       8: cmd/xl-storage.go:436:cmd.(*xlStorage).Healing()
+       7: cmd/xl-storage.go:436:cmd.(*xlStorage).Healing()
        ...
        1: cmd/erasure.go:301:cmd.erasureObjects.getOnlineDisksWithHealingAndInfo.func1()
 ```
@@ -574,7 +577,7 @@ produces it, the explanation is grounded in what the running system does, not in
 | `mc admin heal` | Q5, Q6 | admin entry `HealObject` `cmd/erasure-healing.go:L1039`; observed `[Green -> Green]`, `Healed: 0/2 objects` |
 
 **Reproducibility note.** Observed values are reported exactly as captured during the investigation. The build
-reported `go1.23.4` (a `1.23.x` patch of the `go 1.23` constraint at `go.mod:L3`); the baseline object
+reported `go1.23.12` (a `1.23.x` patch of the `go 1.23` constraint at `go.mod:L3`); the baseline object
 `obj1.txt` was 32B; and `mc admin heal` reported `68 B` — these are the measured values from this run rather
 than fixed constants.
 
