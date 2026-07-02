@@ -646,18 +646,41 @@ The `ignore_errFileCorrupt_error` case confirms Section 3(C): a corrupt (non‑a
 --- PASS: TestHealCorrectQuorum
 ```
 
-### 9.1 Transparent fidelity note — three tests FAILED in this sandbox
+### 9.1 Transparent fidelity note — the three heal tests PASS under the documented command; a narrow test‑ordering subset can surface a shared‑global‑state artifact
 
-Reported honestly and **not** smoothed over: three healing tests **failed** when run on the sandbox's ext4 `/tmp`:
+Reported honestly and **not** smoothed over. When these healing tests are run the way the project runs them — the exact documented command — **all of them pass**, including the three (`TestHealObjectCorruptedXLMeta`, `TestHealObjectCorruptedParts`, `TestHealLastDataShard`) that an earlier draft of this note reported as failing:
 
 ```text
---- FAIL: TestHealObjectCorruptedXLMeta
---- FAIL: TestHealObjectCorruptedParts
---- FAIL: TestHealLastDataShard
-    error: Storage resources are insufficient for the read operation bucket/object
+$ go test -tags kqueue -run 'TestHeal|TestIsObjectDangling' ./cmd
+ok  	github.com/minio/minio/cmd	3.255s
+
+# same command with -v — the three previously‑doubted tests, PASS by name:
+--- PASS: TestHealObjectCorruptedXLMeta (0.23s)
+--- PASS: TestHealObjectCorruptedParts (0.29s)
+--- PASS: TestHealLastDataShard (1.00s)
 ```
 
-The failure message is the `InsufficientReadQuorum` wrapper (`cmd/object-api-errors.go:L236-237`), which `Unwrap()`s to `errErasureReadQuorum` (`cmd/object-api-errors.go:L241-243`). These failures are **environment‑specific** to the sandbox filesystem, not a contradiction of the reconstruction behavior: the live‑server control proved reconstruction works — object `objG` (2‑of‑4 shards wiped) reconstructed and round‑tripped its exact original content (Section 6), and Scenario A3 (2 corrupt parts, deep scan) rebuilt to a byte‑identical `sha256`. Where the sandbox unit tests and the live server disagree, **the live‑server reconstruction is treated as authoritative** for this document, and the unit‑test failures are recorded here exactly as observed. The two live‑server reconstruction controls that justify treating reconstruction as authoritative are pasted verbatim below (same runs as Section 6):
+The same three tests also pass when run **in isolation as a trio** (no other heal test sharing the process):
+
+```text
+$ go test -tags kqueue -run '^(TestHealObjectCorruptedXLMeta|TestHealObjectCorruptedParts|TestHealLastDataShard)$' ./cmd
+ok  	github.com/minio/minio/cmd	1.971s
+```
+
+The failure *can* be reproduced, but **only** under a narrow `-run` subset that places `TestHealingDanglingObject` before one of these heal tests. Every row below runs on the **same** ext4 `/tmp`; only the `-run` selection changes:
+
+```text
+go test -run 'TestHeal|TestIsObjectDangling' ./cmd            -> ok      (documented; all pass)
+^(...CorruptedXLMeta|...CorruptedParts|...LastDataShard)$     -> ok      (3 victims, no polluter)
+^(TestHealingDanglingObject|TestHealObjectCorruptedXLMeta)$   -> FAIL
+^(TestHealingDanglingObject|TestHealObjectCorruptedParts)$    -> FAIL
+^(TestHealingDanglingObject|TestHealLastDataShard)$           -> FAIL
+    erasure-healing_test.go:1718: Storage resources are insufficient for the read operation bucket/object
+```
+
+Because **pass and fail both occur on the identical ext4 `/tmp`** and are decided purely by the `-run` selection, the failure is **not** environment/filesystem‑specific — it is a **test‑ordering + shared‑global‑state artifact**. The failure message is the `InsufficientReadQuorum` wrapper (`cmd/object-api-errors.go:L236-237`), which `Unwrap()`s to `errErasureReadQuorum` (`cmd/object-api-errors.go:L241-243`); the failing assertion is `t.Fatal(err)` at `cmd/erasure-healing_test.go:1718`, inside `TestHealLastDataShard` (func at `L1642`).
+
+The polluting state is a process‑global. `TestHealingDanglingObject` (`cmd/erasure-healing_test.go:L647`) reconfigures the shared global `globalStorageClass` (declared at `cmd/globals.go:L248`) to Standard `EC:4` for its own run (`L659-663`) and relies on a deferred restore (`L656-658`). But `storageclass.Config.Update` **unconditionally sets `initialized = true`** (`internal/config/storageclass/storage-class.go:L344`), so that "restore" resets `Standard.Parity` to the saved value yet leaves the global in a non‑pristine state. None of these tests call `t.Parallel()` (verified at `L647`, `L1158`, `L1297`, `L1642`), so within one `go test` process the order is deterministic: a subset that starts with the polluter runs a later heal test against the non‑pristine global and trips the read‑quorum wrapper. Under the documented command the tests pass regardless. This is therefore a test‑harness artifact, **not** a reconstruction defect — a conclusion independently corroborated by the live‑server reconstruction controls (same runs as Section 6), pasted verbatim below:
 
 ```text
 $ mc admin heal --json --scan deep inv/testbucket/objG.bin   # 2-of-4 full shards wiped
@@ -673,7 +696,7 @@ A3 downloaded sha256: 8c94c3b39fb86be1b2b4ce7efeef9821221e77a836704eab8bed4568b3
 match: YES
 ```
 
-Both controls lost exactly 2 of the 4 shards (`intact = 2 == DataBlocks`), reconstructed to all‑`ok`, and returned byte‑identical content on download — which is why the sandbox‑specific unit‑test failures above are read as an environment artifact rather than a reconstruction defect.
+Both controls lost exactly 2 of the 4 shards (`intact = 2 == DataBlocks`), reconstructed to all‑`ok`, and returned byte‑identical content on download — confirming that the ordering‑dependent unit‑test failure above is a shared‑global‑state test‑harness artifact, not a reconstruction defect.
 
 ---
 
@@ -708,7 +731,7 @@ Every sub‑question of the prompt, answered by name, with its evidence location
 
 1. **A bit‑rot corrupt part is reported as `State = "missing"`, not `"corrupt"`** — because `errPartMissingOrCorrupt` (`cmd/erasure-healing.go:L152`) falls in the `DriveStateMissing` case (`cmd/erasure-healing.go:L388-389`). See §3(A3), §4.2.
 2. **The `mc` heal‑JSON `"Invalid parity shard count/surplus shard count given: ..."` string is a client display artifact**, from `getHColCode` (`mc/cmd/admin-heal-ui.go:55`) with the suffix appended at `mc/cmd/admin-heal-result-item.go:47-48` — not a server error. See §3(B).
-3. **Three unit tests failed on the sandbox ext4 `/tmp`** (`TestHealObjectCorruptedXLMeta`, `TestHealObjectCorruptedParts`, `TestHealLastDataShard`) with the `InsufficientReadQuorum` message; this is environment‑specific and the live‑server reconstruction is authoritative. See §9.1.
+3. **The referenced heal tests PASS under the documented command** — including `TestHealObjectCorruptedXLMeta`, `TestHealObjectCorruptedParts`, and `TestHealLastDataShard` (shown `--- PASS` by name), and they also pass as an isolated trio. The `InsufficientReadQuorum` message is reproducible **only** under a narrow `-run` subset that runs `TestHealingDanglingObject` first; that test mutates the shared process‑global `globalStorageClass` (`cmd/globals.go:L248`) and its deferred restore is not pristine because `storageclass.Config.Update` forces `initialized = true` (`internal/config/storageclass/storage-class.go:L344`). It is a **test‑ordering / shared‑global‑state artifact — filesystem‑independent** (pass and fail both on the same ext4 `/tmp`) — **not a reconstruction defect**; the live‑server sha256 controls corroborate. See §9.1.
 
 ### Note on cited line numbers
 
