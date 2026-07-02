@@ -28,7 +28,7 @@ $ printf '{"report": "weekly"}\n' | md5sum
 001b1ab535a1cbd53bef9e4933aca2be  -
 ```
 
-> Note on per‑run values: identifiers such as `X-Amz-Request-Id`, `X-Amz-Id-2`, `Date`, `Last-Modified`, trace timestamps, and `Duration`/`TTFB` differ on every run. The values pasted below are the ones this run actually produced; the deterministic values (ETags, XML structure, error `Code`/`Message`, `format.json` marker, `xl.meta` magic bytes, byte sizes, object bodies) are stable and reproducible.
+> Note on per‑run values: identifiers such as `X-Amz-Request-Id`, `X-Amz-Id-2`, `Date`, `Last-Modified`, the `X-Ratelimit-Limit`/`X-Ratelimit-Remaining` counters (derived from available memory at startup), trace timestamps, and `Duration`/`TTFB` differ on every run. The values pasted below are the ones this run actually produced; the deterministic values (ETags, XML structure, error `Code`/`Message`, `format.json` marker, `xl.meta` magic bytes, byte sizes, object bodies) are stable and reproducible.
 
 ---
 
@@ -385,6 +385,7 @@ Note the downloaded byte counts line up exactly with the HTTP `Content-Length` v
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 ```
 
 **Why / rationale.** MinIO's console logger prints a startup banner and (by default) only surfaces errors/warnings, not a success‑path access log; that is why the count of per‑request console lines is `0`. Operator‑facing, timestamped request visibility is provided by the admin trace subsystem and consumed with `mc admin trace`. Reporting this honestly — rather than inventing per‑request console lines — is required by the "report exactly what is observed" discipline.
@@ -428,6 +429,7 @@ $ mc admin trace -v local
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 ```
 
 The `Credential=minioadmin/20260701/us-east-1/s3/aws4_request` scope shows the request is signed by the root identity for the `s3` service in `us-east-1`; the paired `[RESPONSE]` line reporting `200 OK` confirms the signature validated and the request succeeded.
@@ -688,6 +690,7 @@ HTTP/1.1 200 OK
 Content-Length: 26
 Content-Type: text/plain
 ETag: "3bb51064cf13d3be5e710394962bbeda"
+X-Content-Type-Options: nosniff
 Hello MinIO first bucket!
 
 $ curl -si "http://127.0.0.1:9000/first-bucket/data/report.json" --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:minioadmin" \
@@ -696,6 +699,7 @@ HTTP/1.1 200 OK
 Content-Length: 21
 Content-Type: application/json
 ETag: "001b1ab535a1cbd53bef9e4933aca2be"
+X-Content-Type-Options: nosniff
 {"report": "weekly"}
 ```
 
