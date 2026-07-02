@@ -498,7 +498,7 @@ The XML `<Code>AccessDenied</Code>` and `<Message>Access Denied.</Message>` at H
 
 ## Section 6 — How the system processes requests and persists data
 
-Requests are routed by `registerAPIRouter()` [cmd/api-router.go:253], which maps each S3 verb/path to its handler and wraps each one in `s3APIMiddleware`. The middleware attaches security headers and the per‑request identifiers: `X-Amz-Request-Id` is set in `setRequestHeaderFunc` [cmd/generic-handlers.go:548], and the header name constants are `AmzRequestID = "x-amz-request-id"` and `AmzRequestHostID = "x-amz-id-2"` [internal/http/headers.go:160-161] — visible on every response in Section 2.
+Requests are routed by `registerAPIRouter()` [cmd/api-router.go:253], which maps each S3 verb/path to its handler and wraps each one in `s3APIMiddleware`. The middleware attaches security headers and the per‑request identifiers: `X-Amz-Request-Id` is set in `addCustomHeadersMiddleware` [cmd/generic-handlers.go:536] (specifically `w.Header().Set(xhttp.AmzRequestID, mustGetRequestID(UTCNow()))` at line 548), and the header name constants are `AmzRequestID = "x-amz-request-id"` and `AmzRequestHostID = "x-amz-id-2"` [internal/http/headers.go:160-161] — visible on every response in Section 2.
 
 Using the verbose and single‑line traces, the specific lines that answer "which log line shows X" are:
 
