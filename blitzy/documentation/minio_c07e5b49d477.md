@@ -4,15 +4,15 @@
 
 ## 1. Summary
 
-This document answers, with **captured runtime evidence**, how MinIO's healing subsystem decides what to do with an object whose shards are in a conflicting/ambiguous state — some drives holding valid data, some corrupted, some empty — across a **4‑disk single‑node erasure set**. Every behavioral claim below sits immediately next to the **verbatim output** that demonstrates it, plus a `file:line` citation into the source at the pinned commit. Statements that were derived by reading code rather than observed at runtime are explicitly labeled **"inferred."**
+This document answers, with **captured runtime evidence**, how MinIO's healing subsystem decides what to do with an object whose shards are in a conflicting/ambiguous state — some drives holding valid data, some corrupted, some empty — across a **4‑disk single‑node erasure set**. This Summary is a brief **overview only**: it makes no standalone behavioral assertion — each outcome named here is demonstrated with its own **verbatim output** and a `file:line` citation in the detailed section pointed to beside it. Throughout those detailed sections (§3–§10), every behavioral claim sits immediately next to the verbatim output that demonstrates it; statements derived by reading code rather than observed at runtime are explicitly labeled **"inferred."**
 
-The short answer: MinIO does **not** always reconstruct. For the default **EC:2** layout (proven below) it resolves ambiguity by comparing surviving shards against a **quorum threshold** computed from parity:
+The short answer: MinIO does **not** always reconstruct. For the default **EC:2** layout it resolves ambiguity by comparing surviving shards against a **quorum threshold** computed from parity. The three possible outcomes are previewed here as a map into the evidence; **each is proven with its own captured output in the section named beside it** (the EC:2 layout itself is proven in §4, and the quorum arithmetic in §8):
 
-- **≥ 2 valid shards** (read quorum) → the object is **reconstructed** (Reed‑Solomon rebuild) and drive states flip to `ok`.
-- **≤ 1 valid shard** and the object is judged **dangling** → it is **purged** by heal `--remove` and **stays deleted** (a client GET returns a read‑quorum error).
-- **Insufficient evidence to declare it dangling** (e.g., every `xl.meta` unreadable but no missing parts) → the object is **left alone** (degraded, not purged), and the dangling‑delete path returns `errErasureReadQuorum` without deleting anything.
+- **Reconstruct** — when read quorum holds, the object is rebuilt (Reed‑Solomon) and drive states flip to `ok`. *Demonstrated with the full heal result in §5.1 (Case A); the ≥ 2‑valid‑shard boundary is proven in §8 (R7a).*
+- **Purge / stays deleted** — when the object is judged **dangling**, heal `--remove` purges it and it stays deleted (a client GET then returns a read‑quorum error). *Demonstrated in §5.2 (Case B); the exact error literal appears in §9 (R7b).*
+- **Leave‑alone / degraded** — when there is insufficient evidence to declare the object dangling, it is left in place (not purged) and the dangling‑delete path returns `errErasureReadQuorum` without deleting anything. *Demonstrated in §5.3 (Case C).*
 
-A partially failed **write** and a partially failed **delete** heal through **different thresholds** (parts‑vs‑parity for writes; metadata‑vs‑data‑blocks for delete markers), which is why the two failure modes are reconciled differently.
+A partially failed **write** and a partially failed **delete** heal through **different thresholds**; that comparison is treated in full, with evidence and the governing `file:line` thresholds, in §10 (R7c).
 
 All evidence was produced by **building and running MinIO from source** and driving the **real server heal path**, then reading verbatim output — never from code reading alone.
 
@@ -92,10 +92,10 @@ This function returns `(true, <reason>)` when a disk's copy must be healed. The 
 - **`errOutdatedXLMeta`** — when this disk's metadata does not equal the latest (`!latestMeta.Equals(meta)`).
 - **`errPartMissingOrCorrupt`** — when metadata is fine and the object is neither Deleted nor Remote, but a part check returned `checkPartFileNotFound` or `checkPartFileCorrupt`.
 
-*Evidence (this per‑disk classification is exactly what the `Before` drive states expose).* In Case A, damaging the **part** on disk1 and the **metadata** on disk2 produced two different Before states in the real heal output:
+*Evidence (this per‑disk classification is exactly what the `Before` drive states expose).* In Case A, damaging the **part** on disk1 and the **metadata** on disk2 produced two different `Before` states. Below is the **full, unabridged** `madmin.HealResultItem` returned by the real heal path (verbatim — this is the identical Case A result reproduced in full in §5.1); read the `"before"` block:
 
 ```
-{"...","before":{"drives":[{"uuid":"","endpoint":"/tmp/disk1","state":"missing"},{"uuid":"","endpoint":"/tmp/disk2","state":"corrupt"},{"uuid":"","endpoint":"/tmp/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/disk4","state":"ok"}]},...}
+{"resultId":2,"type":"object","bucket":"testbucket","object":"testobj","versionId":"null","detail":"","parityBlocks":2,"dataBlocks":2,"diskCount":4,"setCount":0,"before":{"drives":[{"uuid":"","endpoint":"/tmp/disk1","state":"missing"},{"uuid":"","endpoint":"/tmp/disk2","state":"corrupt"},{"uuid":"","endpoint":"/tmp/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/disk4","state":"ok"}]},"after":{"drives":[{"uuid":"","endpoint":"/tmp/disk1","state":"ok"},{"uuid":"","endpoint":"/tmp/disk2","state":"ok"},{"uuid":"","endpoint":"/tmp/disk3","state":"ok"},{"uuid":"","endpoint":"/tmp/disk4","state":"ok"}]},"objectSize":1048576}
 ```
 
 disk1's corrupted **part** surfaced as `errPartMissingOrCorrupt` → `missing`; disk2's corrupted **`xl.meta`** surfaced as `errFileCorrupt` → `corrupt` (state mapping detailed in §6).
@@ -124,7 +124,7 @@ The caller that acts on this decision is `deleteIfDangling` [cmd/erasure-object.
 
 ## 4. R2 — The 4‑disk inconsistent‑state scenario (and why it is EC:2)
 
-**Why the layout is EC:2.** For a 4‑drive set, `DefaultParityBlocks(4)` returns **2**: the switch case `case 4, 5:` [internal/config/storageclass/storage-class.go:L361] returns `2` [internal/config/storageclass/storage-class.go:L362]. (Full table for context: `case 1`→`0` [L358]; `case 3, 2`→`1` [L360]; `case 4, 5`→`2` [L362]; `case 6, 7`→`3` [L364]; `default`→`4` [L366].) So the default layout is **2 data + 2 parity = EC:2**.
+**Why the layout is EC:2.** For a 4‑drive set, `DefaultParityBlocks(4)` returns **2**: the switch case `case 4, 5:` [internal/config/storageclass/storage-class.go:L361] returns `2` [internal/config/storageclass/storage-class.go:L362]. (Full table for context: `case 1`→`0` [internal/config/storageclass/storage-class.go:L358]; `case 3, 2`→`1` [internal/config/storageclass/storage-class.go:L360]; `case 4, 5`→`2` [internal/config/storageclass/storage-class.go:L362]; `case 6, 7`→`3` [internal/config/storageclass/storage-class.go:L364]; `default`→`4` [internal/config/storageclass/storage-class.go:L366].) So the default layout is **2 data + 2 parity = EC:2**.
 
 **On‑disk shard layout.** After `mc cp` of a 1 MiB object to `local/testbucket/testobj`, each of the four drives holds one `xl.meta` (368 bytes) plus the **same** datadir UUID containing exactly one `part.1` (524320 bytes). Verbatim enumeration:
 
@@ -216,11 +216,12 @@ original=78e672d4ca019e7c99cc4965a4bf82b9  got=78e672d4ca019e7c99cc4965a4bf82b9 
 mc: <ERROR> Unable to read from `local/testbucket/testobj`. Resource requested is unreadable, please reduce your request rate.
 ```
 
-**The same GET with `--debug` (verbatim HTTP status + S3 error body):**
+**The same GET with `--debug` — verbatim HTTP status line and the *complete* S3 error body** (the response carried `Content-Type: application/xml` with `Content-Length: 376`; the `RequestId`/`HostId`/`Date` fields are unique per request, everything else is stable):
 
 ```
 mc: <DEBUG> HTTP/1.1 503 Service Unavailable
-<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>testobj</Key><BucketName>testbucket</BucketName>...</Error>
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>testobj</Key><BucketName>testbucket</BucketName><Resource>/testbucket/testobj</Resource><RequestId>18BEA00AA10DC87D</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
 This is the client rendering of the internal `errErasureReadQuorum` = `"Read failed. Insufficient number of drives online"` [cmd/erasure-errors.go:L23], mapped by `toAPIError` (`case errErasureReadQuorum: apiErr = ErrSlowDownRead`) [cmd/api-errors.go:L2190-L2191] to `ErrSlowDownRead` — `Code:"SlowDownRead"`, HTTP `503 Service Unavailable` [cmd/api-errors.go:L869-L872].
@@ -403,11 +404,12 @@ AFTER  : ['ok', 'ok', 'ok', 'ok'] (disk1,disk2,disk3,disk4)
 
 The canonical internal literal is **`errErasureReadQuorum`** = `"Read failed. Insufficient number of drives online"` [cmd/erasure-errors.go:L23]. `deleteIfDangling` returns exactly this error when it cannot prove the object is safely deletable [cmd/erasure-object.go:L487].
 
-**Observed client rendering** (from Case B's GET, verbatim): the internal error is translated by `toAPIError` [cmd/api-errors.go:L2190-L2191] to `ErrSlowDownRead` — `Code:"SlowDownRead"`, HTTP `503 Service Unavailable` [cmd/api-errors.go:L869-L872]:
+**Observed client rendering** (from Case B's GET, verbatim — HTTP status line + the *complete* S3 error body; this is the same lost‑read‑quorum response whose full headers, incl. `Content-Length: 376`, are shown in §5.2, so `RequestId`/`HostId` match that capture): the internal error is translated by `toAPIError` [cmd/api-errors.go:L2190-L2191] to `ErrSlowDownRead` — `Code:"SlowDownRead"`, HTTP `503 Service Unavailable` [cmd/api-errors.go:L869-L872]:
 
 ```
 mc: <DEBUG> HTTP/1.1 503 Service Unavailable
-<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message>...</Error>
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>testobj</Key><BucketName>testbucket</BucketName><Resource>/testbucket/testobj</Resource><RequestId>18BEA00AA10DC87D</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
 **Sibling literals (named for completeness):**
