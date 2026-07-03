@@ -2,7 +2,7 @@
 
 > **Scope of this document.** This is an *evidence-grounded* answer to nine questions about how MinIO behaves when erasure-coded drives become inaccessible at runtime in a **single-node, four-directory** deployment. Every behavioral claim below sits next to the **verbatim output** that demonstrates it, and every code claim carries an exact **`file:line`** citation. All observations were produced by **building and running the actual MinIO binary**, injecting permission faults against live data directories, and exercising the **real S3 write path** and the **real `/minio/health/*` HTTP endpoints** — not by reading the source alone. The MinIO source tree was treated as read-only; nothing in it was modified.
 >
-> Repository: `github.com/minio/minio` · HEAD `c07e5b49d477b0774f23db3b290745aef8c01bd2` · build banner `DEVELOPMENT.2024-11-25T17-10-22Z`.
+> Repository: `github.com/minio/minio` · **source revision under investigation** `c07e5b49d477b0774f23db3b290745aef8c01bd2` (source branch `minio_c07e5b49d477`) · that revision's build banner `DEVELOPMENT.2024-11-25T17-10-22Z`. Every `file:line` citation below resolves at this source revision. This document is delivered on a branch that adds **only this one file** on top of that revision (no MinIO source is changed); because MinIO git-stamps its version from the checked-out `HEAD`, a binary built from the deliverable branch's HEAD reports a *different* date and `commit-id` while the code stays byte-for-byte identical — see [§1](#1-environment--methodology).
 
 ---
 
@@ -12,8 +12,8 @@
 - **Quorum.** From the code, this yields **read quorum = 2** and **write quorum = 3**. Write quorum is `dataBlocks` (2) **plus one** because `dataBlocks == parityBlocks` — a split-brain guard [`cmd/erasure-metadata.go:557-560`]. Confirmed on the wire: `X-Minio-Write-Quorum: 3`, `X-Minio-Read-Quorum: 2`.
 - **Lose one directory (3 online ≥ write quorum 3).** MinIO **adapts and keeps writing**. A real `PutObject` returned **HTTP 200**; the health endpoint stayed **200**; the failing disk was logged **by path**.
 - **Lose a second directory (2 online < write quorum 3).** MinIO **draws a hard line**: a real `PutObject` was **refused with HTTP 503 `SlowDownWrite`**, while **reads still succeeded** (2 online ≥ read quorum 2). `GET /minio/health/cluster` flipped to **503** but `GET /minio/health/cluster/read` stayed **200**.
-- **Path logging.** Yes — disk errors name the failing directory directly, e.g. `endpoint="/tmp/minio-obs.zvAv/data1"`, via `printEndpointError` [`cmd/prepare-storage.go:35-72`].
-- **Recovery is self-driven by polling.** When permissions are restored, a background loop re-admits the drive **on its own** and **pushes** it into a healing path. The reconnect poll interval is **runtime-confirmed ≈15.0 s** (two runs, 10 intervals, 15.000–15.002 s, mean 15.001 s), matching the code constant `10s + 5s` [`cmd/erasure-sets.go:348`], [`cmd/background-newdisks-heal-ops.go:40`].
+- **Path logging.** Yes — disk errors name the failing directory directly, e.g. `endpoint="/tmp/minio-obs.v7dzu3/data1"`, via `printEndpointError` [`cmd/prepare-storage.go:35-72`] (emitted on the reconnect monitor tick), plus default-visible absolute-path read errors such as the `.healing.bin … permission denied` line.
+- **Recovery is self-driven by polling.** When permissions are restored, a background loop re-admits the drive **on its own** and **pushes** it into a healing path. The reconnect poll interval is **runtime-confirmed ≈15.0 s** (two runs, 10 intervals, 15.000–15.001 s, mean 15.001 s), matching the code constant `10s + 5s` [`cmd/erasure-sets.go:348`], [`cmd/background-newdisks-heal-ops.go:40`].
 - **Stale objects are repaired.** An object written while a drive was down had its missing shard **reconstructed onto the returned drive** — proven by before/after on-disk inspection — via the MRF (Most-Recent-Failures) queue and background healing [`cmd/mrf.go:78,220`], [`cmd/erasure-healing.go:258`].
 
 ---
@@ -52,7 +52,27 @@ $ basename "$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/m
 minio_c07e5b49d477
 ```
 
-The source branch (its `origin/` remote prefix removed) is **`minio_c07e5b49d477`** — the stem of this file's name — so the deliverable is **`blitzy/documentation/minio_c07e5b49d477.md`**. Its tip commit `c07e5b49d477b0774f23db3b290745aef8c01bd2` is exactly the `commit-id` in the version banner below, confirming the running binary and this document describe the same source revision.
+The source branch (its `origin/` remote prefix removed) is **`minio_c07e5b49d477`** — the stem of this file's name — so the deliverable is **`blitzy/documentation/minio_c07e5b49d477.md`**. Its tip commit `c07e5b49d477b0774f23db3b290745aef8c01bd2` is the **source revision under investigation**: every `file:line` citation in this document resolves against it, and it is the revision whose build banner is quoted as authoritative below.
+
+**Source revision vs. deliverable-branch HEAD (why the banner you build may differ).** Two distinct things must not be conflated: (a) the **source revision under investigation** — `c07e5b49d477b0774f23db3b290745aef8c01bd2`, the tip of source branch `minio_c07e5b49d477`, against which all code citations resolve; and (b) the **deliverable branch's own `HEAD`**, on which this document is authored. The deliverable branch adds **only this one Markdown file** on top of the source revision — it changes **no** MinIO source, test, config, or build file — which is provable directly:
+
+```bash
+$ git diff c07e5b49d477 HEAD --name-status
+A	blitzy/documentation/minio_c07e5b49d477.md
+$ git diff c07e5b49d477 HEAD --name-only | grep -c '\.go$'
+0
+```
+
+Crucially, MinIO stamps its version **from the checked-out `HEAD`, not from a fixed release string**: `buildscripts/gen-ldflags.go` sets the release date from the HEAD commit time (`git log --format=%cI -n1`) and the `commit-id` (and copyright year) from the HEAD commit hash (`git log --format=%H -n1`). Therefore a binary built while `HEAD` is the source revision reports the banner below, whereas a binary built while `HEAD` is a **deliverable-branch commit** reports **that commit's** date and hash instead — *the same MinIO binary behavior, a different git-stamped label*. The git metadata that drives the authoritative banner:
+
+```bash
+$ git log --format=%cI -n1 c07e5b49d477      # source revision commit time
+2024-11-25T09:10:22-08:00                    #  -> UTC 2024-11-25T17:10:22Z -> DEVELOPMENT.2024-11-25T17-10-22Z
+$ git log --format=%H  -n1 c07e5b49d477      # source revision commit hash
+c07e5b49d477b0774f23db3b290745aef8c01bd2     #  -> commit-id=c07e5b49d477b0774f23db3b290745aef8c01bd2
+```
+
+For example, an acceptance build performed while `HEAD` pointed at a later documentation commit reported `DEVELOPMENT.2026-07-03T02-08-47Z (commit-id=fc5fe77b015e32928914b44f1d4e96f0d06ee84a)` (and `Copyright: 2015-2026`) — a later date and a deliverable-branch `commit-id`, exactly as the HEAD-stamping rule predicts, and with the MinIO source unchanged. **This document quotes the banner of the source revision under investigation as authoritative** (next); any deliverable-branch HEAD build differs only in that git-stamped date/`commit-id`/copyright-year label.
 
 **Build — canonical, default configuration.** The binary was built with the repository's own recipe [`Makefile:177` `build:` target; `Makefile:179` recipe; `Makefile:3` `LDFLAGS`]. Exact command executed:
 
@@ -60,7 +80,7 @@ The source branch (its `origin/` remote prefix removed) is **`minio_c07e5b49d477
 CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(go run buildscripts/gen-ldflags.go)" -o ./minio
 ```
 
-Produced a 117,293,208-byte (~112 MiB) binary whose version banner (`./minio --version`) is quoted **verbatim**:
+Built with `HEAD` at the **source revision under investigation** (`c07e5b49d477`), this produced a 117,293,208-byte (~112 MiB) binary whose version banner (`./minio --version`) — the **authoritative banner for the code under investigation** — is quoted **verbatim**:
 
 ```
 minio version DEVELOPMENT.2024-11-25T17-10-22Z (commit-id=c07e5b49d477b0774f23db3b290745aef8c01bd2)
@@ -68,6 +88,8 @@ Runtime: go1.23.12 linux/amd64
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Copyright: 2015-2024 MinIO, Inc.
 ```
+
+Here the `commit-id` equals the source revision and the copyright year (`2015-2024`) is that commit's year — both git-stamped from `HEAD` as described above. Running the **identical build command** from a later deliverable-branch HEAD yields an otherwise-identical binary whose banner instead carries that HEAD's date, `commit-id`, and copyright year (e.g. the `DEVELOPMENT.2026-07-03T02-08-47Z (commit-id=fc5fe77b…)` acceptance build noted above); the runtime behavior, quorum thresholds, and every `file:line` cited below are unchanged because the MinIO source is byte-for-byte identical.
 
 **Run — four-directory erasure server.** The four directories were passed as a single erasure set. The startup log confirms the topology **verbatim**:
 
@@ -161,6 +183,13 @@ $ python3 s3op.py get bucket obj-A.bin    # GetObject          -> GET_OK … / S
 **Timing method (magnitude rule).** To measure the disk-reconnect poll interval directly, the server was (for that measurement only) started with `_MINIO_SERVER_DEBUG=on` [`cmd/common-main.go:67`], which surfaces the internal monitor tick `console.Debugln("running drive monitoring")` [`cmd/erasure-sets.go:300`]. This toggles **logging verbosity only**; it does not change the polling behavior, and the interval itself is a fixed code constant. The inter-tick spacing was measured across **two independent windows**.
 
 **Reproducibility & cleanup.** Every value below is reproducible from the commands above. After the investigation, the server was stopped by its explicit PID, and the built binary, the temporary `$OBS` workspace (data directories, logs, and helper scripts) were removed, leaving the source tree byte-for-byte unchanged and this document as the only added file. Because the built binary is git-ignored, artifact removal is proved with explicit absence checks (not `git status` alone); the full cleanup proof — absence checks, the `.gitignore:4` caveat, the source-revision diff, and the clean working tree — is shown at the end of [§Q9](#q9--empirical-grounding-health-endpoint--real-writes).
+
+**Recorded-run identifiers vs. stable, reproducible values (read this before comparing captures).** The verbatim captures below come from **one recorded run** at the source revision. A re-run reproduces the same *behavior* but not the same *incidental identifiers*, because several tokens are allocated fresh each run:
+
+- **Per-run (will differ on re-execution, and that is expected):** the workspace path `/tmp/minio-obs.XXXXXX` (created by `mktemp -d`; this run's suffix was `v7dzu3`); the chosen object names (`obj-healthy`, `obj-A`, `obj-B`, `obj-D`, `obj-mrf`, `obj-heal`, `obj-h2`) and bucket names; each object's per-part-directory **UUID** (e.g. `b9ae3409-…` for `obj-mrf.bin`, `adfb1f0a-…` for `obj-heal.bin`, `089f73a2-…` for `obj-h2.bin`); the heal-task `respCh` heap pointer (e.g. `0xc003243ab0`); the `DeploymentID`; and the wall-clock `Time:` stamps in log blocks.
+- **Stable (reproducible run-to-run and the substance of every answer):** HTTP status codes (`200`/`503`/`404`/`412`), the quorum headers `X-Minio-Write-Quorum: 3` and `X-Minio-Read-Quorum: 2`, object byte count `1048576`, S3 error codes (`SlowDownWrite`, `NoSuchKey`), the fixed 1 MiB payload's ETag `d9122db2eede81390065782dbabc5aba`, the `xl.meta` size (391 B for a 1 MiB object here), the ~15 s reconnect interval, the sub-second health recovery (~0.012–0.013 s) and ~0.31 s write-resume, and every `file:line` citation.
+
+To regenerate equivalent evidence with fresh names, re-run the exact sequence: build → start the four-directory server as a non-root user → `s3op.py mb/put/get` → `chmod 000` one then two directories (waiting one ~15 s monitor tick between the fault and grepping for the `endpoint=` line) → `chmod 755` to restore → inspect on-disk shards before/after. Object names and the workspace suffix in a fresh run will differ from those quoted here; the statuses, headers, byte counts, literals, and timings will not.
 
 
 ---
@@ -304,18 +333,29 @@ This matches the format string at `cmd/erasure-server-pool.go:2794`. **Reported 
 
 **How it works (code).** `printEndpointError` [`cmd/prepare-storage.go:35`] attaches the path as a request-info tag — `reqInfo := (&logger.ReqInfo{}).AppendTags("endpoint", endpoint.String())` [`cmd/prepare-storage.go:40`] — and emits the error via `peersLogAlwaysIf(ctx, err)` [`cmd/prepare-storage.go:51`]; a repeated error is rate-annotated with `"Following error has been printed %d times.. %w"` [`cmd/prepare-storage.go:63`]. It is invoked from `connectDisks` [`cmd/erasure-sets.go:230`] (and `:244`) as MinIO (re)connects drives.
 
-**Evidence (verbatim, after `chmod 000 $OBS/data1`).** The failing directory is named by full path in the `endpoint=` tag, and the stack trace ends exactly at the `printEndpointError` call site:
+**When it fires (so it reproduces deterministically).** The `endpoint=`-tagged line is emitted from the `log == true` branch of `connectDisks` at [`cmd/erasure-sets.go:230`], which runs on the **reconnect monitor tick**, *not* at the instant of the `chmod`. After a **live** drive is made inaccessible you must therefore wait for the next monitor sweep (~15 s; see [§Q6](#q6--self-recognition-polling-vs-being-pushed-into-healing)) for the line to appear, and because `printEndpointError` de-duplicates through its `printOnce` map (declared [`cmd/prepare-storage.go:37`]; the `if once { … peersLogAlwaysIf; return }` / `if once { return }` guards at [`cmd/prepare-storage.go:49-58`]) it is printed **exactly once per endpoint** until the fault clears (observed occurrence count for `data1` across a full run: `1`). This timing is why a "chmod then immediately grep" misses the line, whereas grepping after one monitor tick surfaces it every time.
+
+**Evidence (verbatim, captured on the first reconnect tick after `chmod 000 $OBS/data1` on a live server).** The failing directory is named by full path in the `endpoint=` tag, and the stack trace ends exactly at the `printEndpointError` emit site [`cmd/prepare-storage.go:51`] → [`cmd/erasure-sets.go:230`]:
 
 ```
+API: SYSTEM.peers
+Time: 03:55:33 UTC 07/03/2026
+DeploymentID: 9aa0d644-b771-4bf7-92ad-2770965c208c
 Error: drive access denied (cmd.StorageErr)
-       endpoint="/tmp/minio-obs.zvAv/data1"
+       endpoint="/tmp/minio-obs.v7dzu3/data1"
        4: internal/logger/logger.go:258:logger.LogAlwaysIf()
        3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
        2: cmd/prepare-storage.go:51:cmd.init.func22.1()
        1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
 ```
 
-The permission fault surfaces the storage sentinel **`errDiskAccessDenied` = `StorageErr("drive access denied")`** [`cmd/storage-errors.go:68`] (comment L67: "we don't have write permissions on disk"). Internal read paths also name the path directly, e.g. `unable to read /tmp/minio-obs.zvAv/data1/.minio.sys/buckets/.healing.bin: … permission denied` from `xlStorage.Healing()`.
+The permission fault surfaces the storage sentinel **`errDiskAccessDenied` = `StorageErr("drive access denied")`** [`cmd/storage-errors.go:68`] (comment L67: "we don't have write permissions on disk"). Two **additional** path-naming signals were observed in the same run, so Q4's answer does not hinge on catching the monitor tick. First, a **default-visible** internal read error names the absolute path immediately, from `xlStorage.Healing()` [`cmd/xl-storage.go:430,436`]:
+
+```
+Error: unable to read /tmp/minio-obs.v7dzu3/data1/.minio.sys/buckets/.healing.bin: open /tmp/minio-obs.v7dzu3/data1/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
+```
+
+Second, if a drive is **already** inaccessible at startup (rather than failing live), the boot path logs `Unable to use the drive %s: %v, will be retried` [`cmd/prepare-storage.go:175`], again naming the drive by path. All three routes print the failing directory directly — **the answer to Q4 holds regardless of which one is caught.**
 
 **The full family of disk-error literals** that surface in logs (each an exact string):
 
@@ -341,7 +381,7 @@ The permission fault surfaces the storage sentinel **`errDiskAccessDenied` = `St
 
 ```
 Error: drive access denied (cmd.StorageErr)
-       endpoint="/tmp/minio-obs.zvAv/data1"
+       endpoint="/tmp/minio-obs.v7dzu3/data1"
        2: cmd/prepare-storage.go:51:cmd.init.func22.1()
        1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
 ```
@@ -349,12 +389,12 @@ Error: drive access denied (cmd.StorageErr)
 Second, recovery is observable purely through the **real health endpoint and real writes**: starting from a below-quorum state (`data1`+`data2` down → `GET /minio/health/cluster` returns `503` and a PUT is refused with `HTTP 503 SlowDownWrite`), simply restoring one directory brings both back **on their own**, with no restart and no command. Measuring from `chmod 755 <dir>`:
 
 ```
-$ chmod 755 /tmp/minio-obs.zvAv/data1
-health cluster -> 200 after 0.02s
-write resumed after 0.31s: PUT_OK obj-D.bin HTTP 200 ETag "d9122db2eede81390065782dbabc5aba"
+$ chmod 755 /tmp/minio-obs.v7dzu3/data1
+health cluster: 503 -> 200 after 0.013s          # 2 runs: 0.013s, 0.012s
+write resumed after 0.320s: PUT_OK obj-D.bin HTTP 200 ETag "d9122db2eede81390065782dbabc5aba"   # 2 runs: 0.320s, 0.296s (mean ~0.31s)
 ```
 
-The `obj-D.bin` shard then landed on the just-restored `data1`, confirming the drive was re-admitted for live I/O without intervention.
+Both figures were confirmed **stable across two runs** (health `503→200`: 0.013 s and 0.012 s; first successful write after `chmod 755`: 0.320 s and 0.296 s, mean ~0.31 s). The resumed write's shard then landed on the just-restored `data1`, confirming the drive was re-admitted for live I/O without any restart or manual heal command.
 
 **Evidence — diagnostic (non-default) observability (`_MINIO_SERVER_DEBUG=on`).** The two lines below are emitted **only** when the server is started with `_MINIO_SERVER_DEBUG=on` [`cmd/common-main.go:67`]; both are wrapped in `if serverDebugLog { … }` and are **not** part of default log output. They are shown here as diagnostic confirmation of the internal mechanism, not as default runtime behavior. The reconnect monitor ticking (`console.Debugln("running drive monitoring")` gated at [`cmd/erasure-sets.go:299-300`]):
 
@@ -365,10 +405,10 @@ minio: <DEBUG> running drive monitoring
 A heal task **queued** for the exact object that had been written while `data1` was down (`fmt.Printf("Task in the queue: %#v\n", task)` gated at [`cmd/admin-heal-ops.go:740-741`]), captured ~5 s after restoring `data1`:
 
 ```
-Task in the queue: cmd.healTask{bucket:"bucket2", object:"obj-h2.bin", versionID:"", opts:madmin.HealOpts{Recursive:false, DryRun:false, Remove:true, Recreate:false, ScanMode:0, UpdateParity:false, NoLock:false, Pool:(*int)(nil), Set:(*int)(nil)}, respCh:(chan cmd.healResult)(0xc001320000)}
+Task in the queue: cmd.healTask{bucket:"bucket2", object:"obj-h2.bin", versionID:"", opts:madmin.HealOpts{Recursive:false, DryRun:false, Remove:true, Recreate:false, ScanMode:0, UpdateParity:false, NoLock:false, Pool:(*int)(nil), Set:(*int)(nil)}, respCh:(chan cmd.healResult)(0xc003243ab0)}
 ```
 
-That heal completed: `obj-h2.bin`'s shard reappeared on the returned `data1` (PRESENT on all four drives afterward).
+(Here `obj-h2.bin` was written into `bucket2` while `data2` was inaccessible; the `respCh` channel pointer is a per-run heap address and differs on each run — everything else in the struct is stable.) That heal completed: `obj-h2.bin`'s shard reappeared on the returned `data2`, carrying the same part-directory UUID `089f73a2-d0af-4c9d-b798-44ed32727198` as the surviving shards (PRESENT on all four drives afterward).
 
 **What was and was not visible under default logging.** Under default logging (no `_MINIO_SERVER_DEBUG`), the **path-tagged disk error** and the **health/write recovery** above are fully visible; the **per-tick monitor line** and the **per-task heal-enqueue struct** are **not** — they require `_MINIO_SERVER_DEBUG=on`. Enabling that flag only changes logging verbosity (both lines sit behind `if serverDebugLog`); it does not alter the reconnect or heal behavior itself.
 
@@ -388,31 +428,31 @@ That heal completed: `obj-h2.bin`'s shard reappeared on the returned `data1` (PR
 
 ```
 # Run 1 (fresh server, _MINIO_SERVER_DEBUG=on)
-01:18:38.180 minio: <DEBUG> running drive monitoring
-01:18:53.180 minio: <DEBUG> running drive monitoring
-01:19:08.182 minio: <DEBUG> running drive monitoring
-01:19:23.183 minio: <DEBUG> running drive monitoring
-01:19:38.183 minio: <DEBUG> running drive monitoring
-01:19:53.183 minio: <DEBUG> running drive monitoring
+04:01:02.807 minio: <DEBUG> running drive monitoring
+04:01:17.807 minio: <DEBUG> running drive monitoring
+04:01:32.808 minio: <DEBUG> running drive monitoring
+04:01:47.809 minio: <DEBUG> running drive monitoring
+04:02:02.810 minio: <DEBUG> running drive monitoring
+04:02:17.811 minio: <DEBUG> running drive monitoring
 # Run 2 (second fresh server)
-01:20:28.155 minio: <DEBUG> running drive monitoring
-01:20:43.155 minio: <DEBUG> running drive monitoring
-01:20:58.156 minio: <DEBUG> running drive monitoring
-01:21:13.157 minio: <DEBUG> running drive monitoring
-01:21:28.157 minio: <DEBUG> running drive monitoring
-01:21:43.158 minio: <DEBUG> running drive monitoring
+04:02:56.450 minio: <DEBUG> running drive monitoring
+04:03:11.451 minio: <DEBUG> running drive monitoring
+04:03:26.452 minio: <DEBUG> running drive monitoring
+04:03:41.453 minio: <DEBUG> running drive monitoring
+04:03:56.453 minio: <DEBUG> running drive monitoring
+04:04:11.454 minio: <DEBUG> running drive monitoring
 ```
 
 The inter-tick **deltas below are computed from those quoted raw timestamps** (consecutive differences):
 
 | Run | Ticks | Deltas (s), derived from raw timestamps above | Mean (derived) |
 |---|---|---|---|
-| 1 | 6 | 15.000, 15.002, 15.001, 15.000, 15.000 | 15.001 |
-| 2 | 6 | 15.000, 15.001, 15.001, 15.000, 15.001 | 15.001 |
+| 1 | 6 | 15.000, 15.001, 15.001, 15.001, 15.001 | 15.001 |
+| 2 | 6 | 15.001, 15.001, 15.001, 15.000, 15.001 | 15.001 |
 
-Across both runs, **10 intervals** span **min 15.000 s, max 15.002 s, mean 15.001 s** — stable across the two runs and matching the code-derived 15 s (`10 s + 5 s`).
+Across both runs, **10 intervals** span **min 15.000 s, max 15.001 s, mean 15.001 s** — stable across the two runs and matching the code-derived 15 s (`10 s + 5 s`).
 
-**Reported exactly as observed — an important nuance.** The *health endpoint's* view of drives recovers **much faster** than this ~15 s poll, and this is measurable under **default logging**. Measuring from `chmod 755 <dir>`, `GET /minio/health/cluster` returned `200` again after **0.02 s** and a real S3 write resumed after **0.31 s** (`PUT_OK obj-D.bin`, see [§Q5](#q5--signs-of-recovery-while-the-system-is-live)). That is because `Health()` re-derives the online count from fresh per-drive `DiskInfo` probes, which are independent of the ~15 s reconnect poll. So there are two distinct cadences: the health endpoint reflects drive accessibility sub-second (default-visible), whereas the drive-reconnect monitor sweeps every ~15 s (a cadence visible only via the diagnostic `_MINIO_SERVER_DEBUG=on` tick). Both were observed; neither was assumed.
+**Reported exactly as observed — an important nuance.** The *health endpoint's* view of drives recovers **much faster** than this ~15 s poll, and this is measurable under **default logging**. Measuring from `chmod 755 <dir>` (from a below-quorum state, restoring one drive), `GET /minio/health/cluster` returned `200` again after **0.013 s** (2 runs: 0.013 s, 0.012 s) and a real S3 write resumed after **0.320 s** (2 runs: 0.320 s, 0.296 s; mean ~0.31 s) — `PUT_OK obj-D.bin`, see [§Q5](#q5--signs-of-recovery-while-the-system-is-live). That is because `Health()` re-derives the online count from fresh per-drive `DiskInfo` probes, which are independent of the ~15 s reconnect poll. So there are two distinct cadences: the health endpoint reflects drive accessibility sub-second (default-visible), whereas the drive-reconnect monitor sweeps every ~15 s (a cadence visible only via the diagnostic `_MINIO_SERVER_DEBUG=on` tick). Both were observed; neither was assumed.
 
 **Evidence — diagnostic tick (`_MINIO_SERVER_DEBUG=on`).** The self-recognition poll is confirmed by the monitor tick, recurring every ~15 s. This line is **diagnostic-only** (gated by `if serverDebugLog` at [`cmd/erasure-sets.go:299-300`]) and is **not** emitted under default logging:
 
@@ -449,27 +489,27 @@ $ python3 s3op.py put bucket obj-mrf.bin
 PUT_OK obj-mrf.bin HTTP 200 ETag "d9122db2eede81390065782dbabc5aba"
 ```
 
-**Evidence — definitive before/after shard inspection.** Inspecting the on-disk shards **while `data1` was still down** showed the shard was **absent** on `data1` but present on each of the three online drives (each carrying the same part-directory UUID plus a 387-byte `xl.meta`):
+**Evidence — definitive before/after shard inspection.** Inspecting the on-disk shards **while `data1` was still down** showed the shard was **absent** on `data1` but present on each of the three online drives (each carrying the same part-directory UUID plus a 391-byte `xl.meta`):
 
 ```
 BEFORE heal (data1 chmod 000; obj-mrf.bin written with 3 drives up):
   data1: MISSING   (ls: cannot access .../data1/bucket/obj-mrf.bin/: No such file or directory)
-  data2: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5/  +  xl.meta 387B)
-  data3: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5/  +  xl.meta 387B)
-  data4: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5/  +  xl.meta 387B)
+  data2: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3/  +  xl.meta 391B)
+  data3: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3/  +  xl.meta 391B)
+  data4: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3/  +  xl.meta 391B)
 ```
 
-After restoring `data1` (`chmod 755`) and waiting for healing, the shard had been **reconstructed onto `data1`**:
+After restoring `data1` (`chmod 755`) and waiting for healing (the missing shard reappeared within ~5 s once the drive stayed up), the shard had been **reconstructed onto `data1`**:
 
 ```
-AFTER restore data1 (healed, observed 01:14:35 UTC):
-  data1: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5)   <- reconstructed onto the returned drive
-  data2: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5)
-  data3: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5)
-  data4: PRESENT   (005e1281-6b25-4702-86d8-ddb66d4980c5)
+AFTER restore data1 (healed, ~5 s after chmod 755):
+  data1: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3   +  xl.meta 391B)   <- reconstructed onto the returned drive
+  data2: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3   +  xl.meta 391B)
+  data3: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3   +  xl.meta 391B)
+  data4: PRESENT   (b9ae3409-fbb2-4335-8897-b022d83551f3   +  xl.meta 391B)
 ```
 
-The reconstructed shard on `data1` carries the **same part-directory UUID** (`005e1281-6b25-4702-86d8-ddb66d4980c5`) as the surviving three, i.e. the object was rebuilt from its surviving shards rather than re-uploaded. Integrity of the healed object was confirmed through the real S3 read path:
+The reconstructed shard on `data1` carries the **same part-directory UUID** (`b9ae3409-fbb2-4335-8897-b022d83551f3`) as the surviving three, i.e. the object was rebuilt from its surviving shards rather than re-uploaded. Integrity of the healed object was confirmed through the real S3 read path:
 
 ```
 $ python3 s3op.py get bucket obj-mrf.bin
@@ -591,9 +631,9 @@ live          HTTP 200
 **Restored — permissions returned (recovery + heal; default logging, no debug).**
 
 ```
-$ chmod 755 /tmp/minio-obs.zvAv/data1
-health cluster -> 200 after 0.02s
-write resumed after 0.31s: PUT_OK obj-D.bin HTTP 200 ETag "d9122db2eede81390065782dbabc5aba"
+$ chmod 755 /tmp/minio-obs.v7dzu3/data1
+health cluster: 503 -> 200 after 0.013s          # 2 runs: 0.013s, 0.012s
+write resumed after 0.320s: PUT_OK obj-D.bin HTTP 200 ETag "d9122db2eede81390065782dbabc5aba"   # 2 runs: 0.320s, 0.296s (mean ~0.31s)
 $ python3 s3op.py get bucket obj-mrf.bin
 GET_OK obj-mrf.bin HTTP 200 BYTES 1048576
 ```
@@ -663,7 +703,7 @@ Each question and each named mechanism is answered with an exact literal, a `fil
 
 | Item | Exact literal / value | `file:line` | Observed evidence |
 |---|---|---|---|
-| Q1 health decision | `Health()`, `DriveStateOk`, `Healthy = online >= poolWriteQuorums` | `cmd/erasure-server-pool.go:2679,2707,2783-2784` | `GET /cluster` → `200`, `X-Minio-Write-Quorum: 3` |
+| Q1 health decision | `Health()` [`:2679`]; online-count gate `if disk.State == madmin.DriveStateOk` [`:2707`]; K+1 write quorum `if data == b.StandardSCParity { poolWriteQuorums[i] = data + 1 }` [`:2725-2726`]; per-set verdict `Healthy = online >= poolWriteQuorums` / `HealthyRead = online >= poolReadQuorums` [`:2783-2784`] | `cmd/erasure-server-pool.go:2679`, `:2707`, `:2725-2726`, `:2783-2784` | `GET /cluster` → `200`, `X-Minio-Write-Quorum: 3` |
 | Q1 write-quorum header | `MinIOWriteQuorum = "x-minio-write-quorum"` → wire `X-Minio-Write-Quorum` | `internal/http/headers.go:193`; `cmd/healthcheck-handler.go:72` | `X-Minio-Write-Quorum: 3` |
 | Q1 read-quorum header | `MinIOReadQuorum = "x-minio-read-quorum"` → wire `X-Minio-Read-Quorum` | `internal/http/headers.go:196`; `cmd/healthcheck-handler.go:109` | `X-Minio-Read-Quorum: 2` |
 | Q2 adapt vs refuse | threshold-gated on `writeQuorum` | `cmd/erasure-metadata.go:557-560` | A: `PUT_OK obj-A.bin HTTP 200`; B: `S3_ERROR HTTP=503 SlowDownWrite` |
@@ -672,13 +712,13 @@ Each question and each named mechanism is answered with an exact literal, a `fil
 | Q3 read survives | 2 online ≥ rq 2 | `cmd/erasure-server-pool.go:2784` | `GET_OK obj-healthy.bin HTTP 200 BYTES 1048576` |
 | Q3 wire mapping | `ErrSlowDownWrite` = Code `"SlowDownWrite"`, 503 | `cmd/api-errors.go:874-878,2192-2193` | `Code=SlowDownWrite` |
 | Q3 quorum-fail log | `"Write quorum could not be established on pool: %d, set: %d, expected write quorum: %d, drives-online: %d"` (via `logger.FatalKind`, no crash) | `cmd/erasure-server-pool.go:2794-2795` | `expected write quorum: 3, drives-online: 2`; process stayed alive |
-| Q4 path logging | `AppendTags("endpoint", endpoint.String())` via `printEndpointError` | `cmd/prepare-storage.go:35,40,51` | `endpoint="/tmp/minio-obs.zvAv/data1"` |
+| Q4 path logging | `AppendTags("endpoint", endpoint.String())` via `printEndpointError`, emitted from `connectDisks(true)` on the reconnect monitor tick | `cmd/prepare-storage.go:35,40,51`; `cmd/erasure-sets.go:230` | `endpoint="/tmp/minio-obs.v7dzu3/data1"` (once per endpoint) + `.healing.bin … permission denied` absolute-path line |
 | Q4 observed literal | `errDiskAccessDenied` = `"drive access denied"` | `cmd/storage-errors.go:68` | `Error: drive access denied (cmd.StorageErr)` |
 | Q4 sibling literals | `errUnformattedDisk`/`errDiskNotFound`/`errDriveIsRoot`/`errFaultyDisk` | `cmd/storage-errors.go:38,53,59,65` | (enumerated in §Q4 table) |
-| Q5 live recovery | `monitorLocalDisksAndHeal`; heal-task print (diagnostic) | `cmd/background-newdisks-heal-ops.go:563`; `cmd/admin-heal-ops.go:740-741` | default: `health 200 @0.02s` + `PUT_OK obj-D.bin`; diagnostic: heal enqueued for `obj-h2.bin` |
+| Q5 live recovery | `monitorLocalDisksAndHeal`; heal-task print (diagnostic) | `cmd/background-newdisks-heal-ops.go:563`; `cmd/admin-heal-ops.go:740-741` | default: `health 503→200 @0.013s` + `PUT_OK obj-D.bin` (resumed @~0.31s); diagnostic: heal enqueued for `obj-h2.bin` |
 | Q6 polling self-recognition | `monitorAndConnectEndpoints` → `connectDisks(true)` | `cmd/erasure-sets.go:283,303,479` | `minio: <DEBUG> running drive monitoring` |
 | Q6 push into healing | `pushHealLocalDisks(...)` | `cmd/erasure-sets.go:227,238` | heal tasks enqueued after restore |
-| Q6 interval (runtime-confirmed) | `defaultMonitorNewDiskInterval + time.Second*5` = 15 s | `cmd/erasure-sets.go:348`; `cmd/background-newdisks-heal-ops.go:40` | 10 intervals, 15.000–15.002 s, mean 15.001 (2 runs) |
+| Q6 interval (runtime-confirmed) | `defaultMonitorNewDiskInterval + time.Second*5` = 15 s | `cmd/erasure-sets.go:348`; `cmd/background-newdisks-heal-ops.go:40` | 10 intervals, 15.000–15.001 s, mean 15.001 (2 runs) |
 | Q7 MRF queue | `addPartialOp` / `healRoutine` | `cmd/mrf.go:78,220`; `cmd/erasure-object.go:400,805,1578,2113`; `cmd/erasure-multipart.go:1409` | before: data1 MISSING → after: data1 PRESENT |
 | Q7 fresh-disk heal | `healFreshDisk` via `monitorLocalDisksAndHeal` | `cmd/background-newdisks-heal-ops.go:419,563` | shard reconstructed on returned drive |
 | Q7 object reconstruction | `healObject` / `HealObject`, `objectQuorumFromMeta` | `cmd/erasure-healing.go:258,307,1039` | `GET_OK obj-mrf.bin HTTP 200 BYTES 1048576` |
@@ -689,7 +729,7 @@ Each question and each named mechanism is answered with an exact literal, a `fil
 | Q8 metadata-derived quorum (read/heal/copy) | `objectQuorumFromMeta` callers (not new PUT) | `cmd/erasure-object.go:103`; `cmd/erasure-healing.go:307`; `cmd/erasure-multipart.go:79`; `cmd/erasure-object.go:2145,2224` | reconstruction paths only |
 | Q9 empirical table | routes + handlers | `cmd/healthcheck-router.go:27-31,41-52`; `cmd/healthcheck-handler.go:56,93` | full stage table above |
 | Topology | `1 set(s), 4 drives per set` | (startup log) | `INFO: Formatting 1st pool, 1 set(s), 4 drives per set.` |
-| Build banner | `DEVELOPMENT.2024-11-25T17-10-22Z`, `go1.23.12` | `Makefile:177,179`; `go.mod:3` | `./minio --version` output |
+| Build banner (source revision) | `DEVELOPMENT.2024-11-25T17-10-22Z` (commit-id `c07e5b49d477`), `go1.23.12` — git-stamped from `HEAD` (`git log --format=%cI/%H -n1`), so a deliverable-branch HEAD build reports that HEAD's date/`commit-id` while the source is byte-for-byte identical | `buildscripts/gen-ldflags.go`; `Makefile:177,179`; `go.mod:3` | `./minio --version` at `HEAD==c07e5b49d477` (§1 provenance note) |
 | Cleanup | repo unchanged apart from this doc | `.gitignore:4` (binary git-ignored) | `test ! -e ./minio` → `ABSENT`; `git diff c07e5b49d477 HEAD --name-status` → single `A blitzy/documentation/minio_c07e5b49d477.md` (0 `.go`); `git status --porcelain` empty |
 
 **Coverage statement.** All nine questions (Q1–Q9) and every named mechanism — quorum math, health endpoints and headers, path-tagged logging, the disk-error literals, the polling reconnect and the push-into-healing, the MRF queue, fresh-disk healing, and per-object reconstruction — are addressed above, each paired with an exact `file:line` citation and a verbatim observed evidence line. Timing was reported only after confirming stability across two runs; the ≈15 s value is runtime-confirmed. Values obtained from the real S3 path and the real health endpoints are canonical; no bypassing, fallback, or synthetic path was used to produce any reported value.
