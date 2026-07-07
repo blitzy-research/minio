@@ -38,9 +38,9 @@ The rest of this document proves each of the three outcomes with real output, de
 $ CGO_ENABLED=0 go build -tags kqueue -o /tmp/minio_bin/minio .
 # exit 0
 $ ls -la /tmp/minio_bin/minio
--rwxr-xr-x 1 root root 156750807 ... /tmp/minio_bin/minio
+-rwxr-xr-x 1 root root 156750807 Jul  6 22:57 /tmp/minio_bin/minio
 $ file /tmp/minio_bin/minio
-/tmp/minio_bin/minio: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=..., with debug_info, not stripped
+/tmp/minio_bin/minio: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=7GA04ogtF4TmoEsk-bwo/4Y4tIFWU6Z-P_rI1k6PT/nlYUf3rsMRguGv2zsbsM/BkpoFBDA4XpXwnff4GaH, with debug_info, not stripped
 $ /tmp/minio_bin/minio --version
 minio version DEVELOPMENT.GOGET (commit-id=DEVELOPMENT.GOGET)
 Runtime: go1.23.2 linux/amd64
@@ -56,13 +56,14 @@ Copyright: 2015-0000 MinIO, Inc.
    ```bash
    $ CGO_ENABLED=0 go test -v -run 'TestHeal|TestIsObjectDangling' -tags kqueue -timeout 900s ./cmd/
    ```
-   Plus a **temporary scratch test** (`cmd/zz_blitzy_scratch_test.go`, since deleted — see §13) built on the repo's own verified helper `prepareErasure(ctx, 4)` [`cmd/test-utils_test.go:211`], which yields a **clean 4‑disk EC:2** object layer (the exact topology the question asks about; the shipped `TestHeal*` tests use 16/32‑disk sets — see §5 caveat).
+   Plus a **temporary scratch test** (`cmd/zz_blitzy_scratch_test.go`, since deleted — see §14) built on the repo's own verified helper `prepareErasure(ctx, 4)` [`cmd/test-utils_test.go:211`], which yields a **clean 4‑disk EC:2** object layer (the exact topology the question asks about; the shipped `TestHeal*` tests use 16/32‑disk sets — see §5 caveat).
 
-2. **Live 4‑drive single‑node server** (`ErasureSetupType`) driven by the operator CLI:
+2. **Live 4‑drive single‑node server** (`ErasureSetupType`) driven by the operator CLI (an audit‑webhook sink on `:9500` captures the `DeleteDanglingObject` event of §7):
    ```bash
    $ MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+     MINIO_AUDIT_WEBHOOK_ENABLE_blitzy=on MINIO_AUDIT_WEBHOOK_ENDPOINT_blitzy=http://127.0.0.1:9500/ \
      /tmp/minio_bin/minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4 --address :9000 --console-address :9001 &
-   # server log: "Formatting 1st pool, 1 set(s), 4 drives per set."
+   # server log: "INFO: Formatting 1st pool, 1 set(s), 4 drives per set."
    $ mc --config-dir /tmp/mc-config alias set local http://127.0.0.1:9000 minioadmin minioadmin
    $ mc --config-dir /tmp/mc-config admin heal --json --force local/<bucket>/<object>
    ```
@@ -148,7 +149,7 @@ $ mc --config-dir /tmp/mc-config admin info local
 4 drives online, 0 drives offline, EC:2
 ```
 
-These two numbers — **read quorum 2** and **parity 2** — frame every boundary answer that follows. Corroboration (documentation, supplementing the runtime evidence): MinIO documents that when parity `M` is exactly half the erasure‑set size the write quorum is `K+1`, matching the observed `writeQuorum = 3` for EC:2; and that an object "cannot [be] reconstruct[ed]…that has lost read quorum."
+These two numbers — **read quorum 2** and **parity 2** — frame every boundary answer that follows. Corroboration (documentation, supplementing the runtime evidence): MinIO documents that when parity `M` is exactly half the erasure‑set size the write quorum is `K+1`, matching the observed `writeQuorum = 3` for EC:2; and that an object which has lost read quorum can no longer be reconstructed.
 
 ---
 
@@ -269,11 +270,11 @@ HealObject [erasure-healing.go:1039]  (real ObjectLayer entry point)
   → healObject [erasure-healing.go:258]
      → readAllFileInfo across all 4 disks
      → objectQuorumFromMeta [erasure-metadata.go:531]
-         └─ err? → deleteIfDangling(…, dataErrsByPart=nil) EARLY [erasure-healing.go:309]
+         └─ err? → deleteIfDangling(partsMetadata, errs, dataErrsByPart=nil) EARLY [erasure-healing.go:309]
      → classify each disk Ok/Missing/Corrupt/Offline [erasure-healing.go:383-404]   (Before/After drives)
      → disksToHealCount == 0? → "object is healthy, nothing to heal"
      → cannotHeal := disksToHealCount > parity [erasure-healing.go:428]
-          (override: if all ETags agree, cannotHeal=false [L429-432])
+          (override: if all ETags agree (quorumETag != ""), cannotHeal=false [L429-433])
         ├─ false → RECONSTRUCT: RenameData, After[i]=Ok [erasure-healing.go:649-653]
         └─ true  → deleteIfDangling [erasure-object.go:482]
                      → isObjectDangling [erasure-healing.go:968]?
@@ -289,23 +290,76 @@ HealObject [erasure-healing.go:1039]  (real ObjectLayer entry point)
 
 > **Caveat about the shipped tests (stated honestly):** the repository's own `TestHeal*` tests run on **16‑ or 32‑disk** sets (EC:4, or EC:2‑on‑32), and `TestHealingDanglingObject` explicitly forces parity to 4. They demonstrate the *same mechanism* (`disksToHealCount > parity`) but not the exact 4‑drive numeric boundary the question asks about. To pin the exact **EC:2** boundary we use (a) the naturally‑EC:2 **live server** and (b) a **temporary scratch test** built on `prepareErasure(ctx, 4)`. Where a shipped test's parity differs, the mechanism is identical and only the numeric threshold scales with parity.
 
-All shipped heal tests pass:
+All shipped heal tests pass. Full, unedited `go test -v` output (every `=== RUN` line and every subtest, not just the summary):
 
 ```text
 $ CGO_ENABLED=0 go test -v -run 'TestHeal|TestIsObjectDangling' -tags kqueue -timeout 900s ./cmd/
+=== RUN   TestIsObjectDangling
+=== RUN   TestIsObjectDangling/FileInfoExists-case1
+=== RUN   TestIsObjectDangling/FileInfoExists-case2
+=== RUN   TestIsObjectDangling/FileInfoUndecided-case1
+=== RUN   TestIsObjectDangling/FileInfoUndecided-case2
+=== RUN   TestIsObjectDangling/FileInfoUndecided-case3(file_deleted)
+=== RUN   TestIsObjectDangling/FileInfoUnDecided-case4
+=== RUN   TestIsObjectDangling/FileInfoUnDecided-case5-(ignore_errFileCorrupt_error)
+=== RUN   TestIsObjectDangling/FileInfoUnDecided-case6-(data-dir_intact)
+=== RUN   TestIsObjectDangling/FileInfoDecided-case1
+=== RUN   TestIsObjectDangling/FileInfoDecided-case2-delete-marker
+=== RUN   TestIsObjectDangling/FileInfoDecided-case3-(enough_data-dir_missing)
+=== RUN   TestIsObjectDangling/FileInfoDecided-case4-(missing_data-dir_for_part_2)
+=== RUN   TestIsObjectDangling/FileInfoDecided-case4-(enough_data-dir_existing_for_each_part)
 --- PASS: TestIsObjectDangling (0.00s)
---- PASS: TestHealing (0.09s)
---- PASS: TestHealingVersioned (0.13s)
---- PASS: TestHealingDanglingObject (0.18s)
---- PASS: TestHealCorrectQuorum (0.39s)
---- PASS: TestHealObjectCorruptedPools (0.60s)
---- PASS: TestHealObjectCorruptedXLMeta (0.30s)
---- PASS: TestHealObjectCorruptedParts (0.21s)
---- PASS: TestHealObjectErasure (0.19s)
---- PASS: TestHealEmptyDirectoryErasure (0.06s)
---- PASS: TestHealLastDataShard (1.25s)
+    --- PASS: TestIsObjectDangling/FileInfoExists-case1 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoExists-case2 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUndecided-case1 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUndecided-case2 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUndecided-case3(file_deleted) (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUnDecided-case4 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUnDecided-case5-(ignore_errFileCorrupt_error) (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoUnDecided-case6-(data-dir_intact) (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoDecided-case1 (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoDecided-case2-delete-marker (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoDecided-case3-(enough_data-dir_missing) (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoDecided-case4-(missing_data-dir_for_part_2) (0.00s)
+    --- PASS: TestIsObjectDangling/FileInfoDecided-case4-(enough_data-dir_existing_for_each_part) (0.00s)
+=== RUN   TestHealing
+--- PASS: TestHealing (0.11s)
+=== RUN   TestHealingVersioned
+--- PASS: TestHealingVersioned (0.12s)
+=== RUN   TestHealingDanglingObject
+--- PASS: TestHealingDanglingObject (0.20s)
+=== RUN   TestHealCorrectQuorum
+--- PASS: TestHealCorrectQuorum (0.58s)
+=== RUN   TestHealObjectCorruptedPools
+--- PASS: TestHealObjectCorruptedPools (0.32s)
+=== RUN   TestHealObjectCorruptedXLMeta
+--- PASS: TestHealObjectCorruptedXLMeta (0.24s)
+=== RUN   TestHealObjectCorruptedParts
+--- PASS: TestHealObjectCorruptedParts (0.35s)
+=== RUN   TestHealObjectErasure
+--- PASS: TestHealObjectErasure (0.22s)
+=== RUN   TestHealEmptyDirectoryErasure
+--- PASS: TestHealEmptyDirectoryErasure (0.08s)
+=== RUN   TestHealLastDataShard
+=== RUN   TestHealLastDataShard/4KiB
+=== RUN   TestHealLastDataShard/64KiB
+=== RUN   TestHealLastDataShard/128KiB
+=== RUN   TestHealLastDataShard/1MiB
+=== RUN   TestHealLastDataShard/5MiB
+=== RUN   TestHealLastDataShard/10MiB
+=== RUN   TestHealLastDataShard/5MiB-1KiB
+=== RUN   TestHealLastDataShard/10MiB-1Kib
+--- PASS: TestHealLastDataShard (1.08s)
+    --- PASS: TestHealLastDataShard/4KiB (0.09s)
+    --- PASS: TestHealLastDataShard/64KiB (0.08s)
+    --- PASS: TestHealLastDataShard/128KiB (0.06s)
+    --- PASS: TestHealLastDataShard/1MiB (0.08s)
+    --- PASS: TestHealLastDataShard/5MiB (0.16s)
+    --- PASS: TestHealLastDataShard/10MiB (0.23s)
+    --- PASS: TestHealLastDataShard/5MiB-1KiB (0.17s)
+    --- PASS: TestHealLastDataShard/10MiB-1Kib (0.20s)
 PASS
-ok  	github.com/minio/minio/cmd	(cached)
+ok  	github.com/minio/minio/cmd	3.609s
 ```
 
 ### 5.1 Outcome A — RECONSTRUCT (via the real `HealObject`, EC:2, 1 drive `xl.meta` missing)
@@ -314,7 +368,7 @@ ok  	github.com/minio/minio/cmd	(cached)
 
 ```text
 ==================== BLITZY OUTCOME reconstruct: 1 drive xl.meta MISSING (deep scan, Remove=true) ====================
-BLITZY object presence BEFORE heal: PRESENT (size=1048576, etag=8f293a2f6c19b345152f7a49bb4c643c)
+BLITZY object presence BEFORE heal: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
 BLITZY[reconstruct-1missing] HealObject err = <nil>
 BLITZY[reconstruct-1missing] HealResultItem (JSON) =
 {
@@ -330,25 +384,25 @@ BLITZY[reconstruct-1missing] HealResultItem (JSON) =
   "setCount": 0,
   "before": {
     "drives": [
-      { "uuid": "", "endpoint": "/tmp/minio-4199478986", "state": "missing" },
-      { "uuid": "", "endpoint": "/tmp/minio-1324648754", "state": "ok" },
-      { "uuid": "", "endpoint": "/tmp/minio-2689418314", "state": "ok" },
-      { "uuid": "", "endpoint": "/tmp/minio-2155655378", "state": "ok" }
+      { "uuid": "", "endpoint": "/tmp/minio-1815770780", "state": "missing" },
+      { "uuid": "", "endpoint": "/tmp/minio-2552471093", "state": "ok" },
+      { "uuid": "", "endpoint": "/tmp/minio-3641865182", "state": "ok" },
+      { "uuid": "", "endpoint": "/tmp/minio-3226884936", "state": "ok" }
     ]
   },
   "after": {
     "drives": [
-      { "uuid": "", "endpoint": "/tmp/minio-4199478986", "state": "ok" },
-      { "uuid": "", "endpoint": "/tmp/minio-1324648754", "state": "ok" },
-      { "uuid": "", "endpoint": "/tmp/minio-2689418314", "state": "ok" },
-      { "uuid": "", "endpoint": "/tmp/minio-2155655378", "state": "ok" }
+      { "uuid": "", "endpoint": "/tmp/minio-1815770780", "state": "ok" },
+      { "uuid": "", "endpoint": "/tmp/minio-2552471093", "state": "ok" },
+      { "uuid": "", "endpoint": "/tmp/minio-3641865182", "state": "ok" },
+      { "uuid": "", "endpoint": "/tmp/minio-3226884936", "state": "ok" }
     ]
   },
   "objectSize": 1048576
 }
 BLITZY[reconstruct-1missing] Before.Drives states = "missing" "ok" "ok" "ok"
 BLITZY[reconstruct-1missing] After.Drives  states = "ok" "ok" "ok" "ok"
-BLITZY object presence AFTER  heal: PRESENT (size=1048576, etag=8f293a2f6c19b345152f7a49bb4c643c)
+BLITZY object presence AFTER  heal: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
 ```
 
 **Reading:** `err == nil`; drive 0 transitions `missing → ok`; the object is present with the **same size and ETag** before and after. `disksToHealCount = 1`, `1 > 2` is `false`, so `cannotHeal == false` → reconstruct path [`cmd/erasure-healing.go:428`], rebuilt shard renamed into place and `After[0].State = ok` [`cmd/erasure-healing.go:649-653`].
@@ -391,7 +445,7 @@ BLITZY[leaveasis-pure] err == errErasureReadQuorum ? true
 
 This is the exact return at [`cmd/erasure-object.go:487`] (`return FileInfo{}, errErasureReadQuorum`). Because the function returns **before** the delete loop, no shard is removed — the object is left exactly as found.
 
-A second, operator‑visible flavour of leave‑as‑is: when **all four data shards report corrupt** (only 1 valid, below `dataBlocks=2`) but the metadata copies all agree (so the `quorumETag` override at [`cmd/erasure-healing.go:429-432`] flips `cannotHeal` back to `false` and MinIO *attempts* reconstruction), the rebuild fails for lack of data shards and surfaces the client‑facing read‑quorum error — the object stays in place, neither reconstructed nor purged (full output in §8, sweep case 3).
+A second, operator‑visible flavour of leave‑as‑is: when **three of four data shards are corrupt** (only 1 valid shard, below `dataBlocks=2`) while the metadata copies all agree, `cannotHeal` is `true` [`cmd/erasure-healing.go:428`] and — because the derived `quorumETag` is *empty*, the override at [`cmd/erasure-healing.go:429-433`] does **not** fire — it stays `true`. The object is nonetheless **not** provably dangling (a corrupt part is non‑actionable, so `isObjectDangling` is `false` [`cmd/erasure-healing.go:1008-1009`]), so `deleteIfDangling` returns `errErasureReadQuorum` and the object stays in place — neither reconstructed nor purged. The returned `HealResultItem` then reports all four drives `corrupt` (via `defaultHealResult`'s default mapping [`cmd/erasure-healing.go:820-826`]). Full output and the step‑by‑step mechanism are in §8, sweep case 3.
 
 A third flavour: corrupt **metadata** on 3 of 4 drives yields `errFileCorrupt` and the object is left (not purged):
 
@@ -415,8 +469,7 @@ BLITZY[setlevel-purge] disk 1 xl.meta present BEFORE = false
 BLITZY[setlevel-purge] disk 2 xl.meta present BEFORE = false
 BLITZY[setlevel-purge] disk 3 xl.meta present BEFORE = true
 BLITZY[setlevel-purge] er.HealObject (SET-LEVEL) err = Version not found: blitzysignals/setlevel-purge-3missing(null)
-BLITZY[setlevel-purge] err == errFileNotFound ? false
-BLITZY[setlevel-purge] HealObject err = Version not found: blitzysignals/setlevel-purge-3missing(null)
+BLITZY[setlevel-purge] err.Error() == VersionNotFound form ? true
 BLITZY[setlevel-purge] Before.Drives states = "ok" "ok" "ok" "ok"
 BLITZY[setlevel-purge] After.Drives  states = "ok" "ok" "ok" "ok"
 BLITZY[setlevel-purge] disk 0 xl.meta present AFTER  = false
@@ -425,9 +478,9 @@ BLITZY[setlevel-purge] disk 2 xl.meta present AFTER  = false
 BLITZY[setlevel-purge] disk 3 xl.meta present AFTER  = false
 ```
 
-**Reading:** before heal, disk 3 still held the valid `xl.meta` (the dangling remnant); after heal, **all four disks have no `xl.meta`** — the remnant was physically `DeleteVersion`‑ed. The error is `Version not found` (= `errFileVersionNotFound`), because the empty `versionID` is normalized to `nullVersionID` [`cmd/erasure-healing.go:1062`] and the code returns `errFileVersionNotFound` on a successful dangling delete [`cmd/erasure-healing.go:442-445`].
+**Reading:** before heal, disk 3 still held the valid `xl.meta` (the dangling remnant); after heal, **all four disks have no `xl.meta`** — the remnant was physically `DeleteVersion`‑ed. The returned error is the object‑API **`Version not found:` form** — a `VersionNotFound` wrap of the underlying `errFileVersionNotFound` (a direct `==` comparison to the bare sentinel is therefore `false`; the `err.Error()`‑prefix check above is `true`). The empty `versionID` is normalized to `nullVersionID` [`cmd/erasure-healing.go:1062`], and the code returns `errFileVersionNotFound` on a successful dangling delete [`cmd/erasure-healing.go:442-445`], which the object layer surfaces as this `Version not found:` string.
 
-> **Honesty note on the `Before/After` array for purge:** in the purge path the `errs` slice is reset to `nil` before `defaultHealResult` builds the drive array, so the reported states read `ok`/`ok`/`ok`/`ok` — i.e. the drive‑state array is **not** the purge signal. The authoritative purge signals are (1) the **error return** (`errFileVersionNotFound`/`errFileNotFound`) and (2) the **physical deletion** of the remnant, both shown above.
+> **Honesty note on the `Before/After` array for purge:** in the purge path the `errs` slice is reset to `nil` before `defaultHealResult` builds the drive array, so the reported states read `ok`/`ok`/`ok`/`ok` — i.e. the drive‑state array is **not** the purge signal. The authoritative purge signals are (1) the **error return** (the `Version not found:` / `errFileVersionNotFound` form, or `errFileNotFound` for a non‑versioned object) and (2) the **physical deletion** of the remnant, both shown above.
 
 **Same outcome through the live operator path** (`mc admin heal --json --force`, 3 drives' `xl.meta` removed, `d4` left as the valid remnant). On‑disk before/after and the full unedited heal JSON:
 
@@ -454,13 +507,13 @@ d4: DIR GONE (purged)
 
 The operator‑visible signal is `detail: "Object not found: healbucket2/purge3.bin"` with `objects_healed: 0`, and the on‑disk proof is that `d4` (the authoritative remnant) is **physically removed**. This confirms Q1: **MinIO leaves the object "deleted/degraded" — it does not resurrect a remnant that can never reach quorum.**
 
-> The `mc`‑side `error` string `"Invalid parity shard count/surplus shard count given…"` is the reedsolomon library complaining that a 0‑parity remnant can't be decoded; the *decision* (purge) is carried by `detail: Object not found` plus the deletion, which correspond to the server's `errFileVersionNotFound`/`errFileNotFound` return.
+> **What that `error` field actually is — and is *not*.** The string `Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0` (full text in the JSON above) is **not** produced by the server and is **not** a `reedsolomon` decode error. Verified: the distinctive token `surplusShardsBeforeHeal` appears **nowhere** in the minio server tree, nor in `github.com/klauspost/reedsolomon@v1.12.4` (both `grep` searches return no match); it appears only in the **`mc` client**. It is emitted client‑side while `mc` computes the *display color* for the heal result: `getHColCode` returns `fmt.Errorf("Invalid parity shard count/surplus shard count given")` whenever `parityShards < 1` [`mc/cmd/admin-heal-ui.go:53-55`], and its caller `getObjectHCCChange` wraps that error with `": surplusShardsBeforeHeal: %d, parityShards: %d"` [`mc/cmd/admin-heal-result-item.go:47-48`]. Because the object was **purged**, the server's returned result item carries `parityShards = 0` (`< 1`), so the client's color arithmetic trips this error. The *decision* (purge) is carried instead by `detail: "Object not found: healbucket2/purge3.bin"` plus the physical deletion of `d4` — which correspond to the server's `errFileVersionNotFound`/`errFileNotFound` return.
 
 ---
 
 ## 6. Q3 — Observable decision signals (the `Before` / `After` drive‑state arrays)
 
-The authoritative decision signal returned by the server is the `madmin.HealResultItem`'s per‑drive **`Before.Drives[].State`** vs. **`After.Drives[].State`** arrays. Values are exactly the four `madmin.DriveState*` constants, serialized lowercase: **`ok`**, **`missing`**, **`corrupt`**, **`offline`** (`madmin-go/v3/heal-commands.go`). They are assembled by the classifier in §4, Step 1 [`cmd/erasure-healing.go:383-404`].
+The authoritative decision signal returned by the server is the `madmin.HealResultItem`'s per‑drive **`Before.Drives[].State`** vs. **`After.Drives[].State`** arrays. The per‑object erasure‑heal classifier emits **four** state constants, serialized lowercase: **`ok`**, **`missing`**, **`corrupt`**, **`offline`**. (`madmin` actually defines **nine** `DriveState*` constants [`madmin-go/v3/heal-commands.go:120-128`]: the four above plus `permission-denied`, `faulty`, `root-mount`, `unknown`, and `unformatted`. Those other five are used elsewhere in admin/disk reporting but are **not** produced by this per‑object shard classifier — a `grep` of `cmd/erasure-healing.go` finds only `DriveStateOk`, `DriveStateMissing`, `DriveStateCorrupt`, and `DriveStateOffline`.) They are assembled by the classifier in §4, Step 1 [`cmd/erasure-healing.go:383-404`].
 
 **For a healed (reconstructed) object, the transition is `missing`/`corrupt` → `ok`.** Observed (EC:2 scratch, 1 missing shard, from §5.1):
 
@@ -476,12 +529,89 @@ BLITZY[reconstruct-2missing] Before.Drives states = "missing" "missing" "ok" "ok
 BLITZY[reconstruct-2missing] After.Drives  states = "ok" "ok" "ok" "ok"
 ```
 
-Live, the same signal appears in the JSON `before`/`after` `drives[].state` fields, and `mc` additionally computes a summary `color`/`online`/`missing`/`corrupted` header **client‑side** from those states:
+**And for a `corrupt` (not merely `missing`) shard, the transition is `corrupt` → `ok`.** To exercise the classifier's `default` branch [`cmd/erasure-healing.go:390-392`] — the one that produces `corrupt` rather than `missing` — I corrupted **one** drive's `xl.meta` with junk bytes using the canonical technique from `TestHealObjectCorruptedXLMeta` [`cmd/erasure-healing_test.go:1253`], `firstDisk.WriteAll(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), []byte("abcd"))`, leaving the other three drives intact. Because `disksToHealCount = 1 ≤ parity = 2`, `cannotHeal == false` and the object is reconstructed. Observed through the **real** `er.HealObject` entry (deep scan, `Remove=true`) — full unedited `HealResultItem`:
+
+```text
+==================== BLITZY Q3 Corrupt->Ok: 1 drive CORRUPT xl.meta (junk), 3 intact (deep scan, Remove=true) ====================
+BLITZY object presence BEFORE heal: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
+BLITZY[corrupt-1xlmeta] HealObject err = <nil>
+BLITZY[corrupt-1xlmeta] HealResultItem (JSON) =
+{
+  "resultId": 0,
+  "type": "object",
+  "bucket": "blitzycorrupt",
+  "object": "corrupt-1xlmeta",
+  "versionId": "null",
+  "detail": "",
+  "parityBlocks": 2,
+  "dataBlocks": 2,
+  "diskCount": 4,
+  "setCount": 0,
+  "before": {
+    "drives": [
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-3404828048",
+        "state": "corrupt"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-2545624221",
+        "state": "ok"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-797473030",
+        "state": "ok"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-2166782108",
+        "state": "ok"
+      }
+    ]
+  },
+  "after": {
+    "drives": [
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-3404828048",
+        "state": "ok"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-2545624221",
+        "state": "ok"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-797473030",
+        "state": "ok"
+      },
+      {
+        "uuid": "",
+        "endpoint": "/tmp/minio-2166782108",
+        "state": "ok"
+      }
+    ]
+  },
+  "objectSize": 1048576
+}
+BLITZY[corrupt-1xlmeta] Before.Drives states = "corrupt" "ok" "ok" "ok"
+BLITZY[corrupt-1xlmeta] After.Drives  states = "ok" "ok" "ok" "ok"
+BLITZY object presence AFTER  heal: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
+```
+
+**Reading:** the tampered drive is classified **`corrupt`** in `Before` — *not* `missing` — which confirms it took the `default` classifier branch [`cmd/erasure-healing.go:390-392`] (a junk `xl.meta` fails to decode and does not match any of the `missing`‑list errors). The heal returns `err = <nil>`, `After` shows all four drives **`ok`**, and the object stays `PRESENT` with an unchanged size and ETag (`b561f87202d04959e37588ee05cf5b10`) — the observed **`corrupt` → `ok`** transition. (The `/tmp/minio-*` endpoints in this item are a fresh set of `os.MkdirTemp` paths from a separate capture run; per §13 the temp‑dir endpoints and random version IDs vary between independent runs while the decision fields — states, `err`, parity/data blocks, ETag — do not.)
+
+Live, the same signal appears in the JSON `before`/`after` `drives[].state` fields, and `mc` additionally computes a summary `color`/`online`/`missing`/`corrupted` header **client‑side** from those states. This is the same full object‑heal item shown verbatim in §5.1 (`healbucket2/recon3.bin`, 1 drive `xl.meta` removed), with all four drives listed (no field elided):
 
 ```json
-"before":{"color":"yellow","online":3,"missing":1,"corrupted":0,"drives":[{"endpoint":"/tmp/d1","state":"missing"}, …]}
-"after": {"color":"green","online":4,"missing":0,"corrupted":0,"drives":[{"endpoint":"/tmp/d1","state":"ok"}, …]}
+"before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/d1","state":"missing"},{"uuid":"","endpoint":"/tmp/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/d4","state":"ok"}]}
+"after": {"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/d4","state":"ok"}]}
 ```
+
+The per‑drive `state` goes `missing → ok` on `/tmp/d1`; `mc`'s client‑side summary header goes `color: yellow (online 3, missing 1) → color: green (online 4, missing 0)`. (Independently reproduced this session on a second live instance — see §13.)
 
 **How each state is produced** (all in the classifier switch [`cmd/erasure-healing.go:383-394`]):
 
@@ -557,7 +687,7 @@ Captured live via an audit webhook during the purge of `purge3.bin` (full, unedi
 
 | Tag | Observed value | Meaning / source |
 |---|---|---|
-| `caller` | `…/cmd/erasure-healing.go:309` | `runtime.Caller(1)` [`cmd/erasure-object.go:526-528`] — proves this purge took the **early quorum‑failure path** [`cmd/erasure-healing.go:309`], not the main `cannotHeal` branch at L438. (3 missing metas < read quorum 2 ⇒ `objectQuorumFromMeta` errored ⇒ early `deleteIfDangling`.) |
+| `caller` | `/tmp/blitzy/minio/blitzy-629729d3-cb15-4820-bb3e-f65517d9c2ea_444e13/cmd/erasure-healing.go:309` | `runtime.Caller(1)` [`cmd/erasure-object.go:526-528`] — proves this purge took the **early quorum‑failure path** [`cmd/erasure-healing.go:309`], not the main `cannotHeal` branch at L438. (Only one valid metadata copy remains, which is below read quorum 2 ⇒ `objectQuorumFromMeta` errored ⇒ early `deleteIfDangling`.) |
 | `d:p` | `2:2` | `fmt.Sprintf("%d:%d", m.Erasure.DataBlocks, m.Erasure.ParityBlocks)` [`cmd/erasure-object.go:497`] — the object's **data:parity ratio = EC:2**, confirming the config *in the audit trail itself*. |
 | `ddisk-0`, `ddisk-1`, `ddisk-2` | `file version not found` | per‑disk `DeleteVersion` result from the delete loop [`cmd/erasure-object.go:551-560`] — those drives had nothing to delete (their metadata was already gone). |
 | `ddisk-3` | `<nil>` | disk 3 held the valid remnant; its `DeleteVersion` **succeeded** (nil error) — this is the shard that was actually purged. |
@@ -567,7 +697,9 @@ Captured live via an audit webhook during the purge of `purge3.bin` (full, unedi
 | `derrs` | `map[]` | `fmt.Sprintf("%v", dataErrsByPart)` [`cmd/erasure-object.go:493`]; empty because the early path passes `dataErrsByPart = nil` [`cmd/erasure-healing.go:309`]. |
 | `merrs` | `` (empty) | `joinErrs(errs)` [`cmd/erasure-object.go:492`]. **Observed empty** — and this is a genuine source bug, confirmed at runtime: `joinErrs` iterates `for i := range s` over its *empty local string* `s` instead of over `errs`, so it always returns `""` [`cmd/erasure-object.go`]. Reported here as observed, not paraphrased. |
 
-The `caller`, `d:p`, and per‑disk `ddisk-*` tags together answer *why* the object was purged: parity is 2, three of four metadata copies were unrecoverable (below read quorum), so the object could never reach quorum and the sole remnant was deleted.
+**Why there is no `offline` tag in this event.** The `offline` tag is emitted **conditionally**: `deleteIfDangling` counts the disks reporting `errDiskNotFound` (or a part `checkPartDiskNotFound`) and adds the tag only `if offline > 0` [`cmd/erasure-object.go:503-524`]. In this capture all four drives were **online** (`admin info` reported "4 drives online, 0 drives offline"), so `offline == 0` and the tag is **legitimately absent** — and that absence is itself informative: it shows the purge was driven by *missing metadata*, not by offline drives. (The complete tag vocabulary `deleteIfDangling` can emit is `set`, `pool`, `merrs`, `derrs`, then either `sz`/`mt`/`d:p` for a valid `FileInfo` or `invalid`+`d:p` otherwise, the conditional `offline`, and `caller` [`cmd/erasure-object.go:489-528`].)
+
+The `caller`, `d:p`, and per‑disk `ddisk-*` tags together answer *why* the object was purged: parity is 2, and only one of the four metadata copies remained readable — which is below read quorum 2 — so the object could never reach quorum and the sole remnant was deleted.
 
 **Heal trace** (`mc admin trace --call healing --json`) captures the per‑object heal invocation itself, emitted via `healTrace → madmin.TraceHealing` [`cmd/erasure-healing.go:1090`] (full, unedited):
 
@@ -585,39 +717,50 @@ Here `type:"Healing"`, `api:"heal.Object"`, `extra.disks:"4"`, and `extra.mode:"
 
 **Answer: at least `dataBlocks` intact shards — i.e. 2 for EC:2 — equivalently, healing succeeds while `disksToHealCount ≤ parityBlocks` (2) and fails once `disksToHealCount > parityBlocks`** [`cmd/erasure-healing.go:428`]. Demonstrated by sweeping the number of *corrupted data shards* from 1 → 3 (metadata intact on all four, deep scan, `Remove=true`), full unedited output per case:
 
-**Sweep case 1 — 1 corrupt (3 valid) → RECONSTRUCT:**
+**Sweep case 1 — 1 corrupt (3 valid) → RECONSTRUCT** (the `DRYRUN classifier` line is a dry‑run `HealObject` that returns immediately after the drive‑state classifier [`cmd/erasure-healing.go:424`], so it shows exactly what the classifier saw *before* any repair — the ground‑truth count of surviving shards):
 
 ```text
 ==================== BLITZY SWEEP: 1 of 4 data shards CORRUPT (valid shards=3, parity=2, deep scan) ====================
-BLITZY[sweep-1] presence BEFORE: PRESENT (size=1048576, etag=26e2437d8c01f4bceded84f9309ac88f)
+BLITZY[sweep-1] presence BEFORE: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
+BLITZY[sweep-1] DRYRUN classifier states (valid=ok) = "missing" "ok" "ok" "ok"
 BLITZY[sweep-1] HealObject err = <nil>
 BLITZY[sweep-1] Before.Drives states = "missing" "ok" "ok" "ok"
 BLITZY[sweep-1] After.Drives  states = "ok" "ok" "ok" "ok"
+BLITZY[sweep-1] presence AFTER : PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
 ```
 
 **Sweep case 2 — 2 corrupt (2 valid = the boundary) → RECONSTRUCT:**
 
 ```text
 ==================== BLITZY SWEEP: 2 of 4 data shards CORRUPT (valid shards=2, parity=2, deep scan) ====================
-BLITZY[sweep-2] presence BEFORE: PRESENT (size=1048576, etag=26e2437d8c01f4bceded84f9309ac88f)
+BLITZY[sweep-2] presence BEFORE: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
+BLITZY[sweep-2] DRYRUN classifier states (valid=ok) = "missing" "missing" "ok" "ok"
 BLITZY[sweep-2] HealObject err = <nil>
 BLITZY[sweep-2] Before.Drives states = "missing" "missing" "ok" "ok"
 BLITZY[sweep-2] After.Drives  states = "ok" "ok" "ok" "ok"
-BLITZY[sweep-2] presence AFTER : PRESENT (size=1048576, etag=26e2437d8c01f4bceded84f9309ac88f)
+BLITZY[sweep-2] presence AFTER : PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
 ```
 
 **Sweep case 3 — 3 corrupt (only 1 valid, below `dataBlocks=2`) → CANNOT HEAL (object left in place):**
 
 ```text
 ==================== BLITZY SWEEP: 3 of 4 data shards CORRUPT (valid shards=1, parity=2, deep scan) ====================
-BLITZY[sweep-3] presence BEFORE: PRESENT (size=1048576, etag=26e2437d8c01f4bceded84f9309ac88f)
+BLITZY[sweep-3] presence BEFORE: PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
+BLITZY[sweep-3] DRYRUN classifier states (valid=ok) = "missing" "missing" "missing" "ok"
 BLITZY[sweep-3] HealObject err = Storage resources are insufficient for the read operation blitzysweep/sweep-3corrupt
 BLITZY[sweep-3] Before.Drives states = "corrupt" "corrupt" "corrupt" "corrupt"
 BLITZY[sweep-3] After.Drives  states = "corrupt" "corrupt" "corrupt" "corrupt"
-BLITZY[sweep-3] presence AFTER : PRESENT (size=1048576, etag=26e2437d8c01f4bceded84f9309ac88f)
+BLITZY[sweep-3] presence AFTER : PRESENT (size=1048576, etag=b561f87202d04959e37588ee05cf5b10)
 ```
 
-**The boundary is exactly at 2 valid shards:** 3 or 2 valid → reconstruct; 1 valid → cannot heal. This is precisely `disksToHealCount > parityBlocks` (`2 > 2` is false → heal; `3 > 2` is true → cannot). In case 3 the object is **left in place** (still present, same ETag) — a leave‑as‑is outcome surfaced as the client‑facing `InsufficientReadQuorum` error, because all metadata agreed so the `quorumETag` override attempted a rebuild that then failed for lack of data shards.
+**Reading case 3 — why the `DRYRUN classifier` line shows exactly one valid shard, yet the final `Before`/`After` arrays report all four drives `corrupt`.** These two views are *not* contradictory; together they are the boundary proof, and each is grounded in a distinct code path:
+
+- The **dry‑run classifier** view (`"missing" "missing" "missing" "ok"`) is the ground truth of surviving shards: the three corrupted data parts are classified as needing heal, the one intact drive as `ok`. Exactly **1 valid shard** remains — below `dataBlocks = 2` — so `disksToHealCount (3) > parityBlocks (2)` and `cannotHeal` is `true` [`cmd/erasure-healing.go:428`].
+- All four **metadata** copies are intact and agree, so `objectQuorumFromMeta` succeeds (`readQuorum = 2`); but the derived `quorumETag` is **empty**, so the override that could flip `cannotHeal` back to `false` does **not** fire [`cmd/erasure-healing.go:429-433`] — `cannotHeal` stays `true`.
+- The object is **not provably dangling**: a *corrupt* part is not the same as a *missing* one, so it is counted non‑actionable and `isObjectDangling` returns `false` [`cmd/erasure-healing.go:1008-1009`]. The `cannotHeal` branch therefore calls `deleteIfDangling`, which — finding the object not dangling — returns `errErasureReadQuorum` **without deleting anything** [`cmd/erasure-object.go:483,487`]. The object is **left in place** (presence AFTER = PRESENT, same ETag) — a leave‑as‑is outcome surfaced to the client as `InsufficientReadQuorum` (the `Storage resources are insufficient for the read operation blitzysweep/sweep-3corrupt` message shown verbatim in the block above).
+- The **final** `HealResultItem` reports every drive `corrupt` because `defaultHealResult` derives each drive's reported state from its per‑drive error: `nil → ok`, `errFileNotFound`/`errVolumeNotFound → missing`, and *everything else* (here `errErasureReadQuorum`, stamped on all four drives by the leave‑as‑is path) `→ corrupt` [`cmd/erasure-healing.go:820-826`]. That is why the ground‑truth "1 valid" (dry‑run) and the result "all four corrupt" (final) are both correct and consistent.
+
+**The boundary is exactly at 2 valid shards:** 3 or 2 valid → reconstruct; 1 valid → cannot heal. This is precisely `disksToHealCount > parityBlocks` (`2 > 2` is false → heal; `3 > 2` is true → cannot).
 
 Documentation corroboration (supplementing the runtime evidence): MinIO states "There must be an intact parity shard available for each lost or damaged data shard, otherwise the object cannot be recovered" — the documentary statement of the same `disksToHealCount > parityBlocks` cutoff.
 
@@ -698,54 +841,124 @@ whereas the set‑level `er.HealObject` returns the populated result and the `Ve
 
 ## 10. Q7 — Boundary C: does behavior differ between a partial *write* and a partial *delete*?
 
-**Yes.** The divergence lives in `isObjectDangling` [`cmd/erasure-healing.go:968`], which takes a **different arithmetic branch for a delete‑marker (partial delete) than for a normal data object (partial write)**:
+**Yes — and the difference is proven below through the real `er.HealObject` entry point, not merely inferred.** Two things differ between a partial *write* (a normal data object) and a partial *delete* (a delete‑marker):
+
+1. **The recovery action differs.** A recoverable *normal object* is **reconstructed** — missing/corrupt data shards are rebuilt from parity (Outcome A, §5.1). A recoverable *delete‑marker* has no data parts, so healing simply **propagates the marker metadata** to the drives missing it. Beyond the recoverable threshold, **both** are purged.
+2. **The dangling test uses different arithmetic.** `isObjectDangling` [`cmd/erasure-healing.go:968`] takes a **meta‑only** branch for a delete‑marker versus a **meta‑and‑parts** branch for a normal object (shown after the runtime proof).
+
+### 10.1 Runtime proof through the real `HealObject` path
+
+All three scenarios below call `er.HealObject(ctx, bucket, object, versionID, madmin.HealOpts{ScanMode: HealDeepScan, Remove: true})` — the same `erasureObjects.HealObject` [`cmd/erasure-healing.go:1039`] that `mc admin heal` reaches (§12) — after inducing the remnant on a canonical EC:2 set. Full unedited output:
+
+**W — partial WRITE (normal object, `Deleted=false`), 3 of 4 `xl.meta` missing (beyond parity) ⇒ PURGED:**
+
+```text
+==================== BLITZY Q7-W partial WRITE (normal object, 3 xl.meta missing) via REAL er.HealObject ====================
+BLITZY[q7-write] latest meta Deleted (delete-marker?) = false (false => WRITE/data object)
+BLITZY[q7-write] disk 0 xl.meta present BEFORE = false
+BLITZY[q7-write] disk 1 xl.meta present BEFORE = false
+BLITZY[q7-write] disk 2 xl.meta present BEFORE = false
+BLITZY[q7-write] disk 3 xl.meta present BEFORE = true
+BLITZY[q7-write] REAL er.HealObject err = Version not found: blitzyq7/q7-write-3missing(null)
+BLITZY[q7-write] Before.Drives states = "ok" "ok" "ok" "ok"
+BLITZY[q7-write] disk 0 xl.meta present AFTER  = false
+BLITZY[q7-write] disk 1 xl.meta present AFTER  = false
+BLITZY[q7-write] disk 2 xl.meta present AFTER  = false
+BLITZY[q7-write] disk 3 xl.meta present AFTER  = false
+BLITZY[q7-write] presence AFTER = ABSENT (GetObjectInfo err = Object not found: blitzyq7/q7-write-3missing)
+```
+
+The surviving metadata is a normal data object (`Deleted=false`); with 3 of 4 `xl.meta` gone the object is dangling via the **normal‑object** branch, so `HealObject` purges the last remnant (disk 3 `xl.meta` goes `true → false`) and returns the null‑version `Version not found:` form (`Version not found: blitzyq7/q7-write-3missing(null)`, shown verbatim above); the object is subsequently `ABSENT`.
+
+**D — partial DELETE (delete‑marker as the sole surviving version, `Deleted=true`), 3 of 4 `xl.meta` missing (beyond threshold) ⇒ PURGED:**
+
+```text
+==================== BLITZY Q7-D partial DELETE (delete-marker sole version, 3 xl.meta missing) via REAL er.HealObject ====================
+BLITZY[q7-delete] delete-marker version=7563045e-bd19-4296-9cb7-31353720b17f DeleteMarker=true
+BLITZY[q7-delete] healed version meta Deleted (delete-marker?) = true (true => DELETE branch)
+BLITZY[q7-delete] disk 0 xl.meta present BEFORE = false
+BLITZY[q7-delete] disk 1 xl.meta present BEFORE = false
+BLITZY[q7-delete] disk 2 xl.meta present BEFORE = false
+BLITZY[q7-delete] disk 3 xl.meta present BEFORE = true
+BLITZY[q7-delete] REAL er.HealObject(delete-marker version) err = Version not found: blitzyq7/q7-delete-marker(7563045e-bd19-4296-9cb7-31353720b17f)
+BLITZY[q7-delete] Before.Drives states = "ok" "ok" "ok" "ok"
+BLITZY[q7-delete] disk 0 xl.meta present AFTER  = false
+BLITZY[q7-delete] disk 1 xl.meta present AFTER  = false
+BLITZY[q7-delete] disk 2 xl.meta present AFTER  = false
+BLITZY[q7-delete] disk 3 xl.meta present AFTER  = false
+```
+
+Here the surviving metadata's latest version is a **delete‑marker** (`Deleted=true`); with 3 of 4 copies gone it is dangling via the **meta‑only** branch, so `HealObject` purges the remnant marker (disk 3 `true → false`) and returns the versioned `Version not found:` form carrying the delete‑marker's version id (`Version not found: blitzyq7/q7-delete-marker(7563045e-bd19-4296-9cb7-31353720b17f)`, shown verbatim above).
+
+**D2 — partial DELETE that is *recoverable* (delete‑marker, only 1 of 4 `xl.meta` missing) ⇒ PROPAGATED (healed), not purged:**
+
+```text
+==================== BLITZY Q7-D2 partial DELETE that HEALS (delete-marker, only 1 xl.meta missing) ====================
+BLITZY[q7-delete-heal] delete-marker version=af203e3b-93f3-4728-89e4-b9177b383f78
+BLITZY[q7-delete-heal] disk 0 xl.meta present BEFORE = false
+BLITZY[q7-delete-heal] REAL er.HealObject err = <nil>
+BLITZY[q7-delete-heal] Before.Drives states = "missing" "ok" "ok" "ok"
+BLITZY[q7-delete-heal] After.Drives  states = "ok" "ok" "ok" "ok"
+BLITZY[q7-delete-heal] disk 0 xl.meta present AFTER  = true (true => delete-marker PROPAGATED/healed)
+```
+
+This is the behavioral contrast: a delete‑marker within the recoverable threshold is **propagated** (its `xl.meta` is written back to the drive that was missing it — disk 0 `false → true`, `Before "missing" → After "ok"`, `err=nil`) rather than reconstructed from parity, because a marker carries no data shards. The analogous *normal‑object* case within parity reconstructs data shards instead (Outcome A, §5.1).
+
+### 10.2 The mechanism behind the divergence — `isObjectDangling` arithmetic
+
+The dangling test that drives both purge decisions above lives in `isObjectDangling` [`cmd/erasure-healing.go:968`] and branches on `validMeta.Deleted`:
 
 ```go
-// cmd/erasure-healing.go:1008-1035
-if nonActionableMetaErrs > 0 || nonActionablePartsErrs > 0 {
-	return validMeta, false                                  // leave-as-is (undecidable)
-}
+// cmd/erasure-healing.go:1008-1036 (verbatim)
+	if nonActionableMetaErrs > 0 || nonActionablePartsErrs > 0 {
+		return validMeta, false
+	}
 
-if validMeta.Deleted {
-	// notFoundPartsErrs is ignored since
-	// - delete marker does not have any parts
-	dataBlocks := (len(errs) + 1) / 2
-	return validMeta, notFoundMetaErrs > dataBlocks          // DELETE-MARKER branch (meta-only)
-}
+	if validMeta.Deleted {
+		// notFoundPartsErrs is ignored since
+		// - delete marker does not have any parts
+		dataBlocks := (len(errs) + 1) / 2
+		return validMeta, notFoundMetaErrs > dataBlocks
+	}
 
-// TODO: It is possible to replay the object via just single
-// xl.meta file, considering quorum number of data-dirs are still
-// present on other drives.
-//
-// However this requires a bit of a rewrite, leave this up for
-// future work.
-if notFoundMetaErrs > 0 && notFoundMetaErrs > validMeta.Erasure.ParityBlocks {
-	return validMeta, true                                   // normal object: metadata beyond parity
-}
+	// TODO: It is possible to replay the object via just single
+	// xl.meta file, considering quorum number of data-dirs are still
+	// present on other drives.
+	//
+	// However this requires a bit of a rewrite, leave this up for
+	// future work.
+	if notFoundMetaErrs > 0 && notFoundMetaErrs > validMeta.Erasure.ParityBlocks {
+		// All xl.meta is beyond parity blocks missing, this is dangling
+		return validMeta, true
+	}
 
-if !validMeta.IsRemote() && notFoundPartsErrs > 0 && notFoundPartsErrs > validMeta.Erasure.ParityBlocks {
-	return validMeta, true                                   // normal object: DATA parts beyond parity
-}
+	if !validMeta.IsRemote() && notFoundPartsErrs > 0 && notFoundPartsErrs > validMeta.Erasure.ParityBlocks {
+		// All data-dir is beyond parity blocks missing, this is dangling
+		return validMeta, true
+	}
 
-return validMeta, false
+	return validMeta, false
+}
 ```
+
+Annotating the branches (each mapped to a scenario above): the first `return validMeta, false` is the **undecidable / leave‑as‑is** guard; the `validMeta.Deleted` block is the **delete‑marker (meta‑only)** branch (scenario **D**); the `notFoundMetaErrs > ParityBlocks` block is the **normal‑object metadata‑beyond‑parity** branch (scenario **W**); the `notFoundPartsErrs > ParityBlocks` block is the **normal‑object data‑parts‑beyond‑parity** branch (case **[C]**).
 
 - **Partial delete (delete‑marker):** the `validMeta.Deleted` branch [`cmd/erasure-healing.go:1012-1017`] uses a threshold of `dataBlocks = (len(errs)+1)/2` and **ignores part errors entirely** (a delete marker has no data parts).
 - **Partial write (normal data object):** the object is dangling if *either* metadata errors exceed parity [`cmd/erasure-healing.go:1025`] *or* data‑part errors exceed parity [`cmd/erasure-healing.go:1030`] — it checks **both** meta and parts against `ParityBlocks`.
 
-Exercised directly against `isObjectDangling` on a clean EC:2 `FileInfo` (parity = 2), full unedited output:
+Exercised directly against `isObjectDangling` on a clean EC:2 `FileInfo` (parity = 2) as a supporting cross‑check of the branch arithmetic, full unedited output:
 
 ```text
-==================== BLITZY Q7 write-vs-delete: isObjectDangling divergence (EC:2, parity=2) ====================
-BLITZY[A normal-obj, 3 xl.meta missing]  parity=2  meta-threshold=parity(2)  => dangling=true (validMeta.Deleted=false)
-BLITZY[B delete-marker, 3 xl.meta missing] meta-only branch  dataBlocks=(len(errs)+1)/2=2  => dangling=true (validMeta.Deleted=true)
-BLITZY[C normal-obj, parts missing on 3/4, meta intact] parts-threshold=parity(2) => dangling=true (validMeta.Deleted=false)
-BLITZY note: delete-marker branch IGNORES part errors (delete markers have no parts); normal-object path checks BOTH meta AND part errors vs parity.
+==================== BLITZY Q7 supporting: isObjectDangling arithmetic (EC:2, parity=2) ====================
+BLITZY[A normal-obj, 3 xl.meta missing]  parity=2 meta-threshold=parity => dangling=true (Deleted=false)
+BLITZY[B delete-marker, 3 xl.meta missing] meta-only branch (len(errs)+1)/2=2 => dangling=true (Deleted=true)
+BLITZY[C normal-obj, parts notFound 3/4, meta intact] parts-threshold=parity => dangling=true (Deleted=false)
+BLITZY note: delete-marker branch IGNORES part errors (markers have no parts); normal-object path checks BOTH meta AND part errors vs parity.
 ```
 
 **Reading the three cases:**
-- **[A]** a partially‑written *normal object* with 3/4 `xl.meta` missing is dangling because `notFoundMetaErrs(3) > parity(2)` [`cmd/erasure-healing.go:1025`]; `validMeta.Deleted == false`.
-- **[B]** a partial *delete* (a *delete‑marker* present on only 1/4 drives, missing on 3) is dangling via the **meta‑only** branch with threshold `(len(errs)+1)/2 = 2` and **no** part accounting; `validMeta.Deleted == true`.
+- **[A]** a partially‑written *normal object* with 3/4 `xl.meta` missing is dangling because `notFoundMetaErrs(3) > parity(2)` [`cmd/erasure-healing.go:1025`]; `validMeta.Deleted == false`. (This is the arithmetic behind scenario **W** above.)
+- **[B]** a partial *delete* (a *delete‑marker* missing on 3/4 drives) is dangling via the **meta‑only** branch with threshold `(len(errs)+1)/2 = 2` and **no** part accounting; `validMeta.Deleted == true`. (This is the arithmetic behind scenario **D** above.)
 - **[C]** a partially‑written normal object whose *metadata is intact* but whose *data parts* are missing on 3/4 drives is dangling via the **parts** branch `notFoundPartsErrs(3) > parity(2)` [`cmd/erasure-healing.go:1030`] — a check that does **not** exist for delete markers.
 
 This is corroborated by the shipped `TestIsObjectDangling` (which uses `newFileInfo(_, 2, 2)` = **exact EC:2**) — its subcases include a normal‑object dangling case, a **delete‑marker** case, and part‑missing cases, all passing:
@@ -758,11 +971,76 @@ This is corroborated by the shipped `TestIsObjectDangling` (which uses `newFileI
 --- PASS: TestIsObjectDangling/FileInfoUnDecided-case5-(ignore_errFileCorrupt_error) (0.00s)
 ```
 
-So the **decision mechanism** (dangling ⇒ purge, non‑dangling ⇒ leave‑as‑is) is the same for writes and deletes, but the **dangling test itself uses different arithmetic**: a delete‑marker is judged on metadata copies alone, whereas a data object is judged on metadata *and* data parts against parity.
+So the **decision mechanism** (dangling ⇒ purge, non‑dangling ⇒ reconstruct/propagate) is the same for writes and deletes, but the two differ in **what healing does when recoverable** (a normal object reconstructs data shards; a delete‑marker propagates its metadata — scenario **D2**) and in the **dangling arithmetic** (a delete‑marker is judged on metadata copies alone, whereas a data object is judged on metadata *and* data parts against parity — scenarios **W**/**D**/[C]).
 
 ---
 
-## 11. Entry points — when the same `healObject` decision is reached
+## 11. Additional conditions exercised — scan mode (`HealNormalScan` vs `HealDeepScan`) and the `Remove` flag
+
+The decision above was also exercised across the two `madmin.HealOpts` modifiers the investigation is required to cover — the **scan mode** and the **`Remove` flag** — to show how each does (or does not) change what heal observes and does. Both were driven through the real `er.HealObject` path [`cmd/erasure-healing.go:1039`].
+
+### 11.1 Scan mode — `HealNormalScan` misses silent (same‑size) content corruption; `HealDeepScan` catches it
+
+To isolate the scan modes, a single data part was corrupted **in place with same‑size garbage** (byte length preserved), then the object was healed once under each mode. Full unedited output:
+
+```text
+==================== BLITZY R5 scan-mode: NormalScan vs DeepScan on a SAME-SIZE (content-only) corrupt data part ====================
+BLITZY[r5-normal] HealNormalScan err=<nil> Before="ok" "ok" "ok" "ok" After="ok" "ok" "ok" "ok"
+BLITZY[r5-deep]   HealDeepScan   err=<nil> Before="missing" "ok" "ok" "ok" After="ok" "ok" "ok" "ok"
+```
+
+**Why they differ, at `file:line`.** `disksWithAllParts` [`cmd/erasure-healing-common.go:291`] branches on the scan mode when it inspects each part:
+
+```go
+// cmd/erasure-healing-common.go:418-425
+		switch scanMode {
+		case madmin.HealDeepScan:
+			// disk has a valid xl.meta but may not have all the
+			// parts. This is considered an outdated disk, since
+			// it needs healing too.
+			verifyResp, verifyErr = onlineDisk.VerifyFile(ctx, bucket, object, meta)
+		default:
+			verifyResp, verifyErr = onlineDisk.CheckParts(ctx, bucket, object, meta)
+```
+
+- `HealNormalScan` (the `default` branch) calls `onlineDisk.CheckParts` [`cmd/erasure-healing-common.go:425`], which checks only that each part **exists with the expected size** — it does *not* hash the content. A same‑size overwrite passes, so no drive is flagged and `Before` reads `"ok" "ok" "ok" "ok"` (the corruption is **undetected** — heal is a no‑op, `err=<nil>`).
+- `HealDeepScan` calls `onlineDisk.VerifyFile` [`cmd/erasure-healing-common.go:423`], which **bitrot‑verifies** the part content against its stored HighwayHash checksum. The tampered part fails verification → `checkPartFileCorrupt` → `shouldHealObjectOnDisk` returns `errPartMissingOrCorrupt` [`cmd/erasure-healing.go:156`, string at `:152`], so that drive is classified `missing` in `Before` and then rebuilt (`After` = all `ok`).
+
+This is the runtime basis for the documented fact that MinIO does not bit‑rot‑check via the ordinary scanner by default — only a deep scan (or an on‑the‑fly GET/HEAD read) detects silent content rot. The heal path also **self‑escalates**: if a normal scan hits `errFileCorrupt`, `HealObject` retries with `HealDeepScan` [`cmd/erasure-healing.go:1080-1083`].
+
+### 11.2 The `Remove` flag does **not** gate the dangling‑object purge
+
+It is natural to assume `Remove: true` is required before heal will delete a dangling remnant. For a dangling *object* that is **not** what the code does. The same genuinely‑dangling remnant (a normal object with 3 of 4 `xl.meta` missing) was healed once with `Remove: false` and once with `Remove: true`. Full unedited output:
+
+```text
+==================== BLITZY R5 Remove flag: false vs true on a dangling (3 xl.meta missing) NORMAL-object remnant ====================
+BLITZY[r5-remove-false] disk 3 xl.meta present BEFORE = true
+BLITZY[r5-remove-false] HealObject err=Version not found: blitzyremove/remove-false(null)
+BLITZY[r5-remove-false] Before="ok" "ok" "ok" "ok" After="ok" "ok" "ok" "ok"
+BLITZY[r5-remove-false] disk 3 xl.meta present AFTER  = false (dangling purge is NOT gated by Remove)
+BLITZY[r5-remove-true]  disk 3 xl.meta present BEFORE = true
+BLITZY[r5-remove-true]  HealObject err=Version not found: blitzyremove/remove-true(null)
+BLITZY[r5-remove-true]  Before="ok" "ok" "ok" "ok" After="ok" "ok" "ok" "ok"
+BLITZY[r5-remove-true]  disk 3 xl.meta present AFTER  = false (dangling remnant purged)
+```
+
+**Both** runs purged the surviving remnant (disk 3 `xl.meta` `true → false`) and **both** returned the same `Version not found:` error. Grounded in source: the `cannotHeal` branch calls `deleteIfDangling` with a **freshly‑constructed** `ObjectOptions{VersionID: versionID}` — `opts.Remove` is **not forwarded**:
+
+```go
+// cmd/erasure-healing.go:438-441
+		m, err := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, dataErrsByPart, ObjectOptions{
+			VersionID: versionID,
+		})
+		errs = make([]error, len(errs))
+```
+
+`deleteIfDangling`, once `isObjectDangling` is true, unconditionally issues `DeleteVersion` on every disk [`cmd/erasure-object.go:483`]. What `opts.Remove` *actually* gates is the removal of **abandoned/stray parts** in `checkAbandonedParts` [`cmd/erasure-healing.go:663`] and empty‑directory healing via `healObjectDir` [`cmd/erasure-healing.go:1053`] — not the dangling‑object purge.
+
+**Reading the all‑`ok` drive arrays for a purge (an honesty note).** The `Before`/`After` arrays print `"ok" "ok" "ok" "ok"` even though three `xl.meta` copies were missing, because the purge branch **resets `errs` to a fresh all‑`nil` slice** (`errs = make([]error, len(errs))`, line 441 above) *before* returning `defaultHealResult`, which then renders every drive `ok` (the `nil → ok` mapping of §8). For this purge case the decisive evidence is therefore **not** the drive‑state array but (a) the on‑disk `xl.meta` going `true → false` on the surviving drive and (b) the `Version not found:` return. The empty versionID is normalized to the `null` version [`cmd/erasure-healing.go:1061`], which is why the error prints `(null)`; `toObjectErr` wraps the internal `errFileVersionNotFound` into the client‑facing `Version not found:` form.
+
+---
+
+## 12. Entry points — when the same `healObject` decision is reached
 
 The decision described above is reached through several real entry points, all of which funnel into the same `healObject` [`cmd/erasure-healing.go:258`]; none was bypassed with a synthetic stand‑in:
 
@@ -774,15 +1052,15 @@ Corroboration (documentation, supplementing runtime evidence): the scanner sampl
 
 ---
 
-## 12. Determinism & honesty note
+## 13. Determinism & honesty note
 
-- **Run‑to‑run stability (≥ 2 runs):** every reported value above was confirmed identical across at least two independent runs. The scratch‑test key values (observed quorum `readQuorum=2 writeQuorum=3`; all `Before`/`After` drive‑state arrays; the three error strings; the sweep boundary; the dangling booleans; the set‑level purge on‑disk before/after) were byte‑identical between run 1 and run 2 (`/tmp/blitzy_scratch_run1.log` vs `/tmp/blitzy_scratch_run2.log`; only randomized temp‑dir endpoint suffixes differ). The live `DeleteDanglingObject` audit event was captured twice (objects `purge.bin` and `purge3.bin`) with identical tags: `caller=…/erasure-healing.go:309`, `d:p=2:2`, `merrs=""`, `derrs=map[]`, `sz=1048576`, `set=0`, `pool=0`; the live reconstruct (`recon2.bin`, `recon3.bin`) and purge (`purge.bin`, `purge3.bin`) produced identical decisions across runs.
-- **Observed vs. inferred:** every value in §§3–10 is *observed* runtime output or a directly‑quoted `file:line`. The two items explicitly labelled **(inferred)** are: the 48‑hour offline fresh‑drive heuristic (§11, from documentation, not exercised), and the general framing of scanner sampling frequency (§11, from documentation).
+- **Run‑to‑run stability (≥ 2 runs, concrete diff):** the scratch test was run independently multiple times; the two preserved logs `/tmp/blitzy_scratch_run1.log` and `/tmp/blitzy_scratch_run2.log` are **byte‑for‑byte identical** — both are exactly 9802 bytes and `diff` reports no differences. Every **decision‑relevant** value is therefore stable across runs: the observed quorum (`readQuorum=2 writeQuorum=3`), `DataBlocks=2` / `ParityBlocks=2`, all `Before`/`After` drive‑state arrays, the **form** of the three error strings (`errErasureReadQuorum`, `errFileNotFound`, and the `Version not found: <bucket>/<object>(<versionID>)` form), the reconstruct ETag `b561f87202d04959e37588ee05cf5b10` (a content‑derived MD5, hence deterministic for the fixed 1 MiB payload), the sweep boundary, the dangling booleans, and the set‑level purge on‑disk before/after. **Honesty caveat on the byte‑identical claim:** two classes of value in the scratch JSON are **per‑run random identifiers, not part of the heal decision**: (i) the per‑drive `endpoint` strings (e.g. `/tmp/minio-1815770780`), which are `os.MkdirTemp` paths created by the harness (`getRandomDisks`), and (ii) the randomly‑generated **version UUIDs** (the delete‑marker `versionId`, which also appears as the `(<versionID>)` component embedded inside the `Version not found:` message). Both were identical between the two preserved logs above because those runs used the **same compiled test binary**; once the harness is recompiled they change — for example, the independent `corrupt`→`ok` capture embedded in §6 (harness recompiled with one added scenario) shows a *different* `/tmp/minio-*` endpoint family while **every decision field still matches**. On a real cluster the endpoints would be the actual drive paths. The stability guarantee is thus scoped to the decision fields above, not to these random identifiers. Separately, the live `DeleteDanglingObject` audit event was captured twice (objects `purge.bin` and `purge3.bin`) with identical tags: `caller=/tmp/blitzy/minio/blitzy-629729d3-cb15-4820-bb3e-f65517d9c2ea_444e13/cmd/erasure-healing.go:309`, `d:p=2:2`, `merrs=""`, `derrs=map[]`, `sz=1048576`, `set=0`, `pool=0`; the live reconstruct (`recon2.bin`, `recon3.bin`) and purge (`purge.bin`, `purge3.bin`) produced identical decisions across runs.
+- **Observed vs. inferred:** every value in §§3–10 is *observed* runtime output or a directly‑quoted `file:line`. The two items explicitly labelled **(inferred)** are: the 48‑hour offline fresh‑drive heuristic (§12, from documentation, not exercised), and the general framing of scanner sampling frequency (§12, from documentation).
 - **The `merrs` empty‑tag finding is a real, runtime‑confirmed source bug** (`joinErrs` iterates its empty local string), reported as observed rather than paraphrased (§7).
 
 ---
 
-## 13. Cleanup performed (repository left read‑only)
+## 14. Cleanup performed (repository left read‑only)
 
 This was a read‑only investigation. All runtime artifacts live **outside** the repository tree, and the temporary in‑repo scratch test was removed. Cleanup commands:
 
@@ -796,20 +1074,22 @@ $ rm -rf /tmp/minio_bin /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4 /tmp/mc-config \
 $ rm -f cmd/zz_blitzy_scratch_test.go
 ```
 
-Final repository state — no existing tracked file was modified, and no scratch file remains. `git diff --stat` (tracked‑file changes) is empty, and the only untracked entry is the one new answer document (its parent directories are new):
+Final repository state — the read‑only constraint was honored: **no source, test, or configuration file was modified**, and the temporary in‑repo scratch heal test was removed. The **only** change to the repository is the answer document itself (which is the committed deliverable). Verified with actual output:
 
 ```text
-$ git diff --stat
-$                                   # (empty — zero tracked files modified)
-
 $ git status --porcelain
-?? blitzy/
+ M blitzy/documentation/minio_c07e5b49d477.md      # the sole change — the answer document
 
-$ git status --porcelain --untracked-files=all
-?? blitzy/documentation/minio_c07e5b49d477.md
+# no source/test/config file is touched (scoped diff is empty):
+$ git diff --stat -- cmd internal buildscripts docs .github go.mod go.sum Makefile
+$                                                  # (empty)
+
+# the temporary scratch heal test is gone:
+$ ls cmd/zz_blitzy_scratch_test.go
+ls: cannot access 'cmd/zz_blitzy_scratch_test.go': No such file or directory
 ```
 
-(`git status --porcelain` collapses the new tree to `?? blitzy/`; expanding untracked files shows the single new file `blitzy/documentation/minio_c07e5b49d477.md`. The compiled `minio` binary was built at `/tmp/minio_bin/minio`, outside the tree, and `.gitignore` line 4 (`minio`) ignores it in any case. The temporary scratch heal test `cmd/zz_blitzy_scratch_test.go` was removed and no longer appears in `git status`.)
+The answer document `blitzy/documentation/minio_c07e5b49d477.md` is a tracked file (it is the committed deliverable, and its working‑tree modification is the single entry above); every **other** tracked file is byte‑for‑byte unchanged (the scoped `git diff --stat` over `cmd`, `internal`, `buildscripts`, `docs`, `.github`, `go.mod`, `go.sum`, and `Makefile` is empty), and no untracked scratch file remains under the source tree. The compiled `minio` binary was built at `/tmp/minio_bin/minio`, outside the tree (and `.gitignore` line 4, `minio`, ignores it in any case); the 4‑drive data directories, the `mc` config, the audit sink, and all captured logs live under `/tmp`, outside the repository. The temporary scratch heal test `cmd/zz_blitzy_scratch_test.go` was removed and no longer appears in `git status`.
 
 ---
 
