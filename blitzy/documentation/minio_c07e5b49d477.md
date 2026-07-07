@@ -102,7 +102,7 @@ func DefaultParityBlocks(drive int) int {
 The read/write quorum is computed by `objectQuorumFromMeta` [`cmd/erasure-metadata.go:531`]:
 
 ```go
-// cmd/erasure-metadata.go:555-565
+// cmd/erasure-metadata.go:555-564
 dataBlocks := len(partsMetaData) - parityBlocks
 
 writeQuorum := dataBlocks
@@ -157,10 +157,10 @@ These two numbers — **read quorum 2** and **parity 2** — frame every boundar
 
 `HealObject` (the real `ObjectLayer` entry point) reaches `healObject` [`cmd/erasure-healing.go:258`], which reads metadata from all four disks, computes quorum, classifies each disk, and then takes the determinative `cannotHeal` branch.
 
-**Step 1 — classify each drive** into one of four states [`cmd/erasure-healing.go:383-404`]:
+**Step 1 — classify each drive** into one of four states [`cmd/erasure-healing.go:382-404`]:
 
 ```go
-// cmd/erasure-healing.go:383-404
+// cmd/erasure-healing.go:382-404
 driveState := ""
 switch {
 case reason == nil:
@@ -237,7 +237,7 @@ for i, v := range result.Before.Drives {
 **Step 4 — the dangling handler** decides leave‑as‑is vs. purge. `deleteIfDangling` [`cmd/erasure-object.go:482`] asks `isObjectDangling` and, if the object is **not** provably dangling, refuses to act and returns read‑quorum error (**leave‑as‑is**):
 
 ```go
-// cmd/erasure-object.go:482-488
+// cmd/erasure-object.go:482-490
 func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrsByPart map[int][]int, opts ObjectOptions) (FileInfo, error) {
 	m, ok := isObjectDangling(metaArr, errs, dataErrsByPart)
 	if !ok {
@@ -271,7 +271,7 @@ HealObject [erasure-healing.go:1039]  (real ObjectLayer entry point)
      → readAllFileInfo across all 4 disks
      → objectQuorumFromMeta [erasure-metadata.go:531]
          └─ err? → deleteIfDangling(partsMetadata, errs, dataErrsByPart=nil) EARLY [erasure-healing.go:309]
-     → classify each disk Ok/Missing/Corrupt/Offline [erasure-healing.go:383-404]   (Before/After drives)
+     → classify each disk Ok/Missing/Corrupt/Offline [erasure-healing.go:382-404]   (Before/After drives)
      → disksToHealCount == 0? → "object is healthy, nothing to heal"
      → cannotHeal := disksToHealCount > parity [erasure-healing.go:428]
           (override: if all ETags agree (quorumETag != ""), cannotHeal=false [L429-433])
@@ -513,7 +513,7 @@ The operator‑visible signal is `detail: "Object not found: healbucket2/purge3.
 
 ## 6. Q3 — Observable decision signals (the `Before` / `After` drive‑state arrays)
 
-The authoritative decision signal returned by the server is the `madmin.HealResultItem`'s per‑drive **`Before.Drives[].State`** vs. **`After.Drives[].State`** arrays. The per‑object erasure‑heal classifier emits **four** state constants, serialized lowercase: **`ok`**, **`missing`**, **`corrupt`**, **`offline`**. (`madmin` actually defines **nine** `DriveState*` constants [`madmin-go/v3/heal-commands.go:120-128`]: the four above plus `permission-denied`, `faulty`, `root-mount`, `unknown`, and `unformatted`. Those other five are used elsewhere in admin/disk reporting but are **not** produced by this per‑object shard classifier — a `grep` of `cmd/erasure-healing.go` finds only `DriveStateOk`, `DriveStateMissing`, `DriveStateCorrupt`, and `DriveStateOffline`.) They are assembled by the classifier in §4, Step 1 [`cmd/erasure-healing.go:383-404`].
+The authoritative decision signal returned by the server is the `madmin.HealResultItem`'s per‑drive **`Before.Drives[].State`** vs. **`After.Drives[].State`** arrays. The per‑object erasure‑heal classifier emits **four** state constants, serialized lowercase: **`ok`**, **`missing`**, **`corrupt`**, **`offline`**. (`madmin` actually defines **nine** `DriveState*` constants [`madmin-go/v3/heal-commands.go:120-128`]: the four above plus `permission-denied`, `faulty`, `root-mount`, `unknown`, and `unformatted`. Those other five are used elsewhere in admin/disk reporting but are **not** produced by this per‑object shard classifier — a `grep` of `cmd/erasure-healing.go` finds only `DriveStateOk`, `DriveStateMissing`, `DriveStateCorrupt`, and `DriveStateOffline`.) They are assembled by the classifier in §4, Step 1 [`cmd/erasure-healing.go:382-404`].
 
 **For a healed (reconstructed) object, the transition is `missing`/`corrupt` → `ok`.** Observed (EC:2 scratch, 1 missing shard, from §5.1):
 
@@ -707,7 +707,7 @@ The `caller`, `d:p`, and per‑disk `ddisk-*` tags together answer *why* the obj
 {"status":"success","host":"127.0.0.1:9000","time":"2026-07-06T22:10:50.223841694Z","client":"","duration":15791105,"timeToFirstByte":0,"api":"heal.Object","path":"healbucket/trace.bin","query":"","statusCode":0,"statusMsg":"","type":"Healing","size":1048576,"error":"","extra":{"disks":"4","dry":"false","mode":"1","remove":"false","version-id":"null"}}
 ```
 
-Here `type:"Healing"`, `api:"heal.Object"`, `extra.disks:"4"`, and `extra.mode:"1"` (the `HealDeepScan` scan‑mode value) show the heal path, scope, and scan mode for the object.
+Here `type:"Healing"`, `api:"heal.Object"`, `extra.disks:"4"`, and `extra.mode:"1"` (the `HealNormalScan` scan‑mode value — the raw integer emitted by `fmt.Sprint(opts.ScanMode)` [`cmd/erasure-healing.go:1103`], where `HealScanMode` is defined `HealUnknownScan=0`, `HealNormalScan=1`, `HealDeepScan=2` [`madmin-go/v3/heal-commands.go:37-44`]; this capture is a default `mc admin heal` — note `remove:"false"` in the same trace — so `HealDeepScan` would serialize as `"2"`) show the heal path, scope, and scan mode for the object.
 
 > **For reconstruct and leave‑as‑is, there is no dedicated "reason" audit event** — the rationale is carried by the `Before`/`After` state transition (reconstruct) or by the returned error (`errErasureReadQuorum` for leave‑as‑is). The `DeleteDanglingObject` event is specific to the purge decision.
 
@@ -1034,7 +1034,7 @@ BLITZY[r5-remove-true]  disk 3 xl.meta present AFTER  = false (dangling remnant 
 		errs = make([]error, len(errs))
 ```
 
-`deleteIfDangling`, once `isObjectDangling` is true, unconditionally issues `DeleteVersion` on every disk [`cmd/erasure-object.go:483`]. What `opts.Remove` *actually* gates is the removal of **abandoned/stray parts** in `checkAbandonedParts` [`cmd/erasure-healing.go:663`] and empty‑directory healing via `healObjectDir` [`cmd/erasure-healing.go:1053`] — not the dangling‑object purge.
+`deleteIfDangling`, once `isObjectDangling` is true [`cmd/erasure-object.go:483`], unconditionally issues `DeleteVersion` on every disk [`cmd/erasure-object.go:548`] and collects each disk's result in the delete loop [`cmd/erasure-object.go:551-560`]. What `opts.Remove` *actually* gates is the removal of **abandoned/stray parts** in `checkAbandonedParts` [`cmd/erasure-healing.go:663`] and empty‑directory healing via `healObjectDir` [`cmd/erasure-healing.go:1053`] — not the dangling‑object purge.
 
 **Reading the all‑`ok` drive arrays for a purge (an honesty note).** The `Before`/`After` arrays print `"ok" "ok" "ok" "ok"` even though three `xl.meta` copies were missing, because the purge branch **resets `errs` to a fresh all‑`nil` slice** (`errs = make([]error, len(errs))`, line 441 above) *before* returning `defaultHealResult`, which then renders every drive `ok` (the `nil → ok` mapping of §8). For this purge case the decisive evidence is therefore **not** the drive‑state array but (a) the on‑disk `xl.meta` going `true → false` on the surviving drive and (b) the `Version not found:` return. The empty versionID is normalized to the `null` version [`cmd/erasure-healing.go:1061`], which is why the error prints `(null)`; `toObjectErr` wraps the internal `errFileVersionNotFound` into the client‑facing `Version not found:` form.
 
