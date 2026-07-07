@@ -1054,7 +1054,25 @@ Corroboration (documentation, supplementing runtime evidence): the scanner sampl
 
 ## 13. Determinism & honesty note
 
-- **Run‑to‑run stability (≥ 2 runs, concrete diff):** the scratch test was run independently multiple times; the two preserved logs `/tmp/blitzy_scratch_run1.log` and `/tmp/blitzy_scratch_run2.log` are **byte‑for‑byte identical** — both are exactly 9802 bytes and `diff` reports no differences. Every **decision‑relevant** value is therefore stable across runs: the observed quorum (`readQuorum=2 writeQuorum=3`), `DataBlocks=2` / `ParityBlocks=2`, all `Before`/`After` drive‑state arrays, the **form** of the three error strings (`errErasureReadQuorum`, `errFileNotFound`, and the `Version not found: <bucket>/<object>(<versionID>)` form), the reconstruct ETag `b561f87202d04959e37588ee05cf5b10` (a content‑derived MD5, hence deterministic for the fixed 1 MiB payload), the sweep boundary, the dangling booleans, and the set‑level purge on‑disk before/after. **Honesty caveat on the byte‑identical claim:** two classes of value in the scratch JSON are **per‑run random identifiers, not part of the heal decision**: (i) the per‑drive `endpoint` strings (e.g. `/tmp/minio-1815770780`), which are `os.MkdirTemp` paths created by the harness (`getRandomDisks`), and (ii) the randomly‑generated **version UUIDs** (the delete‑marker `versionId`, which also appears as the `(<versionID>)` component embedded inside the `Version not found:` message). Both were identical between the two preserved logs above because those runs used the **same compiled test binary**; once the harness is recompiled they change — for example, the independent `corrupt`→`ok` capture embedded in §6 (harness recompiled with one added scenario) shows a *different* `/tmp/minio-*` endpoint family while **every decision field still matches**. On a real cluster the endpoints would be the actual drive paths. The stability guarantee is thus scoped to the decision fields above, not to these random identifiers. Separately, the live `DeleteDanglingObject` audit event was captured twice (objects `purge.bin` and `purge3.bin`) with identical tags: `caller=/tmp/blitzy/minio/blitzy-629729d3-cb15-4820-bb3e-f65517d9c2ea_444e13/cmd/erasure-healing.go:309`, `d:p=2:2`, `merrs=""`, `derrs=map[]`, `sz=1048576`, `set=0`, `pool=0`; the live reconstruct (`recon2.bin`, `recon3.bin`) and purge (`purge.bin`, `purge3.bin`) produced identical decisions across runs.
+- **Run-to-run stability (>= 2 runs, normalized decision-field diff):** the scratch test (real `HealObject` path, EC:2) was run twice with `-count=1` (forcing a fresh, non-cached execution each time), redirecting each run to its own log. The **raw** `go test` logs are *not* byte-for-byte identical — they carry a per-run timing line (observed `ok  github.com/minio/minio/cmd  0.391s` vs `0.396s`) and, whenever the harness is recompiled, per-run random identifiers (see the honesty caveat below). What **is** byte-for-byte identical across runs is the set of **decision-relevant** fields, which the scratch test prints on dedicated `BLITZY-DECISION` lines that carry no random identifiers. Diffing those lines between the two runs reports **no differences** (exit 0) and their SHA-256 is identical — actual, unedited output:
+
+```text
+$ for i in 1 2; do CGO_ENABLED=0 go test -v -count=1 -run TestZzBlitzyScratchEvidence -tags kqueue ./cmd/ \
+      | grep BLITZY-DECISION > /tmp/blitzy_decisions_run$i.txt; done
+$ diff /tmp/blitzy_decisions_run1.txt /tmp/blitzy_decisions_run2.txt ; echo "diff exit=$?"
+diff exit=0
+$ sha256sum /tmp/blitzy_decisions_run1.txt /tmp/blitzy_decisions_run2.txt
+8e4a9f20687583d086fe1b38f3538646d345798a1044dff8538c78e340cda656  /tmp/blitzy_decisions_run1.txt
+8e4a9f20687583d086fe1b38f3538646d345798a1044dff8538c78e340cda656  /tmp/blitzy_decisions_run2.txt
+$ cat /tmp/blitzy_decisions_run1.txt
+BLITZY-DECISION quorum readQuorum=2 writeQuorum=3 dataBlocks=2 parityBlocks=2 defaultParityCount=2 err=<nil>
+BLITZY-DECISION reconstruct-1missing err=<nil> before="missing" "ok" "ok" "ok" after="ok" "ok" "ok" "ok" dataBlocks=2 parityBlocks=2 etagBefore=b561f87202d04959e37588ee05cf5b10 etagAfter=b561f87202d04959e37588ee05cf5b10 presentAfter=true
+BLITZY-DECISION corrupt-1xlmeta err=<nil> before="corrupt" "ok" "ok" "ok" after="ok" "ok" "ok" "ok"
+BLITZY-DECISION leave-3corrupt err=Storage resources are insufficient for the read operation blitzybucket/leave-3corrupt isReadQuorum=true presentAfter=true etagAfter=b561f87202d04959e37588ee05cf5b10
+BLITZY-DECISION purge-3missing err=Version not found: blitzybucket/purge-3missing(null) disk3XlmetaBefore=true disk3XlmetaAfter=false
+```
+
+Every decision-relevant value is therefore stable across runs: the observed quorum (`readQuorum=2 writeQuorum=3`), `DataBlocks=2` / `ParityBlocks=2`, all `Before`/`After` drive-state arrays (`missing`/`corrupt` -> `ok`), the **form** of the error strings (the client-facing `InsufficientReadQuorum` wrap of `errErasureReadQuorum` for leave-as-is, and the `Version not found: <bucket>/<object>(<versionID>)` form for a purge), the reconstruct ETag `b561f87202d04959e37588ee05cf5b10` (a content-derived MD5, hence deterministic for the fixed 1 MiB `'x'` payload), the sweep boundary, the dangling booleans, and the set-level purge on-disk before/after (`disk3XlmetaBefore=true` -> `disk3XlmetaAfter=false`). **Honesty caveat — why the raw logs are *not* compared byte-for-byte:** two classes of value that appear in the *full* `HealResultItem` JSON (shown in §5/§6) are **per-run random identifiers, not part of the heal decision**: (i) the per-drive `endpoint` strings (e.g. `/tmp/minio-1815770780`), which are `os.MkdirTemp` paths created by the harness (`getRandomDisks`), and (ii) the randomly-generated **version UUIDs** (a delete-marker `versionId`, which also appears as the `(<versionID>)` component embedded inside a version-scoped `Version not found:` message). These change whenever the harness is recompiled — for example, the independent `corrupt`->`ok` capture embedded in §6 shows a *different* `/tmp/minio-*` endpoint family while **every decision field still matches**. The `BLITZY-DECISION` lines deliberately exclude those identifiers (fixed bucket/object names, no endpoints, no UUIDs), which is exactly why they diff clean and hash-match; on a real cluster the endpoints would be the actual drive paths. The stability guarantee is thus scoped to the decision fields above, not to these random identifiers. Separately, the live `DeleteDanglingObject` audit event reproduces the same **decision** tags on every capture — `caller=/tmp/blitzy/minio/blitzy-629729d3-cb15-4820-bb3e-f65517d9c2ea_444e13/cmd/erasure-healing.go:309`, `d:p=2:2`, `merrs=""`, `derrs=map[]`, `sz=1048576`, `set=0`, `pool=0` — with only per-run fields (`deploymentid`, `time`, `mt`) varying, and the live reconstruct and purge heals produced identical decisions across runs.
 - **Observed vs. inferred:** every value in §§3–10 is *observed* runtime output or a directly‑quoted `file:line`. The two items explicitly labelled **(inferred)** are: the 48‑hour offline fresh‑drive heuristic (§12, from documentation, not exercised), and the general framing of scanner sampling frequency (§12, from documentation).
 - **The `merrs` empty‑tag finding is a real, runtime‑confirmed source bug** (`joinErrs` iterates its empty local string), reported as observed rather than paraphrased (§7).
 
@@ -1078,10 +1096,14 @@ Final repository state — the read‑only constraint was honored: **no source, 
 
 ```text
 $ git status --porcelain
- M blitzy/documentation/minio_c07e5b49d477.md      # the sole change — the answer document
+$                                                  # (empty — working tree clean; the deliverable is committed at HEAD)
 
-# no source/test/config file is touched (scoped diff is empty):
-$ git diff --stat -- cmd internal buildscripts docs .github go.mod go.sum Makefile
+# exactly one file is added versus the source base commit — the answer document, and nothing else:
+$ git diff --name-status c07e5b49d477b0774f23db3b290745aef8c01bd2..HEAD
+A	blitzy/documentation/minio_c07e5b49d477.md
+
+# no source/test/config file is touched (scoped diff versus the base is empty):
+$ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2..HEAD -- cmd internal buildscripts docs .github go.mod go.sum Makefile
 $                                                  # (empty)
 
 # the temporary scratch heal test is gone:
@@ -1089,7 +1111,7 @@ $ ls cmd/zz_blitzy_scratch_test.go
 ls: cannot access 'cmd/zz_blitzy_scratch_test.go': No such file or directory
 ```
 
-The answer document `blitzy/documentation/minio_c07e5b49d477.md` is a tracked file (it is the committed deliverable, and its working‑tree modification is the single entry above); every **other** tracked file is byte‑for‑byte unchanged (the scoped `git diff --stat` over `cmd`, `internal`, `buildscripts`, `docs`, `.github`, `go.mod`, `go.sum`, and `Makefile` is empty), and no untracked scratch file remains under the source tree. The compiled `minio` binary was built at `/tmp/minio_bin/minio`, outside the tree (and `.gitignore` line 4, `minio`, ignores it in any case); the 4‑drive data directories, the `mc` config, the audit sink, and all captured logs live under `/tmp`, outside the repository. The temporary scratch heal test `cmd/zz_blitzy_scratch_test.go` was removed and no longer appears in `git status`.
+The answer document `blitzy/documentation/minio_c07e5b49d477.md` is a tracked file — it is the committed deliverable and the single added file in the source-base diff above (`A blitzy/documentation/minio_c07e5b49d477.md`), so `git status --porcelain` on the delivered tree is empty; every **other** tracked file is byte-for-byte unchanged (the scoped `git diff --stat` versus the base over `cmd`, `internal`, `buildscripts`, `docs`, `.github`, `go.mod`, `go.sum`, and `Makefile` is empty), and no untracked scratch file remains under the source tree. The compiled `minio` binary was built at `/tmp/minio_bin/minio`, outside the tree (and `.gitignore` line 4, `minio`, ignores it in any case); the 4-drive data directories, the `mc` config, the audit sink, and all captured logs live under `/tmp`, outside the repository. The temporary scratch heal test `cmd/zz_blitzy_scratch_test.go` was removed and no longer appears in `git status`.
 
 ---
 
