@@ -144,53 +144,74 @@ encryption requirement" mechanisms, and they behave oppositely. Both were exerci
 
 ### Path A — bucket default / automatic encryption ⇒ the upload SUCCEEDS, transparently encrypted
 
-A server was started with a KMS master key configured and automatic encryption enabled, and
-a broad-write user (`bwuser`, IAM policy `s3:*` on `*`) uploaded an object **with no SSE
-header at all**:
+A single-node server was started on `:9010` with a KMS master key configured and automatic
+encryption enabled; a broad-write user (`bwuser`, IAM policy `s3:*` on `*`) was created; and
+that user uploaded an object **with no SSE header at all**. The exact commands (the KMS master
+key value is an investigation-time secret and is redacted as `<base64-32-bytes>`):
 
 ```bash
 # server (port :9010): KMS key + auto-encryption ON
 export MINIO_KMS_SECRET_KEY="my-minio-key:<base64-32-bytes>"
 export MINIO_KMS_AUTO_ENCRYPTION=on
 /tmp/blitzy/minio-bin/minio server /tmp/blitzy/data-kms --address :9010 --console-address :9011
-# upload as the broad-write user, NO encryption flags:
-mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/plain.txt kmsbw/autobucket/plain.txt
+# create the broad-write user + bucket (root alias kmsroot -> :9010):
+mc --config-dir /tmp/blitzy/mc-config admin policy create kmsroot bwpol /tmp/blitzy/out/bwpolicy.json
+mc --config-dir /tmp/blitzy/mc-config admin user add kmsroot bwuser bwuser12345
+mc --config-dir /tmp/blitzy/mc-config admin policy attach kmsroot bwpol --user bwuser
+mc --config-dir /tmp/blitzy/mc-config alias set kmsbw http://127.0.0.1:9010 bwuser bwuser12345
+mc --config-dir /tmp/blitzy/mc-config mb kmsroot/autobucket
 ```
 
-Trace captured with `mc --config-dir /tmp/blitzy/mc-config admin trace -v kms` (file
-`q1-autoenc-trace.txt`, lines 113–142 — the `PutObject` request and response):
+The upload itself, run as the broad-write user with **no encryption flags** — the exact
+command and its complete client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/plain.txt kmsbw/autobucket/plain.txt
+`/tmp/blitzy/out/plain.txt` -> `kmsbw/autobucket/plain.txt`
+Total: 52 B, Transferred: 52 B, Speed: 1.67 KiB/s
+```
+
+The `PutObject` request and response, captured on the server's HTTP trace stream. The exact
+producing command (run against the root alias `kmsroot`, since the trace stream requires an
+admin caller) was:
+
+```bash
+mc --config-dir /tmp/blitzy/mc-config admin trace -v kmsroot
+```
+
+which yielded the following `PutObject` request/response:
 
 ```text
-127.0.0.1:9010 [REQUEST s3.PutObject] [2026-07-06T22:39:19.241] [Client IP: 127.0.0.1]
+127.0.0.1:9010 [REQUEST s3.PutObject] [2026-07-06T23:42:57.826] [Client IP: 127.0.0.1]
 127.0.0.1:9010 PUT /autobucket/plain.txt
 127.0.0.1:9010 Proto: HTTP/1.1
 127.0.0.1:9010 Host: 127.0.0.1:9010
-127.0.0.1:9010 Content-Length: 228
-127.0.0.1:9010 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9010 X-Amz-Decoded-Content-Length: 55
-127.0.0.1:9010 Accept-Encoding: zstd,gzip
-127.0.0.1:9010 Content-Type: text/plain
 127.0.0.1:9010 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
-127.0.0.1:9010 X-Amz-Date: 20260706T223919Z
+127.0.0.1:9010 X-Amz-Decoded-Content-Length: 52
 127.0.0.1:9010 X-Amz-Server-Side-Encryption: aws:kms
-127.0.0.1:9010 Authorization: AWS4-HMAC-SHA256 Credential=bwuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=3994c58d125fb216755b632087c655381e39aa6a2318c5915335e07dd0b4a8dc
+127.0.0.1:9010 Authorization: AWS4-HMAC-SHA256 Credential=bwuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=f8ec90353794e023fa50b8c14403142cb2558c368a8e3277f944e14ffb1908da
+127.0.0.1:9010 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
+127.0.0.1:9010 Content-Type: text/plain
+127.0.0.1:9010 X-Amz-Date: 20260706T234257Z
+127.0.0.1:9010 Accept-Encoding: zstd,gzip
+127.0.0.1:9010 Content-Length: 225
 127.0.0.1:9010 <BLOB>
-127.0.0.1:9010 [RESPONSE] [2026-07-06T22:39:19.264] [ Duration 23.176ms TTFB 23.147902ms ↑ 392 B  ↓ 0 B ]
+127.0.0.1:9010 [RESPONSE] [2026-07-06T23:42:57.849] [ Duration 22.69ms TTFB 22.670617ms ↑ 389 B  ↓ 0 B ]
 127.0.0.1:9010 200 OK
-127.0.0.1:9010 Accept-Ranges: bytes
-127.0.0.1:9010 Server: MinIO
-127.0.0.1:9010 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9010 X-Amz-Request-Id: 18BFD470FF026F2A
-127.0.0.1:9010 X-Amz-Server-Side-Encryption: aws:kms
-127.0.0.1:9010 X-Xss-Protection: 1; mode=block
-127.0.0.1:9010 Content-Length: 0
-127.0.0.1:9010 ETag: "16a38aaea5adf189fd307e16f5baa576"
+127.0.0.1:9010 X-Amz-Request-Id: 18BFD7EA146AB3FE
+127.0.0.1:9010 X-Ratelimit-Limit: 1142637
 127.0.0.1:9010 Vary: Origin,Accept-Encoding
-127.0.0.1:9010 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: arn:aws:kms:my-minio-key
-127.0.0.1:9010 X-Ratelimit-Remaining: 1141076
-127.0.0.1:9010 X-Ratelimit-Limit: 1141076
+127.0.0.1:9010 X-Amz-Server-Side-Encryption: aws:kms
+127.0.0.1:9010 Server: MinIO
 127.0.0.1:9010 X-Amz-Id-2: 6288f7c424456b65729155b10570da05022411640ac68a83da601467ee9d5c0a
+127.0.0.1:9010 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: arn:aws:kms:my-minio-key
 127.0.0.1:9010 X-Content-Type-Options: nosniff
+127.0.0.1:9010 ETag: "9ce74369b8d3b75c38a227feb58008b7"
+127.0.0.1:9010 Content-Length: 0
+127.0.0.1:9010 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9010 X-Ratelimit-Remaining: 1142637
+127.0.0.1:9010 X-Xss-Protection: 1; mode=block
+127.0.0.1:9010 Accept-Ranges: bytes
 ```
 
 **Reading the evidence.** In the request block the client's SigV4
@@ -200,14 +221,53 @@ SSE header. The `X-Amz-Server-Side-Encryption: aws:kms` line that appears in the
 request is the header the **server injected** into `r.Header` before processing. The
 **response** then returns `200 OK` with `X-Amz-Server-Side-Encryption: aws:kms` and
 `X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: arn:aws:kms:my-minio-key`, and the object's
-ETag is `"16a38aaea5adf189fd307e16f5baa576"`.
+ETag is `"9ce74369b8d3b75c38a227feb58008b7"`.
+
+**The stored object is SSE-KMS encrypted (`mc stat`).** The exact producing command and its
+complete, unedited output confirm the object at rest is encrypted with SSE-KMS under the KMS
+key `arn:aws:kms:my-minio-key`:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config stat kmsbw/autobucket/plain.txt
+Name      : plain.txt
+Date      : 2026-07-06 23:42:57 UTC 
+Size      : 52 B   
+ETag      : 9ce74369b8d3b75c38a227feb58008b7 
+Type      : file 
+Encryption: SSE-KMS (arn:aws:kms:my-minio-key)
+Metadata  :
+  Content-Type: text/plain
+```
 
 **Corroboration (object is encrypted at rest).** The plaintext md5 of the uploaded file is
-`5402b2e15e4c253088e517b55862bb02` (`md5sum plain.txt`). A control upload of the same file
-to a **non-KMS** server (`:9000`, no auto-encryption) stored it with ETag
-`5402b2e15e4c253088e517b55862bb02` and no encryption metadata, whereas the auto-encrypting
-bucket produced ETag `16a38aaea5adf189fd307e16f5baa576` — the stored bytes differ, i.e. the
-object was encrypted server-side even though the client sent no SSE header.
+`1c00e6dd7865536879e3bbd94b6fe595`:
+
+```bash
+$ md5sum /tmp/blitzy/out/plain.txt
+1c00e6dd7865536879e3bbd94b6fe595  /tmp/blitzy/out/plain.txt
+```
+
+A control upload of the **same file** to a **non-KMS** server (`:9000`, no auto-encryption)
+stored it with an ETag equal to the plaintext md5 and with **no** encryption metadata:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/plain.txt local/plainbucket/plain.txt
+`/tmp/blitzy/out/plain.txt` -> `local/plainbucket/plain.txt`
+Total: 52 B, Transferred: 52 B, Speed: 1.75 KiB/s
+$ mc --config-dir /tmp/blitzy/mc-config stat local/plainbucket/plain.txt
+Name      : plain.txt
+Date      : 2026-07-06 23:43:26 UTC 
+Size      : 52 B   
+ETag      : 1c00e6dd7865536879e3bbd94b6fe595 
+Type      : file 
+Metadata  :
+  Content-Type: text/plain
+```
+
+The non-KMS control's `ETag` equals the plaintext md5 (`1c00e6dd…`) with no `Encryption:`
+line, whereas the auto-encrypting bucket produced ETag `9ce74369b8d3b75c38a227feb58008b7`
+and `Encryption: SSE-KMS (arn:aws:kms:my-minio-key)` — the stored representation differs,
+i.e. the object was encrypted server-side even though the client sent no SSE header.
 
 **Root cause / execution sequence (Path A).**
 The toggle is `MINIO_KMS_AUTO_ENCRYPTION`, whose env name is
@@ -246,101 +306,173 @@ correction below. The following IAM policy was created and attached to user `den
 ```
 
 The `Null` condition on `s3:x-amz-server-side-encryption` matches exactly when the SSE header
-is **absent**. As `denyuser`, an unencrypted upload to `denybucket/` was attempted on the
-KMS-enabled-but-auto-encryption-**off** server (`:9030`):
+is **absent**. The policy and user were created, then as `denyuser` an unencrypted upload to
+`denybucket/` was attempted on the KMS-enabled-but-auto-encryption-**off** server (`:9030`):
 
 ```bash
-mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/plain.txt encuser/denybucket/noenc.txt
-# client result:
-# mc: <ERROR> Failed to copy `/tmp/blitzy/out/plain.txt`. Insufficient permissions ...
+# create the deny policy + user (root alias encroot -> :9030):
+mc --config-dir /tmp/blitzy/mc-config admin policy create encroot encmandate /tmp/blitzy/out/enc-mandate-iam.json
+mc --config-dir /tmp/blitzy/mc-config admin user add encroot denyuser denyuser12345
+mc --config-dir /tmp/blitzy/mc-config admin policy attach encroot encmandate --user denyuser
+mc --config-dir /tmp/blitzy/mc-config alias set encuser http://127.0.0.1:9030 denyuser denyuser12345
+mc --config-dir /tmp/blitzy/mc-config mb encroot/denybucket
 ```
 
-Trace (`q1-deny-iam-trace.txt`, lines 113–141 — the unencrypted `PutObject` rejected):
+The unencrypted upload attempt and its **complete** (unedited) client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/plain.txt encuser/denybucket/noenc.txt
+`/tmp/blitzy/out/plain.txt` -> `encuser/denybucket/noenc.txt`
+mc: <ERROR> Failed to copy `/tmp/blitzy/out/plain.txt`. Insufficient permissions to access this path `http://127.0.0.1:9030/denybucket/noenc.txt`
+```
+
+The `PutObject` request/response, captured on the trace stream. The exact producing command
+(root alias `encroot`, since trace requires admin) was
+`mc --config-dir /tmp/blitzy/mc-config admin trace -v encroot`:
 
 ```text
-127.0.0.1:9030 [REQUEST s3.PutObject] [2026-07-06T22:42:05.721] [Client IP: 127.0.0.1]
+127.0.0.1:9030 [REQUEST s3.PutObject] [2026-07-06T23:43:52.539] [Client IP: 127.0.0.1]
 127.0.0.1:9030 PUT /denybucket/noenc.txt
 127.0.0.1:9030 Proto: HTTP/1.1
 127.0.0.1:9030 Host: 127.0.0.1:9030
-127.0.0.1:9030 Accept-Encoding: zstd,gzip
-127.0.0.1:9030 Content-Length: 228
-127.0.0.1:9030 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9030 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
-127.0.0.1:9030 X-Amz-Date: 20260706T224205Z
-127.0.0.1:9030 Authorization: AWS4-HMAC-SHA256 Credential=denyuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=514e6e38f3611d76c53f6056cb539048288615c874a838d0c299a4bf478ce878
+127.0.0.1:9030 Content-Length: 225
 127.0.0.1:9030 Content-Type: text/plain
-127.0.0.1:9030 X-Amz-Decoded-Content-Length: 55
+127.0.0.1:9030 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+127.0.0.1:9030 X-Amz-Date: 20260706T234352Z
+127.0.0.1:9030 X-Amz-Decoded-Content-Length: 52
+127.0.0.1:9030 Accept-Encoding: zstd,gzip
+127.0.0.1:9030 Authorization: AWS4-HMAC-SHA256 Credential=denyuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=96ba7c1cdd0c273da2923e18cc9210ef6284225a2fecd6d7187c9173af211d58
+127.0.0.1:9030 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
 127.0.0.1:9030 <BLOB>
-127.0.0.1:9030 [RESPONSE] [2026-07-06T22:42:05.721] [ Duration 117µs TTFB 99.16µs ↑ 135 B  ↓ 329 B ]
+127.0.0.1:9030 [RESPONSE] [2026-07-06T23:43:52.539] [ Duration 103µs TTFB 91.811µs ↑ 135 B  ↓ 329 B ]
 127.0.0.1:9030 403 Forbidden
+127.0.0.1:9030 Accept-Ranges: bytes
 127.0.0.1:9030 Content-Type: application/xml
 127.0.0.1:9030 Server: MinIO
 127.0.0.1:9030 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9030 X-Amz-Request-Id: 18BFD497C1FB995E
-127.0.0.1:9030 X-Content-Type-Options: nosniff
-127.0.0.1:9030 X-Ratelimit-Remaining: 1140956
-127.0.0.1:9030 Accept-Ranges: bytes
+127.0.0.1:9030 X-Ratelimit-Limit: 1142637
+127.0.0.1:9030 X-Ratelimit-Remaining: 1142637
+127.0.0.1:9030 X-Xss-Protection: 1; mode=block
 127.0.0.1:9030 Content-Length: 329
 127.0.0.1:9030 Vary: Origin,Accept-Encoding
 127.0.0.1:9030 X-Amz-Id-2: 99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6
-127.0.0.1:9030 X-Ratelimit-Limit: 1140956
-127.0.0.1:9030 X-Xss-Protection: 1; mode=block
+127.0.0.1:9030 X-Amz-Request-Id: 18BFD7F6D1868D84
+127.0.0.1:9030 X-Content-Type-Options: nosniff
 127.0.0.1:9030 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>noenc.txt</Key><BucketName>denybucket</BucketName><Resource>/denybucket/noenc.txt</Resource><RequestId>18BFD497C1FB995E</RequestId><HostId>99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>noenc.txt</Key><BucketName>denybucket</BucketName><Resource>/denybucket/noenc.txt</Resource><RequestId>18BFD7F6D1868D84</RequestId><HostId>99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6</HostId></Error>
 ```
 
-The request (no `x-amz-server-side-encryption` in `SignedHeaders`) is rejected in **117µs**
-with `403 Forbidden` and body
-`<Error><Code>AccessDenied</Code>...<Resource>/denybucket/noenc.txt</Resource>...</Error>`.
+The request (no `x-amz-server-side-encryption` in `SignedHeaders`) is rejected in **103µs**
+with `403 Forbidden` and an `<Error><Code>AccessDenied</Code>` body for
+`/denybucket/noenc.txt`.
 
 **Control — an encrypted upload by the same user SUCCEEDS**, proving only the *unencrypted*
-PUT is blocked (`q1-deny-iam-trace.txt`, lines 254–286):
+PUT is blocked. The exact command and its complete client output:
 
 ```bash
-mc --config-dir /tmp/blitzy/mc-config cp --enc-kms "encuser/denybucket=my-minio-key" \
+$ mc --config-dir /tmp/blitzy/mc-config cp --enc-kms "encuser/denybucket=my-minio-key" \
     /tmp/blitzy/out/plain.txt encuser/denybucket/enc.txt
+`/tmp/blitzy/out/plain.txt` -> `encuser/denybucket/enc.txt`
+Total: 52 B, Transferred: 52 B, Speed: 1.58 KiB/s
 ```
 
+The corresponding `PutObject` trace (same
+`mc --config-dir /tmp/blitzy/mc-config admin trace -v encroot` stream):
+
 ```text
-127.0.0.1:9030 
-127.0.0.1:9030 [REQUEST s3.PutObject] [2026-07-06T22:42:05.752] [Client IP: 127.0.0.1]
+127.0.0.1:9030 [REQUEST s3.PutObject] [2026-07-06T23:43:52.573] [Client IP: 127.0.0.1]
 127.0.0.1:9030 PUT /denybucket/enc.txt
 127.0.0.1:9030 Proto: HTTP/1.1
 127.0.0.1:9030 Host: 127.0.0.1:9030
 127.0.0.1:9030 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9030 X-Amz-Server-Side-Encryption: aws:kms
-127.0.0.1:9030 Accept-Encoding: zstd,gzip
-127.0.0.1:9030 Authorization: AWS4-HMAC-SHA256 Credential=denyuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id,Signature=e151c4eb9d3cbec7f179a30391a9aa33f58a2b29902a05f32e6dd86290d1746e
 127.0.0.1:9030 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
-127.0.0.1:9030 X-Amz-Date: 20260706T224205Z
-127.0.0.1:9030 X-Amz-Decoded-Content-Length: 55
-127.0.0.1:9030 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: my-minio-key
-127.0.0.1:9030 Content-Length: 228
-127.0.0.1:9030 Content-Type: text/plain
-127.0.0.1:9030 <BLOB>
-127.0.0.1:9030 [RESPONSE] [2026-07-06T22:42:05.775] [ Duration 22.774ms TTFB 22.754315ms ↑ 436 B  ↓ 0 B ]
-127.0.0.1:9030 200 OK
-127.0.0.1:9030 Content-Length: 0
-127.0.0.1:9030 X-Amz-Id-2: 99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6
 127.0.0.1:9030 X-Amz-Server-Side-Encryption: aws:kms
-127.0.0.1:9030 X-Xss-Protection: 1; mode=block
+127.0.0.1:9030 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: my-minio-key
+127.0.0.1:9030 Content-Type: text/plain
+127.0.0.1:9030 Content-Length: 225
+127.0.0.1:9030 X-Amz-Date: 20260706T234352Z
+127.0.0.1:9030 X-Amz-Decoded-Content-Length: 52
+127.0.0.1:9030 Accept-Encoding: zstd,gzip
+127.0.0.1:9030 Authorization: AWS4-HMAC-SHA256 Credential=denyuser/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id,Signature=7a4953c2b7518ce748abb2c6227fc8fd2ebce8b486ddc8ca2f7b98ca8c5626b5
+127.0.0.1:9030 <BLOB>
+127.0.0.1:9030 [RESPONSE] [2026-07-06T23:43:52.598] [ Duration 24.49ms TTFB 24.469433ms ↑ 433 B  ↓ 0 B ]
+127.0.0.1:9030 200 OK
+127.0.0.1:9030 X-Amz-Server-Side-Encryption: aws:kms
+127.0.0.1:9030 ETag: "d2816f2d5f2b846ac819d2ddae9ec31d"
 127.0.0.1:9030 Server: MinIO
-127.0.0.1:9030 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9030 X-Content-Type-Options: nosniff
-127.0.0.1:9030 X-Ratelimit-Limit: 1140956
-127.0.0.1:9030 ETag: "114861f311f6f8e7ec93b3124da0e3aa"
-127.0.0.1:9030 X-Amz-Request-Id: 18BFD497C3D6FD2E
+127.0.0.1:9030 X-Amz-Id-2: 99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6
+127.0.0.1:9030 X-Xss-Protection: 1; mode=block
 127.0.0.1:9030 Accept-Ranges: bytes
-127.0.0.1:9030 Vary: Origin,Accept-Encoding
+127.0.0.1:9030 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9030 X-Amz-Request-Id: 18BFD7F6D394743A
 127.0.0.1:9030 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: arn:aws:kms:my-minio-key
-127.0.0.1:9030 X-Ratelimit-Remaining: 1140956
+127.0.0.1:9030 X-Content-Type-Options: nosniff
+127.0.0.1:9030 X-Ratelimit-Remaining: 1142637
+127.0.0.1:9030 Content-Length: 0
+127.0.0.1:9030 Vary: Origin,Accept-Encoding
+127.0.0.1:9030 X-Ratelimit-Limit: 1142637
 127.0.0.1:9030 <BLOB>
 ```
 
 Here the client explicitly signs the SSE headers
 (`SignedHeaders=...;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id`),
 the `Null` condition no longer matches, the `Deny` does not fire, and the write returns
-`200 OK`.
+`200 OK` (ETag `"d2816f2d5f2b846ac819d2ddae9ec31d"`).
+
+**Control — reading the encrypted object SUCCEEDS**, proving that only the *unencrypted PUT* is
+blocked while the encrypted PUT **and** the subsequent GET/read both succeed. As `denyuser`,
+`mc cat` returns the original plaintext and a download's md5 matches the original:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cat encuser/denybucket/enc.txt
+hello minio bucket-encryption test payload line one
+$ mc --config-dir /tmp/blitzy/mc-config cp encuser/denybucket/enc.txt /tmp/blitzy/out/enc-downloaded.txt
+`encuser/denybucket/enc.txt` -> `/tmp/blitzy/out/enc-downloaded.txt`
+Total: 52 B, Transferred: 52 B, Speed: 8.27 KiB/s
+$ md5sum /tmp/blitzy/out/enc-downloaded.txt /tmp/blitzy/out/plain.txt
+1c00e6dd7865536879e3bbd94b6fe595  /tmp/blitzy/out/enc-downloaded.txt
+1c00e6dd7865536879e3bbd94b6fe595  /tmp/blitzy/out/plain.txt
+```
+
+The corresponding `GetObject` trace (from the `mc cat`) returns `200 OK`, transferring the
+52 decrypted plaintext bytes (`↓ 52 B`) with `X-Amz-Server-Side-Encryption: aws:kms` echoed:
+
+```text
+127.0.0.1:9030 [REQUEST s3.GetObject] [2026-07-06T23:43:52.627] [Client IP: 127.0.0.1]
+127.0.0.1:9030 GET /denybucket/enc.txt
+127.0.0.1:9030 Proto: HTTP/1.1
+127.0.0.1:9030 Host: 127.0.0.1:9030
+127.0.0.1:9030 X-Amz-Date: 20260706T234352Z
+127.0.0.1:9030 Accept-Encoding: identity
+127.0.0.1:9030 Authorization: AWS4-HMAC-SHA256 Credential=denyuser/20260706/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=1e805cb05bfaee08d2629b86d9cac2dd07b4c20c3859efb522256f9e77ba1669
+127.0.0.1:9030 Content-Length: 0
+127.0.0.1:9030 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
+127.0.0.1:9030 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+127.0.0.1:9030 <BLOB>
+127.0.0.1:9030 [RESPONSE] [2026-07-06T23:43:52.627] [ Duration 702µs TTFB 664.334µs ↑ 93 B  ↓ 52 B ]
+127.0.0.1:9030 200 OK
+127.0.0.1:9030 Last-Modified: Mon, 06 Jul 2026 23:43:52 GMT
+127.0.0.1:9030 Server: MinIO
+127.0.0.1:9030 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9030 Vary: Origin,Accept-Encoding
+127.0.0.1:9030 X-Amz-Request-Id: 18BFD7F6D6C47CB9
+127.0.0.1:9030 X-Amz-Server-Side-Encryption: aws:kms
+127.0.0.1:9030 X-Content-Type-Options: nosniff
+127.0.0.1:9030 X-Xss-Protection: 1; mode=block
+127.0.0.1:9030 X-Ratelimit-Remaining: 1142637
+127.0.0.1:9030 Content-Length: 52
+127.0.0.1:9030 Accept-Ranges: bytes
+127.0.0.1:9030 Content-Type: text/plain
+127.0.0.1:9030 ETag: "d2816f2d5f2b846ac819d2ddae9ec31d"
+127.0.0.1:9030 X-Amz-Id-2: 99b429ef7f7998a42aa90f5909b16f87de5d2572540bbfd35e394c5ae814b0b6
+127.0.0.1:9030 X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id: arn:aws:kms:my-minio-key
+127.0.0.1:9030 X-Ratelimit-Limit: 1142637
+127.0.0.1:9030 <BLOB>
+```
+
+So, under the encryption-mandating IAM policy: the **unencrypted PUT is denied 403**, while the
+**encrypted PUT succeeds (200)** and the **encrypted object reads back correctly (200, 52
+plaintext bytes, md5 `1c00e6dd…`)**.
 
 **Root cause (Path B — deny-wins).** For a regular authenticated user the authorization
 dispatch is `IAMSys.IsAllowed` [`cmd/iam.go:2437`]: it returns `true` immediately for the
@@ -378,259 +510,419 @@ deny wins in the policy evaluator regardless of the user's broad allow.
 > specific log entries that appear when someone tries to delete the locked objects? I want
 > you to give me runtime log output to show this."*
 
-A lock-enabled bucket was created with `mc mb --with-lock local/wormtest` (object locking
-implies versioning). Distinct object versions were then placed under **Governance**,
-**Compliance**, and **Legal Hold**, and versioned deletes were attempted.
+A lock-enabled bucket was created on the single-node server (`:9000`, alias `local`); object
+locking implies versioning. Distinct object versions were then placed under **Governance**,
+**Compliance**, and **Legal Hold**, and versioned deletes were attempted. The exact setup
+commands:
+
+```bash
+mc --config-dir /tmp/blitzy/mc-config mb --with-lock local/wormtest
+mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/gov.txt   local/wormtest/gov.txt
+mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/comp.txt  local/wormtest/comp.txt
+mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/trans.txt local/wormtest/trans.txt
+# apply per-object retention (version ids captured via mc ls --versions):
+mc --config-dir /tmp/blitzy/mc-config retention set --version-id 831099fa-01d1-44f0-862a-720fcd718214 governance "1d" local/wormtest/gov.txt
+mc --config-dir /tmp/blitzy/mc-config retention set --version-id d849a80f-c3ef-4c5d-b0f5-6f05077edfc2 compliance "1d" local/wormtest/comp.txt
+```
+
+The **Legal Hold** case is demonstrated on its own dedicated object (`lh2.txt`) in its
+subsection below, where the `legalhold set` / `info` / `clear` commands and their complete
+client output are shown inline for a fully self-contained state-change trace.
 
 **Where the "log entries" are.** At the default console log level the single-node server's
 console output (`minio-sn.log`) remained the startup banner only — MinIO emits **no
 per-delete console line** for a blocked delete. The runtime log evidence is therefore the
-**HTTP trace stream** (`mc admin trace`) plus the client-facing error. Note also that `mc`
-issues deletes through the S3 **batch** API `DeleteMultipleObjects` (`POST /wormtest/?delete=`),
-so a blocked delete returns **`200 OK`** at the HTTP layer with a per-object `<Error>`
-embedded inside the `<DeleteResult>` document — not a top-level HTTP error.
+**HTTP trace stream** plus the client-facing error. Every trace block below was produced by
+subscribing to the trace stream with:
+
+```bash
+mc --config-dir /tmp/blitzy/mc-config admin trace -v local
+```
+
+Note also that `mc` issues deletes through the S3 **batch** API `DeleteMultipleObjects`
+(`POST /wormtest/?delete=`), so a blocked delete returns **`200 OK`** at the HTTP layer with a
+per-object `<Error>` embedded inside the `<DeleteResult>` document — not a top-level HTTP
+error.
 
 ### Governance — blocked without bypass, allowed with bypass
 
-Attempting to delete a Governance-protected version **without** bypass
-(`mc rm --version-id <VID> local/wormtest/gov.txt`) — client result:
-`mc: <ERROR> ... 'gov.txt (Version ID=0fd838a4-...)' is WORM protected and cannot be
-overwritten.` Trace (`q2-gov-trace.txt`, lines 93–120):
+Attempting to delete a Governance-protected version **without** bypass. The exact command and
+its complete, unedited client output (the full version id is shown in the WORM error):
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm --version-id 831099fa-01d1-44f0-862a-720fcd718214 local/wormtest/gov.txt
+mc: <ERROR> Failed to remove `local/wormtest/gov.txt`. Object, 'gov.txt (Version ID=831099fa-01d1-44f0-862a-720fcd718214)' is WORM protected and cannot be overwritten
+```
+
+The corresponding `DeleteMultipleObjects` trace:
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:44:24.997] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:50:51.143] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 X-Amz-Content-Sha256: 1e7ad4c645b0d4b8daab1d4e0e8649cf6951757ea8ef59b195bb8f141441f556
-127.0.0.1:9000 X-Amz-Date: 20260706T224424Z
+127.0.0.1:9000 X-Amz-Content-Sha256: 71ba961ee0230b5bcc421892f71687f13d6a99cddbfa2f9bf6148cb3aa78e69f
+127.0.0.1:9000 X-Amz-Date: 20260706T235051Z
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=8cf81195a0e5dfa6e1fa0bb9536558bb5daeb394e2e497131e7c7ed148c57ec9
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=657a5a0b6a0a129bfc64cf2a1e8adde459517b7c6fb1a147a28ff0dfa11133b4
 127.0.0.1:9000 Content-Length: 131
-127.0.0.1:9000 Content-Md5: PahMdjFrXSMoEdIWzIa3eg==
-127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>gov.txt</Key><VersionId>0fd838a4-56f7-47f8-8ae1-c19c80981144</VersionId></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:44:24.998] [ Duration 370µs TTFB 354.607µs ↑ 236 B  ↓ 304 B ]
+127.0.0.1:9000 Content-Md5: wO1TYNN4ZdchwhVr2clcrQ==
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
+127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>gov.txt</Key><VersionId>831099fa-01d1-44f0-862a-720fcd718214</VersionId></Object></Delete>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:50:51.143] [ Duration 364µs TTFB 345.827µs ↑ 236 B  ↓ 304 B ]
 127.0.0.1:9000 200 OK
-127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4B82F7BC9EF
 127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
-127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
 127.0.0.1:9000 Content-Length: 304
-127.0.0.1:9000 Content-Type: application/xml
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
 127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD858484456BE
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>gov.txt</Key><VersionId>0fd838a4-56f7-47f8-8ae1-c19c80981144</VersionId></Error></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>gov.txt</Key><VersionId>831099fa-01d1-44f0-862a-720fcd718214</VersionId></Error></DeleteResult>
 ```
 
-Now **with** bypass (`mc rm --bypass --version-id <VID> local/wormtest/gov.txt`) — the
-request carries `x-amz-bypass-governance-retention` in its signed headers and **succeeds**
-(state change: version present → deleted). Trace (`q2-gov-trace.txt`, lines 302–330):
+Now **with** bypass — the request carries `x-amz-bypass-governance-retention` in its signed
+headers and **succeeds** (state change: version present → deleted). The exact command and its
+complete client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm --bypass --version-id 831099fa-01d1-44f0-862a-720fcd718214 local/wormtest/gov.txt
+Removed `local/wormtest/gov.txt` (versionId=831099fa-01d1-44f0-862a-720fcd718214).
+```
+
+The corresponding trace:
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:44:25.053] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:50:51.171] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 Content-Length: 131
-127.0.0.1:9000 Content-Md5: PahMdjFrXSMoEdIWzIa3eg==
-127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=126afdfba022c9628e2cc3f6ca7d74d19f07c9e38322a14df1fce94521db75f6
+127.0.0.1:9000 Content-Length: 131
+127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
+127.0.0.1:9000 X-Amz-Content-Sha256: 71ba961ee0230b5bcc421892f71687f13d6a99cddbfa2f9bf6148cb3aa78e69f
+127.0.0.1:9000 X-Amz-Date: 20260706T235051Z
+127.0.0.1:9000 Content-Md5: wO1TYNN4ZdchwhVr2clcrQ==
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 X-Amz-Content-Sha256: 1e7ad4c645b0d4b8daab1d4e0e8649cf6951757ea8ef59b195bb8f141441f556
-127.0.0.1:9000 X-Amz-Date: 20260706T224425Z
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=26adfc2c82de8de0609dab7d3a606586de4a7b7ffc78fffa860f74b896043d3d
-127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>gov.txt</Key><VersionId>0fd838a4-56f7-47f8-8ae1-c19c80981144</VersionId></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:44:25.053] [ Duration 784µs TTFB 768.084µs ↑ 270 B  ↓ 212 B ]
+127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>gov.txt</Key><VersionId>831099fa-01d1-44f0-862a-720fcd718214</VersionId></Object></Delete>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:50:51.171] [ Duration 827µs TTFB 811.423µs ↑ 270 B  ↓ 212 B ]
 127.0.0.1:9000 200 OK
-127.0.0.1:9000 Content-Type: application/xml
-127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 Vary: Origin,Accept-Encoding
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4B832C91945
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
-127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Length: 212
+127.0.0.1:9000 Content-Type: application/xml
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD85849EEC791
 127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>gov.txt</Key><VersionId>0fd838a4-56f7-47f8-8ae1-c19c80981144</VersionId></Deleted></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>gov.txt</Key><VersionId>831099fa-01d1-44f0-862a-720fcd718214</VersionId></Deleted></DeleteResult>
 ```
 
-The response body is now `<DeleteResult>...<Deleted><Key>gov.txt</Key><VersionId>0fd838a4-...
-</VersionId></Deleted></DeleteResult>` — the same version id that was previously refused.
+The response body (shown in full above) now reports the key under `<Deleted>` rather than
+`<Error>`, for the same version id `831099fa-01d1-44f0-862a-720fcd718214` that was previously
+refused.
 
 ### Compliance — never bypassable
 
-A Compliance-mode version (`X-Amz-Object-Lock-Mode: COMPLIANCE`, verified on the PUT) was
-targeted with a delete that **includes** `--bypass` (as root, with the bypass header). It is
-**still blocked** (`q2-comp-trace.txt`, lines 93–121):
+First, confirm the version really is in Compliance mode. The exact command and its complete,
+unedited output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config retention info --version-id d849a80f-c3ef-4c5d-b0f5-6f05077edfc2 local/wormtest/comp.txt
+Name    : local/wormtest/comp.txt
+Version : d849a80f-c3ef-4c5d-b0f5-6f05077edfc2
+Mode    : COMPLIANCE, expiring in 23 hours 59 minutes
+```
+
+This Compliance-mode version was then targeted with a delete that **includes** `--bypass` (as
+root, with the bypass header). It is **still blocked**. The exact command and its complete
+client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm --bypass --version-id d849a80f-c3ef-4c5d-b0f5-6f05077edfc2 local/wormtest/comp.txt
+mc: <ERROR> Failed to remove `local/wormtest/comp.txt`. Object, 'comp.txt (Version ID=d849a80f-c3ef-4c5d-b0f5-6f05077edfc2)' is WORM protected and cannot be overwritten
+```
+
+The corresponding trace — note the request carries `X-Amz-Bypass-Governance-Retention: true`
+yet the delete is refused:
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:45:00.185] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:50:51.199] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=f4e1d91b60b1fcbb09b16914907e499d60de7761b9cbc2aa71e6f724bd2738b5
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=c2625dceb275bcbd0fdf6ce1e1e84c912ddf652bb2fec4f23621e0606e7ef3c6
 127.0.0.1:9000 Content-Length: 132
 127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
-127.0.0.1:9000 X-Amz-Content-Sha256: f4f9eb5e1b99310d28e62660322891f560d5c8005a6588c33f9190038e94e200
-127.0.0.1:9000 X-Amz-Date: 20260706T224500Z
+127.0.0.1:9000 X-Amz-Content-Sha256: 09bd0cddb8187752954948527c849506692859099b44d1d07731a20d99f31c57
+127.0.0.1:9000 X-Amz-Date: 20260706T235051Z
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Content-Md5: PIS4raFHAgT/fs+wastVwQ==
+127.0.0.1:9000 Content-Md5: 1oZpL+S+XHHVCpTFiq3j5A==
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>comp.txt</Key><VersionId>b21bb9c0-bb4c-4116-b3e3-32b29d088940</VersionId></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:45:00.185] [ Duration 308µs TTFB 299.212µs ↑ 271 B  ↓ 305 B ]
+127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>comp.txt</Key><VersionId>d849a80f-c3ef-4c5d-b0f5-6f05077edfc2</VersionId></Object></Delete>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:50:51.199] [ Duration 309µs TTFB 296.518µs ↑ 271 B  ↓ 305 B ]
 127.0.0.1:9000 200 OK
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4C060CF49D6
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD8584B9B4666
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
 127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Length: 305
 127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 Vary: Origin,Accept-Encoding
 127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
 127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>comp.txt</Key><VersionId>b21bb9c0-bb4c-4116-b3e3-32b29d088940</VersionId></Error></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>comp.txt</Key><VersionId>d849a80f-c3ef-4c5d-b0f5-6f05077edfc2</VersionId></Error></DeleteResult>
 ```
 
 Even with the bypass header and root credentials, the `<Error>` with
 `Object is WORM protected and cannot be overwritten` is returned for `comp.txt` — Compliance
-cannot be bypassed by any user, including root. The object remained present after the failed
-delete.
+cannot be bypassed by any user, including root. **The object remained present after the failed
+delete**, proven by listing the version and stat-ing it (the retain-until date and mode are
+intact). The exact commands and their complete outputs:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config ls --versions local/wormtest/comp.txt
+[2026-07-06 23:50:20 UTC]    29B STANDARD d849a80f-c3ef-4c5d-b0f5-6f05077edfc2 v1 PUT comp.txt
+```
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config stat --version-id d849a80f-c3ef-4c5d-b0f5-6f05077edfc2 local/wormtest/comp.txt
+Name      : comp.txt
+Date      : 2026-07-06 23:50:20 UTC
+Size      : 29 B
+ETag      : 7baca876dee0aa3b7c80d8a2cf104809
+VersionID : d849a80f-c3ef-4c5d-b0f5-6f05077edfc2
+Type      : file
+Metadata  :
+  X-Amz-Object-Lock-Retain-Until-Date: 2026-07-07T23:50:21.000Z
+  X-Amz-Object-Lock-Mode             : COMPLIANCE
+  Content-Type                       : text/plain
+```
+
+(The three `Metadata` key/value pairs are always present, but their **order is
+non-deterministic across runs** — `mc` iterates a Go map — so a repeated `stat` may list the
+Mode / Retain-Until-Date / Content-Type lines in a different order; the values are identical.)
 
 ### Legal Hold — blocked while held, deletable after clearing
 
-With a legal hold set on `lh.txt`, the versioned delete is blocked
-(`q2-legalhold-trace.txt`, lines 91–119):
+A fresh object `lh2.txt` was created and a legal hold applied to its version. The exact commands
+and their complete client outputs (setting the hold, then confirming it is `ON`):
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config legalhold set --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+Object legal hold successfully set for `lh2.txt` (version-id=16619662-6849-4cee-ad51-f10d166f2213).
+
+$ mc --config-dir /tmp/blitzy/mc-config legalhold info --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+[    ON    ]  16619662-6849-4cee-ad51-f10d166f2213  lh2.txt
+```
+
+With the legal hold `ON`, the versioned delete is blocked. The exact command and its complete
+client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+mc: <ERROR> Failed to remove `local/wormtest/lh2.txt`. Object, 'lh2.txt (Version ID=16619662-6849-4cee-ad51-f10d166f2213)' is WORM protected and cannot be overwritten
+```
+
+The corresponding trace (note there is **no** bypass header — legal hold ignores the
+governance-bypass mechanism entirely):
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:45:19.729] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:57:55.752] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=cffa7a36eb380f844cb9a4b861d5bcd0e13a671a56dc4f5e2e98a0514c5c1552
-127.0.0.1:9000 Content-Length: 130
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=cc833bc7b9fe97356e713d57fc834ed6a1d6808e01a1380e2709ad8893307e5d
+127.0.0.1:9000 Content-Length: 131
+127.0.0.1:9000 Content-Md5: 4iKhQHGjGS/U3Xdy9BWyhA==
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 Content-Md5: q64Jdef1hLzfhjzoesV0ow==
-127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
-127.0.0.1:9000 X-Amz-Content-Sha256: 43275a7467d84339d265c99ee890e6434ea319518f374a423ba5330f0ff8d807
-127.0.0.1:9000 X-Amz-Date: 20260706T224519Z
-127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>lh.txt</Key><VersionId>70c3d788-b842-43bd-885e-da2a2aa2ae16</VersionId></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:45:19.729] [ Duration 313µs TTFB 304.763µs ↑ 269 B  ↓ 303 B ]
+127.0.0.1:9000 X-Amz-Content-Sha256: 90b9738583bfc05659c635e06f34f2a5c3d60b60a6dbb8fb2104c73643dfc023
+127.0.0.1:9000 X-Amz-Date: 20260706T235755Z
+127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>lh2.txt</Key><VersionId>16619662-6849-4cee-ad51-f10d166f2213</VersionId></Object></Delete>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:57:55.753] [ Duration 310µs TTFB 301.664µs ↑ 236 B  ↓ 304 B ]
 127.0.0.1:9000 200 OK
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD8BB24FC04E4
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Length: 304
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9000 Vary: Origin,Accept-Encoding
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4C4EDBFB9E9
-127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 Content-Length: 303
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>lh.txt</Key><VersionId>70c3d788-b842-43bd-885e-da2a2aa2ae16</VersionId></Error></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>lh2.txt</Key><VersionId>16619662-6849-4cee-ad51-f10d166f2213</VersionId></Error></DeleteResult>
 ```
 
-After clearing the hold (`mc legalhold clear local/wormtest/lh.txt --version-id <VID>`, which
-issues `s3.PutObjectLegalHold` setting status `OFF`), the identical delete now **succeeds**
-(`q2-legalhold-trace.txt`, lines 463–490):
+Now clear the hold. The exact command and its complete client output, followed by confirmation
+that the hold is `OFF`:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config legalhold clear --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+Object legal hold successfully cleared for `lh2.txt` (version-id=16619662-6849-4cee-ad51-f10d166f2213).
+
+$ mc --config-dir /tmp/blitzy/mc-config legalhold info --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+[    OFF   ]  16619662-6849-4cee-ad51-f10d166f2213  lh2.txt
+```
+
+The `legalhold clear` issues `s3.PutObjectLegalHold` with body `<LegalHold><Status>OFF</Status></LegalHold>`:
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:45:19.850] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.PutObjectLegalHold] [2026-07-06T23:57:55.783] [Client IP: 127.0.0.1]
+127.0.0.1:9000 PUT /wormtest/lh2.txt?legal-hold=&versionId=16619662-6849-4cee-ad51-f10d166f2213
+127.0.0.1:9000 Proto: HTTP/1.1
+127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 X-Amz-Date: 20260706T235755Z
+127.0.0.1:9000 Accept-Encoding: zstd,gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=3cedf3cfb64978dad743587082ce844b46adf7530026392774235dd1d2249c63
+127.0.0.1:9000 Content-Length: 43
+127.0.0.1:9000 Content-Md5: An8G3mv4SfhAibzslQjGDw==
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
+127.0.0.1:9000 X-Amz-Content-Sha256: eef107aae3d3794a8cdb229cacdbab087721ce49f43c55d9b64e17a769592030
+127.0.0.1:9000 <LegalHold><Status>OFF</Status></LegalHold>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:57:55.786] [ Duration 2.791ms TTFB 2.773363ms ↑ 148 B  ↓ 0 B ]
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD8BB26CD8E48
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Length: 0
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
+With the hold cleared, the identical delete now **succeeds**. The exact command and its complete
+client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm --version-id 16619662-6849-4cee-ad51-f10d166f2213 local/wormtest/lh2.txt
+Removed `local/wormtest/lh2.txt` (versionId=16619662-6849-4cee-ad51-f10d166f2213).
+```
+
+The corresponding trace:
+
+```text
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:57:55.843] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Content-Length: 131
+127.0.0.1:9000 Content-Md5: 4iKhQHGjGS/U3Xdy9BWyhA==
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 X-Amz-Content-Sha256: 43275a7467d84339d265c99ee890e6434ea319518f374a423ba5330f0ff8d807
-127.0.0.1:9000 X-Amz-Date: 20260706T224519Z
+127.0.0.1:9000 X-Amz-Content-Sha256: 90b9738583bfc05659c635e06f34f2a5c3d60b60a6dbb8fb2104c73643dfc023
+127.0.0.1:9000 X-Amz-Date: 20260706T235755Z
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=36f7a6f24ea0a2ffcfac0314af2d11118a3ee3b44a0640fc5e90485828f3b871
-127.0.0.1:9000 Content-Length: 130
-127.0.0.1:9000 Content-Md5: q64Jdef1hLzfhjzoesV0ow==
-127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>lh.txt</Key><VersionId>70c3d788-b842-43bd-885e-da2a2aa2ae16</VersionId></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:45:19.850] [ Duration 744µs TTFB 725.6µs ↑ 235 B  ↓ 211 B ]
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=cc833bc7b9fe97356e713d57fc834ed6a1d6808e01a1380e2709ad8893307e5d
+127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>lh2.txt</Key><VersionId>16619662-6849-4cee-ad51-f10d166f2213</VersionId></Object></Delete>
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:57:55.844] [ Duration 782µs TTFB 765.175µs ↑ 236 B  ↓ 212 B ]
 127.0.0.1:9000 200 OK
-127.0.0.1:9000 Content-Length: 211
+127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
 127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 Content-Length: 212
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD8BB2A5D7E81
 127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 Accept-Ranges: bytes
-127.0.0.1:9000 Content-Type: application/xml
-127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4C4F4F0F76F
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>lh.txt</Key><VersionId>70c3d788-b842-43bd-885e-da2a2aa2ae16</VersionId></Deleted></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>lh2.txt</Key><VersionId>16619662-6849-4cee-ad51-f10d166f2213</VersionId></Deleted></DeleteResult>
 ```
 
-State change is explicit: same version id `70c3d788-...` refused while held, then reported
-under `<Deleted>` once the hold is `OFF`.
+State change is explicit — and the two delete requests are **byte-identical**: both carry the
+same `Signature=cc833bc7...` and `Content-Md5: 4iKhQHGjGS/U3Xdy9BWyhA==`. The version id
+`16619662-...` was refused while the hold was `ON`, then reported under `<Deleted>` once the
+hold was `OFF`. Only the server-side legal-hold state changed the outcome, not the request.
 
 ### Transitional case — an *unversioned* delete creates a delete marker (not blocked)
 
 On a versioned bucket, a delete **without** `--version-id` does not remove the protected
-version; it creates a **delete marker** and is not itself blocked
-(`q2-transitional-trace.txt`, lines 93–120):
+version; it creates a **delete marker** and is not itself blocked. The exact command and its
+complete client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config rm local/wormtest/trans.txt
+Created delete marker `local/wormtest/trans.txt` (versionId=cbca6611-097c-4d21-abf6-209501123761).
+```
+
+The corresponding trace — note the request body carries **no** `<VersionId>`, and the response
+reports `<DeleteMarker>true</DeleteMarker>`:
 
 ```text
-127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T22:45:39.500] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [REQUEST s3.DeleteMultipleObjects] [2026-07-06T23:51:10.985] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /wormtest/?delete=
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=cbac4483d2967b83a9b56b93e88c5478798438013f3c536036d2ac0a986e1c07
-127.0.0.1:9000 Content-Length: 74
-127.0.0.1:9000 Content-Md5: 5vntUtVTbDRxYxmuYT6E0A==
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
 127.0.0.1:9000 X-Amz-Content-Sha256: 6de2624a1072a129c7d295a40475895f56d7cb3a97f5252770e865517e06e76e
-127.0.0.1:9000 X-Amz-Date: 20260706T224539Z
+127.0.0.1:9000 X-Amz-Date: 20260706T235110Z
+127.0.0.1:9000 Accept-Encoding: zstd,gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=0bb9db2f707290046d00cb27bd66c8fba72f25011e64c7e6a044f67f4c35ee0f
+127.0.0.1:9000 Content-Length: 74
+127.0.0.1:9000 Content-Md5: 5vntUtVTbDRxYxmuYT6E0A==
 127.0.0.1:9000 <Delete><Quiet>false</Quiet><Object><Key>trans.txt</Key></Object></Delete>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:45:39.506] [ Duration 5.335ms TTFB 5.316494ms ↑ 179 B  ↓ 271 B ]
+127.0.0.1:9000 [RESPONSE] [2026-07-06T23:51:10.987] [ Duration 2.084ms TTFB 2.066419ms ↑ 179 B  ↓ 271 B ]
 127.0.0.1:9000 200 OK
-127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
-127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD4C988361D81
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
-127.0.0.1:9000 Content-Length: 271
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 Content-Length: 271
 127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18BFD85CE6F4EBDA
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>e12b881a-43af-468f-b17c-5243772af1b8</DeleteMarkerVersionId><Key>trans.txt</Key></Deleted></DeleteResult>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>cbca6611-097c-4d21-abf6-209501123761</DeleteMarkerVersionId><Key>trans.txt</Key></Deleted></DeleteResult>
 ```
 
-`mc` reports `Created delete marker`. A subsequent `mc ls --versions` shows the new delete
-marker as the latest version on top of the retained, still-protected original version
-(`q2-transitional-trace.txt`, line 205 — the `ListVersions` result):
+A subsequent `mc ls --versions` shows the new delete marker as the latest version on top of the
+retained, still-protected original version. The exact command and its complete client output:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config ls --versions local/wormtest/trans.txt
+[2026-07-06 23:51:10 UTC]     0B STANDARD cbca6611-097c-4d21-abf6-209501123761 v2 DEL trans.txt
+[2026-07-06 23:50:21 UTC]    37B STANDARD 011d5c90-7a54-4f12-a285-f88459851d7e v1 PUT trans.txt
+```
+
+The equivalent server-side `ListVersions` XML (from the same trace) confirms the marker is
+`IsLatest=true` and the 37-byte original is retained beneath it:
 
 ```text
-<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>wormtest</Name><Prefix>trans.txt</Prefix><KeyMarker></KeyMarker><NextVersionIdMarker></NextVersionIdMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><Delimiter>/</Delimiter><IsTruncated>false</IsTruncated><DeleteMarker><Key>trans.txt</Key><LastModified>2026-07-06T22:45:39.501Z</LastModified><ETag></ETag><Size>0</Size><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner><StorageClass>STANDARD</StorageClass><IsLatest>true</IsLatest><VersionId>e12b881a-43af-468f-b17c-5243772af1b8</VersionId></DeleteMarker><Version><Key>trans.txt</Key><LastModified>2026-07-06T22:45:37.403Z</LastModified><ETag>&#34;a1192ec4e348c86a2d14f2e272a2f528&#34;</ETag><Size>21</Size><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner><StorageClass>STANDARD</StorageClass><IsLatest>false</IsLatest><VersionId>83159f82-8b86-4aef-802b-636793afed4a</VersionId></Version><EncodingType>url</EncodingType></ListVersionsResult>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>wormtest</Name><Prefix>trans.txt</Prefix><KeyMarker></KeyMarker><NextVersionIdMarker></NextVersionIdMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><Delimiter>/</Delimiter><IsTruncated>false</IsTruncated><DeleteMarker><Key>trans.txt</Key><LastModified>2026-07-06T23:51:10.985Z</LastModified><ETag></ETag><Size>0</Size><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner><StorageClass>STANDARD</StorageClass><IsLatest>true</IsLatest><VersionId>cbca6611-097c-4d21-abf6-209501123761</VersionId></DeleteMarker><Version><Key>trans.txt</Key><LastModified>2026-07-06T23:50:21.000Z</LastModified><ETag>&#34;d1560aefe7e2929bf15ce635d161fe61&#34;</ETag><Size>37</Size><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner><StorageClass>STANDARD</StorageClass><IsLatest>false</IsLatest><VersionId>011d5c90-7a54-4f12-a285-f88459851d7e</VersionId></Version><EncodingType>url</EncodingType></ListVersionsResult>
 ```
 
-The delete marker `e12b881a-...` is `IsLatest=true`; the original `83159f82-...` (21 bytes)
+The delete marker `cbca6611-...` is `IsLatest=true`; the original `011d5c90-...` (37 bytes)
 is retained beneath it.
 
 **Root cause / the exact log entry.** The interactive versioned-delete path enforces
@@ -682,158 +974,278 @@ deployment was used (a single-drive/FS backend does not exercise it):
     /tmp/blitzy/ec/d3 /tmp/blitzy/ec/d4 --address :9020 --console-address :9021
 ```
 
-The banner reports `Formatting 1st pool, 1 set(s), 4 drives per set`, and `mc admin info`
-reports `4 drives online ... EC:2` (2 data + 2 parity). A 1 MiB object was written to
-`ecbucket` (md5 `2dd35c41238dd1686cfc531341b00d21`) and stored as `part.1` on **all four**
-drives under `ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1` — each shard
-is 524320 bytes (512 KiB of data plus a 32-byte inline HighwayHash bit-rot checksum).
+The banner reports `Formatting 1st pool, 1 set(s), 4 drives per set`. `mc admin info` confirms
+the erasure geometry:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config admin info ec
+●  127.0.0.1:9020
+   Uptime: 9 seconds
+   Version: 2024-11-25T17:10:22Z
+   Network: 1/1 OK
+   Drives: 4/4 OK
+   Pool: 1
+
+┌──────┬──────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage         │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 1.6% (total: 48 TiB) │ 4                   │ 1            │
+└──────┴──────────────────────┴─────────────────────┴──────────────┘
+
+4 drives online, 0 drives offline, EC:2
+```
+
+A 1 MiB object was written to `ecbucket` and its plaintext md5 recorded. The exact commands and
+their complete output:
+
+```bash
+$ head -c 1048576 /dev/urandom > /tmp/blitzy/q3final_bigobj.bin
+$ md5sum /tmp/blitzy/q3final_bigobj.bin
+225b24b70e346643306d7fe507a8aabf  /tmp/blitzy/q3final_bigobj.bin
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/q3final_bigobj.bin ec/ecbucket/bigobj.bin
+`/tmp/blitzy/q3final_bigobj.bin` -> `ec/ecbucket/bigobj.bin`
+Total: 1.00 MiB, Transferred: 1.00 MiB, Speed: 39.68 MiB/s
+```
+
+The object (md5 `225b24b70e346643306d7fe507a8aabf`) is stored as `part.1` on **all four** drives
+under `ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1` (the directory name is
+the object's data-directory UUID). Listing the backend confirms the layout: each shard is 524320
+bytes (512 KiB of erasure-fragment data plus a 32-byte inline HighwayHash bit-rot checksum), and
+the four shards have **distinct** md5s (they are distinct erasure fragments, not replicas):
+
+```bash
+$ for d in d1 d2 d3 d4; do ls -l /tmp/blitzy/ec/$d/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1; md5sum /tmp/blitzy/ec/$d/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1; done
+-rw-r--r-- 1 root root 524320 Jul  7 00:28 /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+61a6aff4e38840eeb0ebc82318aeab6e  /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+-rw-r--r-- 1 root root 524320 Jul  7 00:28 /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+f77111ba5844327b4fa4f7b64ee70a86  /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+-rw-r--r-- 1 root root 524320 Jul  7 00:28 /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+af256d9e7255a016755bfbec87031648  /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+-rw-r--r-- 1 root root 524320 Jul  7 00:28 /tmp/blitzy/ec/d4/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+cd691e7483e5f701433c5293dde7ae24  /tmp/blitzy/ec/d4/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+```
 
 ### Recoverable corruption (≤ parity shards) — GET returns correct bytes; shard reconstructed
 
-One backend shard was zeroed directly on disk with
-`dd if=/dev/zero of=/tmp/blitzy/ec/d2/ecbucket/bigobj.bin/774f9782-.../part.1 bs=1024 count=64 seek=100 conv=notrunc`.
-A subsequent `GET` returned the **correct** bytes (md5 matched the original), and the trace
-shows the read served from surviving drives plus an auto-heal-on-read
-(`q3-trace.txt`, lines 142–204):
+One backend shard was zeroed directly on disk. The full command and its complete output:
 
-```text
-127.0.0.1:9020  [STORAGE storage.ReadFileStream] [2026-07-06T22:48:06.819] /tmp/blitzy/ec/d2 ecbucket bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 total-errs-availability=0 total-errs-timeout=0 26.362µs 512 KiB
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:06.819] /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 28.423µs
-127.0.0.1:9020  [STORAGE storage.ReadFileStream] [2026-07-06T22:48:06.819] /tmp/blitzy/ec/d1 ecbucket bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 total-errs-availability=0 total-errs-timeout=0 47.331µs 512 KiB
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:06.820] /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 19.491µs
-127.0.0.1:9020  [STORAGE storage.ReadFileStream] [2026-07-06T22:48:06.820] /tmp/blitzy/ec/d3 ecbucket bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 total-errs-availability=0 total-errs-timeout=0 32.076µs 512 KiB
-127.0.0.1:9020 [REQUEST s3.GetObject] [2026-07-06T22:48:06.819] [Client IP: 127.0.0.1]
-127.0.0.1:9020 GET /ecbucket/bigobj.bin
-127.0.0.1:9020 Proto: HTTP/1.1
-127.0.0.1:9020 Host: 127.0.0.1:9020
-127.0.0.1:9020 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-127.0.0.1:9020 X-Amz-Date: 20260706T224806Z
-127.0.0.1:9020 Accept-Encoding: identity
-127.0.0.1:9020 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=858d5e30d4d04f4d89828a20e0357e78900a401af1f2be64252a5346a1207025
-127.0.0.1:9020 Content-Length: 0
-127.0.0.1:9020 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9020 <BLOB>
-127.0.0.1:9020 [RESPONSE] [2026-07-06T22:48:06.833] [ Duration 14.171ms TTFB 13.261821ms ↑ 93 B  ↓ 1.0 MiB ]
-127.0.0.1:9020 200 OK
-127.0.0.1:9020 Accept-Ranges: bytes
-127.0.0.1:9020 ETag: "2dd35c41238dd1686cfc531341b00d21"
-127.0.0.1:9020 X-Content-Type-Options: nosniff
-127.0.0.1:9020 Content-Type: application/octet-stream
-127.0.0.1:9020 Last-Modified: Mon, 06 Jul 2026 22:47:39 GMT
-127.0.0.1:9020 Server: MinIO
-127.0.0.1:9020 Vary: Origin,Accept-Encoding
-127.0.0.1:9020 X-Xss-Protection: 1; mode=block
-127.0.0.1:9020 X-Amz-Id-2: 64084d77053f4fbd8e5405e6d076258766008f28b08394c799d1e979f6b5f3d6
-127.0.0.1:9020 X-Amz-Request-Id: 18BFD4EBD5148FB7
-127.0.0.1:9020 X-Ratelimit-Limit: 565440
-127.0.0.1:9020 Content-Length: 1048576
-127.0.0.1:9020 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9020 X-Ratelimit-Remaining: 565440
-127.0.0.1:9020 <BLOB>
-127.0.0.1:9020 
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4/.minio.sys/format.json 9.622µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2/.minio.sys/format.json 12.287µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3/.minio.sys/format.json 8.372µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4/ecbucket/bigobj.bin/xl.meta 30.552µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1/.minio.sys/format.json 10.584µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/xl.meta 31.692µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/xl.meta 25.237µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 103.068µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/xl.meta 32.107µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 103.233µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 92.047µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 80.698µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4/ecbucket/bigobj.bin/xl.meta 14.906µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/xl.meta 19.4µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 46.525µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/xl.meta 26.44µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2 ecbucket bigobj.bin total-errs-timeout=0 total-errs-availability=0 56.129µs
-127.0.0.1:9020  [OS os.OpenFileR] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/xl.meta 26.758µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 82.834µs
-127.0.0.1:9020  [STORAGE storage.ReadVersion] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 78.233µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 5.3µs
-127.0.0.1:9020  [STORAGE storage.CheckParts] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d1 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 19.27µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 3.396µs
-127.0.0.1:9020  [STORAGE storage.CheckParts] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d2 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 9.696µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 3.233µs
-127.0.0.1:9020  [STORAGE storage.CheckParts] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d3 ecbucket bigobj.bin total-errs-timeout=0 total-errs-availability=0 23.271µs
-127.0.0.1:9020  [OS os.Lstat] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4/ecbucket/bigobj.bin/774f9782-cf06-431d-8310-82e111d9277a/part.1 3.365µs
-127.0.0.1:9020  [STORAGE storage.CheckParts] [2026-07-06T22:48:07.834] /tmp/blitzy/ec/d4 ecbucket bigobj.bin total-errs-availability=0 total-errs-timeout=0 8.385µs
-127.0.0.1:9020  [HEALING heal.Object] [2026-07-06T22:48:07.834] ecbucket/bigobj.bin version-id=null disks=4 dry=false mode=0 remove=true 287.42µs 1.0 MiB
+```bash
+$ dd if=/dev/zero of=/tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1 bs=1024 count=64 seek=100 conv=notrunc
+64+0 records in
+64+0 records out
+65536 bytes (66 kB, 64 KiB) copied, 0.000259887 s, 66 MB/s
 ```
 
-The `GetObject` returns `200 OK` with the original ETag `"2dd35c41238dd1686cfc531341b00d21"`,
-and the `[HEALING heal.Object] ecbucket/bigobj.bin ... disks=4 ... remove=true` line shows
-the object being reconstructed on read. **At the default console log level `errFileCorrupt`
-is not printed** — reconstruction is transparent; the runtime evidence lives in the trace
-stream (reads from surviving drives + auto-heal-on-read).
+This overwrote 64 KiB of the `d2` shard, changing its md5 from the healthy
+`f77111ba5844327b4fa4f7b64ee70a86` to a corrupted `cdd474ae0b91d40bf6e1a8d87cd2b6b4`:
 
-**Heal scan depth matters.** Running the healer on a recoverable object shows that the
-**default (normal) scan is metadata-level** and does not repair in-place *data* bit rot,
-while a **deep scan** detects and reconstructs the corrupted shard from parity
-(`q3-heal.txt` — a clean re-demonstration on a fresh object `healdemo.bin`):
+```bash
+$ md5sum /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+cdd474ae0b91d40bf6e1a8d87cd2b6b4  /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+```
+
+A subsequent `GET` (via `mc cp`) still returned the **correct** bytes — the downloaded md5 matches
+the original `225b24b70e346643306d7fe507a8aabf` exactly:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp ec/ecbucket/bigobj.bin /tmp/blitzy/q3_dl_rec.bin
+`ec/ecbucket/bigobj.bin` -> `/tmp/blitzy/q3_dl_rec.bin`
+Total: 1.00 MiB, Transferred: 1.00 MiB, Speed: 118.89 MiB/s
+$ md5sum /tmp/blitzy/q3_dl_rec.bin
+225b24b70e346643306d7fe507a8aabf  /tmp/blitzy/q3_dl_rec.bin
+```
+
+The runtime trace of that GET (filtered to the S3, storage, and healing subsystems) shows the read
+served across the erasure set followed by a deferred auto-heal-on-read that fires ~1 s after the
+`200 OK` response:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config admin trace --call s3,storage,healing ec
+```
 
 ```text
-$ mc admin heal -r ec/ecbucket/healdemo.bin        # default (normal, metadata-level) scan
+2026-07-07T00:28:54.577 [STORAGE] storage.StatVol 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket 19.696µs
+2026-07-07T00:28:54.577 [STORAGE] storage.StatVol 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket 19.442µs
+2026-07-07T00:28:54.577 [STORAGE] storage.StatVol 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket 26.712µs
+2026-07-07T00:28:54.577 [STORAGE] storage.StatVol 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket 17.882µs
+2026-07-07T00:28:54.577 [200 OK] s3.GetBucketLocation 127.0.0.1:9020/ecbucket/?location=  127.0.0.1        347µs       ⇣  330.009µs  ↑ 93 B ↓ 128 B
+2026-07-07T00:28:54.577 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket bigobj.bin 66.207µs 368 B
+2026-07-07T00:28:54.577 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin 66.473µs 368 B
+2026-07-07T00:28:54.577 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin 54.788µs 368 B
+2026-07-07T00:28:54.577 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin 89.748µs 368 B
+2026-07-07T00:28:54.577 [200 OK] s3.HeadObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        534µs       ⇣  499.488µs  ↑ 97 B ↓ 0 B
+2026-07-07T00:28:54.579 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin 56.178µs 368 B
+2026-07-07T00:28:54.579 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket bigobj.bin 64.811µs 368 B
+2026-07-07T00:28:54.579 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin 49.853µs 368 B
+2026-07-07T00:28:54.579 [STORAGE] storage.ReadXL 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin 39.881µs 368 B
+2026-07-07T00:28:54.580 [STORAGE] storage.ReadFileStream 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1 41.509µs 512 KiB
+2026-07-07T00:28:54.580 [STORAGE] storage.ReadFileStream 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1 38.855µs 512 KiB
+2026-07-07T00:28:54.580 [STORAGE] storage.ReadFileStream 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1 43.383µs 512 KiB
+2026-07-07T00:28:54.579 [200 OK] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        2.217ms      ⇣  1.347183ms  ↑ 93 B ↓ 1.0 MiB
+2026-07-07T00:28:55.582 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin 99.307µs
+2026-07-07T00:28:55.582 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin 117.46µs
+2026-07-07T00:28:55.582 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket bigobj.bin 98.554µs
+2026-07-07T00:28:55.582 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin 82.473µs
+2026-07-07T00:28:55.583 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket bigobj.bin 39.032µs
+2026-07-07T00:28:55.583 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin 47.731µs
+2026-07-07T00:28:55.583 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin 48.414µs
+2026-07-07T00:28:55.583 [STORAGE] storage.ReadVersion 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin 88.811µs
+2026-07-07T00:28:55.583 [STORAGE] storage.CheckParts 127.0.0.1:9020 /tmp/blitzy/ec/d1 ecbucket bigobj.bin 24.708µs
+2026-07-07T00:28:55.583 [STORAGE] storage.CheckParts 127.0.0.1:9020 /tmp/blitzy/ec/d2 ecbucket bigobj.bin 10.196µs
+2026-07-07T00:28:55.583 [STORAGE] storage.CheckParts 127.0.0.1:9020 /tmp/blitzy/ec/d3 ecbucket bigobj.bin 8.875µs
+2026-07-07T00:28:55.583 [STORAGE] storage.CheckParts 127.0.0.1:9020 /tmp/blitzy/ec/d4 ecbucket bigobj.bin 9.218µs
+2026-07-07T00:28:55.582 [HEALING] heal.Object 127.0.0.1:9020 ecbucket/bigobj.bin 266.216µs 1.0 MiB
+```
+
+The `s3.GetObject` line returns `200 OK` with `↓ 1.0 MiB` (the full object). The `storage.ReadXL` calls read the erasure metadata across all four drives (two rounds — for the
+`HeadObject` and the `GetObject`); three `storage.ReadFileStream` calls then stream shard data
+(including the corrupted `d2`). Because only one shard is corrupt — within the `EC:2` parity budget
+of 2 — the object is reconstructed transparently and the GET returns the correct 1.0 MiB (per the
+md5 proof above). ~1 s later the `storage.ReadVersion` / `storage.CheckParts` sweep
+culminates in the `[HEALING] heal.Object 127.0.0.1:9020 ecbucket/bigobj.bin ... 1.0 MiB` event — an
+auto-heal-on-read scheduled for the object. **At the default console log level the `errFileCorrupt`
+sentinel is not printed**: detection and reconstruction are transparent to the client, and the runtime
+evidence lives in the trace stream.
+
+Critically, this auto-heal-on-read is **metadata-level**. Re-checking the `d2` shard immediately after
+the GET shows its md5 is **unchanged** — the in-place *data* bit rot on the shard is not repaired by
+the read itself:
+
+```bash
+$ md5sum /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+cdd474ae0b91d40bf6e1a8d87cd2b6b4  /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+```
+
+**Heal scan depth matters.** Running the healer explicitly on the recoverable object shows that the
+**default (normal) scan is metadata-level** and does not repair in-place *data* bit rot, while a **deep
+scan** detects the checksum mismatch and reconstructs the corrupted shard from parity. The producing
+commands and their complete output (the two `md5sum` invocations are the *same* command, run before and
+after the deep heal):
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config admin heal -r --force ec/ecbucket/bigobj.bin
 [Green  ->  Green] ecbucket/
-[Green  ->  Green] ecbucket/healdemo.bin
+[Green  ->  Green] ecbucket/bigobj.bin
 Healed:	0/1 objects; 1024 KiB in 1s
-
---- d2 shard md5 after NORMAL heal (still corrupted if metadata-only) ---
-ecbb6321a3f18a4e43c6b0180e876e5b
-$ mc admin heal -r --scan deep ec/ecbucket/healdemo.bin   # deep (data-level) scan
+$ md5sum /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+cdd474ae0b91d40bf6e1a8d87cd2b6b4  /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+$ mc --config-dir /tmp/blitzy/mc-config admin heal -r --scan deep --force ec/ecbucket/bigobj.bin
 [Green  ->  Green] ecbucket/
-[Yellow ->  Green] ecbucket/healdemo.bin
+[Yellow ->  Green] ecbucket/bigobj.bin
 Healed:	1/1 objects; 1024 KiB in 1s
-
---- d2 shard md5 after DEEP heal (restored to healthy) ---
-e00564d89b0377749f3c85d157814caf
+$ md5sum /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
+f77111ba5844327b4fa4f7b64ee70a86  /tmp/blitzy/ec/d2/ecbucket/bigobj.bin/cf2bc347-af1e-404f-9619-d8d861e36ac6/part.1
 ```
 
-The corrupted shard md5 is unchanged after the normal scan (`[Green -> Green]`,
-`Healed: 0/1`) but is restored to its original healthy value after the deep scan
-(`[Yellow -> Green]`, `Healed: 1/1`) — confirming that deep data bit rot is caught on the
-**read path** (or by an explicit deep heal), not by the default metadata heal.
+After the normal scan the corrupted shard md5 is **unchanged** (`[Green -> Green]`, `Healed: 0/1`); after
+the deep scan it is **restored to its original healthy value** `f77111ba5844327b4fa4f7b64ee70a86`
+(`[Yellow -> Green]`, `Healed: 1/1`) — confirming that in-place data bit rot is caught and repaired
+on the **read path** (auto-heal-on-read, metadata level) or by an explicit **deep** heal (data-level
+reconstruction from parity), not by the default metadata heal.
+
+**Two-run stability (magnitude/consistency rule).** The recoverable outcome was confirmed stable across
+two independent runs using the *identical* 1 MiB input. **Run 1** is the demonstration above (VID
+`cf2bc347-af1e-404f-9619-d8d861e36ac6`, downloaded md5 `225b24b70e346643306d7fe507a8aabf`). **Run 2**
+re-uploaded the same file to a fresh data-directory UUID `1f1f04bc-f786-4b8a-bb4c-f84ce7b899fb`,
+corrupted its `d2` shard the same way, and read it back — the download md5 again matched the original
+exactly:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/q3final_bigobj.bin ec/ecbucket/bigobj.bin
+`/tmp/blitzy/q3final_bigobj.bin` -> `ec/ecbucket/bigobj.bin`
+Total: 1.00 MiB, Transferred: 1.00 MiB, Speed: 40.40 MiB/s
+$ dd if=/dev/zero of=/tmp/blitzy/ec/d2/ecbucket/bigobj.bin/1f1f04bc-f786-4b8a-bb4c-f84ce7b899fb/part.1 bs=1024 count=64 seek=100 conv=notrunc
+64+0 records in
+64+0 records out
+65536 bytes (66 kB, 64 KiB) copied, 0.00787025 s, 9.4 MB/s
+$ mc --config-dir /tmp/blitzy/mc-config cp ec/ecbucket/bigobj.bin /tmp/blitzy/q3_dl_run2.bin
+`ec/ecbucket/bigobj.bin` -> `/tmp/blitzy/q3_dl_run2.bin`
+Total: 1.00 MiB, Transferred: 1.00 MiB, Speed: 41.11 MiB/s
+$ md5sum /tmp/blitzy/q3_dl_run2.bin
+225b24b70e346643306d7fe507a8aabf  /tmp/blitzy/q3_dl_run2.bin
+```
+
+Both runs returned the original md5 `225b24b70e346643306d7fe507a8aabf` — the recoverable behavior is
+stable across two independent runs with identical input.
 
 ### Unrecoverable corruption (> parity shards) — client sees `SlowDownRead` / HTTP 503
 
-Corrupting **3 of 4** shards (only `d4` intact — beyond the `EC:2` parity of 2) and issuing a
-`GET` makes the object unreadable. The client fails with
-`Resource requested is unreadable, please reduce your request rate`; the trace shows
-`503 Service Unavailable` with `Retry-After: 60` and an S3 `SlowDownRead` error
-(`q3-fail-trace.txt`, lines 149–178):
+Corrupting **3 of 4** shards (leaving only `d4` intact — beyond the `EC:2` parity of 2) makes the
+object unreadable. Continuing on the run-2 object (data-directory UUID
+`1f1f04bc-f786-4b8a-bb4c-f84ce7b899fb`, whose `d2` shard was already corrupt from the run above), the
+`d1` and `d3` shards were zeroed the same way. The resulting per-shard md5 map shows three corrupted
+shards and one healthy shard — `d4`, still matching its healthy baseline
+`cd691e7483e5f701433c5293dde7ae24`:
+
+```bash
+$ for d in d1 d2 d3 d4; do printf "%s  " $d; md5sum /tmp/blitzy/ec/$d/ecbucket/bigobj.bin/1f1f04bc-f786-4b8a-bb4c-f84ce7b899fb/part.1 | awk '{print $1}'; done
+d1  c4f9e03fb514fb59b664cb09cb0821ff
+d2  cdd474ae0b91d40bf6e1a8d87cd2b6b4
+d3  a9425c84dada52f89a7b51c63e7220bd
+d4  cd691e7483e5f701433c5293dde7ae24
+```
+
+A `GET` (via `mc cp`) now **fails** on the client with a rate-limit-style error:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp ec/ecbucket/bigobj.bin /tmp/blitzy/q3_dl_fail.bin
+`ec/ecbucket/bigobj.bin` -> `/tmp/blitzy/q3_dl_fail.bin`
+mc: <ERROR> Failed to copy `http://127.0.0.1:9020/ecbucket/bigobj.bin`. Resource requested is unreadable, please reduce your request rate
+```
+
+The trace shows `GetBucketLocation` and `HeadObject` succeed (`200 OK`) but every `s3.GetObject` returns
+`503 Service Unavailable` with only `↓ 378 B` (the XML error body, not the object). The `mc` client
+auto-retries; the trace captured **10** consecutive `503` GetObject attempts:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config admin trace --call s3 ec
+```
 
 ```text
-127.0.0.1:9020 [REQUEST s3.GetObject] [2026-07-06T22:49:52.746] [Client IP: 127.0.0.1]
-127.0.0.1:9020 GET /ecbucket/bigobj.bin
-127.0.0.1:9020 Proto: HTTP/1.1
-127.0.0.1:9020 Host: 127.0.0.1:9020
-127.0.0.1:9020 Content-Length: 0
-127.0.0.1:9020 User-Agent: MinIO (linux; amd64) minio-go/v7.0.77 mc/DEVELOPMENT.GOGET
-127.0.0.1:9020 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-127.0.0.1:9020 X-Amz-Date: 20260706T224952Z
-127.0.0.1:9020 Accept-Encoding: identity
-127.0.0.1:9020 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260706/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=682d99d9349c7e576dd3413edfae27a229641f13be077e7d16cb498ea64d46e3
-127.0.0.1:9020 <BLOB>
-127.0.0.1:9020 [RESPONSE] [2026-07-06T22:49:52.748] [ Duration 1.616ms TTFB 1.603826ms ↑ 93 B  ↓ 378 B ]
-127.0.0.1:9020 503 Service Unavailable
-127.0.0.1:9020 Server: MinIO
-127.0.0.1:9020 X-Ratelimit-Limit: 565440
-127.0.0.1:9020 Accept-Ranges: bytes
-127.0.0.1:9020 Content-Length: 378
-127.0.0.1:9020 Retry-After: 60
-127.0.0.1:9020 X-Xss-Protection: 1; mode=block
-127.0.0.1:9020 Content-Type: application/xml
-127.0.0.1:9020 Last-Modified: Mon, 06 Jul 2026 22:47:39 GMT
-127.0.0.1:9020 Vary: Origin,Accept-Encoding
-127.0.0.1:9020 ETag: "2dd35c41238dd1686cfc531341b00d21"
-127.0.0.1:9020 Strict-Transport-Security: max-age=31536000; includeSubDomains
-127.0.0.1:9020 X-Amz-Id-2: 64084d77053f4fbd8e5405e6d076258766008f28b08394c799d1e979f6b5f3d6
-127.0.0.1:9020 X-Amz-Request-Id: 18BFD5047ED51573
-127.0.0.1:9020 X-Content-Type-Options: nosniff
-127.0.0.1:9020 X-Ratelimit-Remaining: 565440
-127.0.0.1:9020 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>bigobj.bin</Key><BucketName>ecbucket</BucketName><Resource>/ecbucket/bigobj.bin</Resource><RequestId>18BFD5047ED51573</RequestId><HostId>64084d77053f4fbd8e5405e6d076258766008f28b08394c799d1e979f6b5f3d6</HostId></Error>
+2026-07-07T00:33:15.761 [200 OK] s3.GetBucketLocation 127.0.0.1:9020/ecbucket/?location=  127.0.0.1        426µs       ⇣  402.994µs  ↑ 93 B ↓ 128 B
+2026-07-07T00:33:15.762 [200 OK] s3.HeadObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        564µs       ⇣  540.7µs   ↑ 97 B ↓ 0 B
+2026-07-07T00:33:15.764 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.16ms       ⇣  1.143116ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:15.861 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.396ms      ⇣  1.371893ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:15.890 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.857ms      ⇣  1.832622ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:16.649 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.714ms      ⇣  1.692176ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:16.779 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.761ms      ⇣  1.744697ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:17.487 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.621ms      ⇣  1.594135ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:18.432 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.621ms      ⇣  1.59973ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:19.153 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.7ms        ⇣  1.677299ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:19.889 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.634ms      ⇣  1.613417ms  ↑ 93 B ↓ 378 B
+2026-07-07T00:33:19.942 [503 Service Unavailable] s3.GetObject 127.0.0.1:9020/ecbucket/bigobj.bin 127.0.0.1        1.507ms      ⇣  1.48835ms  ↑ 93 B ↓ 378 B
+```
+
+Fetching the raw HTTP response (via `mc --debug cat`) shows the exact S3 error: HTTP `503 Service
+Unavailable` with `Retry-After: 60`, `Content-Type: application/xml`, and an XML body whose `<Code>` is
+`SlowDownRead` (the `Etag` header still carries the original object md5, and `X-Amz-Request-Id` matches
+the `<RequestId>` in the body):
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config --debug cat ec/ecbucket/bigobj.bin
+```
+
+```text
+mc: <DEBUG> HTTP/1.1 503 Service Unavailable
+Content-Length: 378
+Accept-Ranges: bytes
+Content-Type: application/xml
+Date: Tue, 07 Jul 2026 00:29:06 GMT
+Etag: "225b24b70e346643306d7fe507a8aabf"
+Last-Modified: Tue, 07 Jul 2026 00:29:00 GMT
+Retry-After: 60
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: 64084d77053f4fbd8e5405e6d076258766008f28b08394c799d1e979f6b5f3d6
+X-Amz-Request-Id: 18BFDA6EB9071AD9
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 564934
+X-Ratelimit-Remaining: 564934
+X-Xss-Protection: 1; mode=block
+
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>bigobj.bin</Key><BucketName>ecbucket</BucketName><Resource>/ecbucket/bigobj.bin</Resource><RequestId>18BFDA6EB9071AD9</RequestId><HostId>64084d77053f4fbd8e5405e6d076258766008f28b08394c799d1e979f6b5f3d6</HostId></Error>
 ```
 
 > **Correction to the AAP phrasing (observed).** The internal sentinel is
@@ -842,7 +1254,8 @@ Corrupting **3 of 4** shards (only `d4` intact — beyond the `EC:2` parity of 2
 > `<Code>SlowDownRead</Code>` at **HTTP 503 Service Unavailable** (with `Retry-After: 60`),
 > a *retryable* error — not a literal "file is corrupted" message. The two must not be
 > conflated: `errFileCorrupt` is internal; `SlowDownRead`/503 is what the S3 client sees. The
-> request was retried 10× by the client, each returning 503.
+> `mc` client auto-retried the GET; the S3 trace above captured **10** consecutive `503`
+> responses, each returning only the 378-byte XML error body (`↓ 378 B`).
 
 **Root cause / detection chain.** The per-shard verifier is built by `NewBitrotVerifier`
 [`cmd/bitrot.go:83`] over the algorithm map `bitrotAlgorithms` [`cmd/bitrot.go:39`] and
@@ -876,20 +1289,33 @@ fails with S3 `SlowDownRead` / HTTP 503.
 > to prove this behavior."*
 
 A parent user `stsparent` was created with the built-in `readwrite` policy (`s3:*` on
-everything). Temporary credentials were then obtained via STS `AssumeRole` while supplying a
-**restrictive inline session policy** allowing only `s3:PutObject`/`s3:GetObject` on
-`stsbucket/*`. The temporary credentials were then exercised. The test program
-(`minio-go/v7 v7.0.80`) was run with:
+everything); a restrictive inline **session policy** was then supplied at `AssumeRole` time
+allowing only `s3:PutObject`/`s3:GetObject` on `stsbucket/*`. Setup:
 
 ```bash
-cd /tmp/blitzy/scripts/q4 && ./q4prog        # builds against the repo's pinned module graph
+mc --config-dir /tmp/blitzy/mc-config admin user add local stsparent stsparentsecret123
+mc --config-dir /tmp/blitzy/mc-config admin policy attach local readwrite --user stsparent
+mc --config-dir /tmp/blitzy/mc-config mb local/stsbucket
+mc --config-dir /tmp/blitzy/mc-config mb local/otherbucket
 ```
 
-Program stdout (verbatim, `q4-sts.txt`):
+The temporary credentials were obtained and exercised by a small Go program built against the
+repository's pinned `minio-go/v7 v7.0.80` (`/tmp/blitzy/scripts/q4/main.go`, module `q4prog`).
+It calls `credentials.NewSTSAssumeRole` with the inline session policy
 
-```text
+```go
+const sessionPolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::stsbucket/*"]}]}`
+```
+
+then uses the returned temporary credentials for four actions: an in-session `PutObject` and
+`GetObject` on `stsbucket`, an out-of-session `PutObject` on `otherbucket`, and an
+out-of-session `ListBuckets`. It was run with the exact invocation below (offline, resolving
+`minio-go` from the warmed module cache); its complete stdout is shown verbatim:
+
+```bash
+$ cd /tmp/blitzy/scripts/q4 && GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off go run .
 PARENT-ACCESSKEY: stsparent
-TEMP-ACCESSKEY: Y9ZODVYTJQVMILNIX5J3
+TEMP-ACCESSKEY: HGSDFQLBQOM4E1SSOV0F
 SESSION-TOKEN-PRESENT: true
 SIGNER-TYPE: S3v4
 IN-SESSION  PutObject stsbucket/in.txt  => ALLOWED (success)
@@ -903,120 +1329,207 @@ Both **in-session** actions (PutObject/GetObject on `stsbucket`) are **ALLOWED**
 even though the parent `readwrite` policy allows them. The effective permission set is the
 **intersection** of the parent policy and the session policy.
 
-**Server-side trace.** `AssumeRole` returns `200 OK` with a temporary access key and a
-`SessionToken` JWT (`q4-trace.txt`, lines 74–99):
+**Server-side trace.** The entire `go run` was captured with a verbose trace subscribed by the
+root alias (`mc --config-dir /tmp/blitzy/mc-config admin trace --all -v local`, saved to
+`/tmp/blitzy/logs/q4final/q4-trace-all.txt`). The individual request/response blocks below are
+sliced from that single capture with `sed` (the expired STS `SecretAccessKey` and the JWT
+signature are redacted; the JWT header and payload are shown intact). `AssumeRole` returns
+`200 OK` with a temporary access key and a `SessionToken` JWT:
 
-```text
-127.0.0.1:9000  [STORAGE storage.Delete] [2026-07-06T22:55:28.918] /tmp/blitzy/data .minio.sys/tmp 9787ca07-2222-458a-80d2-d2165e342982 total-errs-availability=0 total-errs-timeout=0 38.251µs
-127.0.0.1:9000 [REQUEST sts.AssumeRole] [2026-07-06T22:55:28.915] [Client IP: 127.0.0.1]
+```bash
+$ sed -n '79,103p' /tmp/blitzy/logs/q4final/q4-trace-all.txt
+127.0.0.1:9000 [REQUEST sts.AssumeRole] [2026-07-07T00:49:53.438] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=stsparent/20260707//sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=eb9e5151ead6aaac59055715cfd1dcdb98babf7a002629b0c786e8fa02bdec2f
 127.0.0.1:9000 Content-Length: 299
 127.0.0.1:9000 Content-Type: application/x-www-form-urlencoded
 127.0.0.1:9000 User-Agent: Go-http-client/1.1
-127.0.0.1:9000 X-Amz-Date: 20260706T225528Z
+127.0.0.1:9000 X-Amz-Date: 20260707T004953Z
 127.0.0.1:9000 Accept-Encoding: gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=stsparent/20260706/us-east-1/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=99af6ca58dd2ee7584fab4211aeab19b42ae9d313e845df55af964a156ca5034
 127.0.0.1:9000 Action=AssumeRole&DurationSeconds=3600&Policy=%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%5B%22s3%3APutObject%22%2C%22s3%3AGetObject%22%5D%2C%22Resource%22%3A%5B%22arn%3Aaws%3As3%3A%3A%3Astsbucket%2F%2A%22%5D%7D%5D%7D&Version=2011-06-15
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:55:28.918] [ Duration 2.557ms TTFB 2.552204ms ↑ 384 B  ↓ 1.0 KiB ]
+127.0.0.1:9000 [RESPONSE] [2026-07-07T00:49:53.444] [ Duration 6.785ms TTFB 6.781972ms ↑ 384 B  ↓ 1.0 KiB ]
 127.0.0.1:9000 200 OK
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDB91097FD482
+127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Length: 1035
 127.0.0.1:9000 Content-Type: application/xml
 127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD552C413C41D
-127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 Vary: Origin
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Content-Type-Options: nosniff
 127.0.0.1:9000 X-Xss-Protection: 1; mode=block
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><AssumedRoleUser><Arn></Arn><AssumeRoleId></AssumeRoleId></AssumedRoleUser><Credentials><AccessKeyId>Y9ZODVYTJQVMILNIX5J3</AccessKeyId><SecretAccessKey><redacted-expired-STS-secret></SecretAccessKey><SessionToken>eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJZOVpPRFZZVEpRVk1JTE5JWDVKMyIsImV4cCI6MTc4MzM4MjEyOCwicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWl3aWN6TTZVSFYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted></SessionToken><Expiration>2026-07-06T23:55:28Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>18BFD552C413C41D</RequestId></ResponseMetadata></AssumeRoleResponse>
+<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><AssumedRoleUser><Arn></Arn><AssumeRoleId></AssumeRoleId></AssumedRoleUser><Credentials><AccessKeyId>HGSDFQLBQOM4E1SSOV0F</AccessKeyId><SecretAccessKey><redacted-expired-STS-secret></SecretAccessKey><SessionToken>eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIR1NERlFMQlFPTTRFMVNTT1YwRiIsImV4cCI6MTc4MzM4ODk5MywicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02VUhWMFQySnFaV04wSWl3aWN6TTZSMlYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted></SessionToken><Expiration>2026-07-07T01:49:53Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>18BFDB91097FD482</RequestId></ResponseMetadata></AssumeRoleResponse>
 ```
 
 The `Policy=...` form field carries the URL-encoded session policy, and the request is signed
 by the parent (`Credential=stsparent/.../sts/aws4_request`). The returned `SessionToken` is a
-JWT; decoding its payload proves the session policy is embedded as a base64 claim:
+JWT; decoding its payload (read from the pre-redaction raw capture) proves the session policy is
+embedded as a base64 claim:
 
-```text
-$ # base64url-decode the JWT payload of the returned SessionToken
+```bash
+$ TOKEN=$(sed -n 's/.*<SessionToken>\(.*\)<\/SessionToken>.*/\1/p' /tmp/blitzy/logs/q4final/q4-trace-all.raw.txt)
+$ python3 -c 'import sys,base64,json; p=sys.argv[1].split(".")[1]; d=json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4))); print("JWT claims keys:",sorted(d)); print("parent:",d["parent"]); sp=d["sessionPolicy"]; print("decoded sessionPolicy:",base64.b64decode(sp+"="*(-len(sp)%4)).decode())' "$TOKEN"
 JWT claims keys: ['accessKey', 'exp', 'parent', 'sessionPolicy']
 parent: stsparent
-decoded sessionPolicy: {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::stsbucket/*"]}]}
+decoded sessionPolicy: {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::stsbucket/*"]}]}
 ```
 
-**In-session PutObject → 200 OK** (`q4-trace.txt`, lines 149–172):
+The claim `sessionPolicy` inside the JWT decodes to exactly the inline policy supplied at
+`AssumeRole` time, and `parent` records the issuing user `stsparent`.
 
-```text
-127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-06T22:55:28.920] [Client IP: 127.0.0.1]
+**In-session PutObject → `200 OK`.** The request is signed with the **temporary** access key
+plus an `X-Amz-Security-Token`, and returns `200 OK` with an ETag:
+
+```bash
+$ sed -n '146,173p' /tmp/blitzy/logs/q4final/q4-trace-all.txt
+127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-07T00:49:53.446] [Client IP: 127.0.0.1]
 127.0.0.1:9000 PUT /stsbucket/in.txt
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=HGSDFQLBQOM4E1SSOV0F/20260707/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token,Signature=34696505fae8ca22a93d903532717bcfdf5cab7a87115b76905d939cc3d97421
 127.0.0.1:9000 Content-Length: 204
 127.0.0.1:9000 Content-Type: text/plain
-127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
-127.0.0.1:9000 X-Amz-Decoded-Content-Length: 31
-127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJZOVpPRFZZVEpRVk1JTE5JWDVKMyIsImV4cCI6MTc4MzM4MjEyOCwicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWl3aWN6TTZVSFYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=Y9ZODVYTJQVMILNIX5J3/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token,Signature=cd61964bc3dc47c69878975e284c93532dfeb9973eb9ca168d91b09a84f40db5
 127.0.0.1:9000 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
-127.0.0.1:9000 X-Amz-Date: 20260706T225528Z
+127.0.0.1:9000 X-Amz-Decoded-Content-Length: 31
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
+127.0.0.1:9000 X-Amz-Date: 20260707T004953Z
+127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIR1NERlFMQlFPTTRFMVNTT1YwRiIsImV4cCI6MTc4MzM4ODk5MywicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02VUhWMFQySnFaV04wSWl3aWN6TTZSMlYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
 127.0.0.1:9000 <BLOB>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:55:28.923] [ Duration 3.437ms TTFB 3.418116ms ↑ 344 B  ↓ 0 B ]
+127.0.0.1:9000 [RESPONSE] [2026-07-07T00:49:53.448] [ Duration 2.024ms TTFB 1.996314ms ↑ 344 B  ↓ 0 B ]
 127.0.0.1:9000 200 OK
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
 127.0.0.1:9000 Accept-Ranges: bytes
-127.0.0.1:9000 ETag: "6ea8c232b6d583f3bf97836b1097fcb6"
-127.0.0.1:9000 Server: MinIO
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD552C456F44D
 127.0.0.1:9000 Content-Length: 0
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDB910A012BB4
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 ETag: "e7aede4e6cc5c68b105a06df0a7c5891"
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 <BLOB>
 ```
 
-The request is signed with the **temporary** access key plus an `X-Amz-Security-Token`, and
-returns `200 OK` with an ETag.
+**Out-of-session PutObject → `403 AccessDenied`.** Same temporary credentials, but writing to
+`otherbucket` (outside the session policy's `stsbucket/*` resource) is rejected `403` with
+`<Code>AccessDenied</Code>` — despite the parent `readwrite` policy allowing `s3:*`:
 
-**Out-of-session PutObject → 403 AccessDenied** (`q4-trace.txt`, lines 206–234):
-
-```text
-127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-06T22:55:28.924] [Client IP: 127.0.0.1]
+```bash
+$ sed -n '203,231p' /tmp/blitzy/logs/q4final/q4-trace-all.txt
+127.0.0.1:9000 [REQUEST s3.PutObject] [2026-07-07T00:49:53.449] [Client IP: 127.0.0.1]
 127.0.0.1:9000 PUT /otherbucket/out.txt
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
-127.0.0.1:9000 X-Amz-Date: 20260706T225528Z
-127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJZOVpPRFZZVEpRVk1JTE5JWDVKMyIsImV4cCI6MTc4MzM4MjEyOCwicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWl3aWN6TTZVSFYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=Y9ZODVYTJQVMILNIX5J3/20260706/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token,Signature=bcdc43a6255b91205107f784358a19aef2916c1e05e1e2f967ba90e80734d0d9
 127.0.0.1:9000 Content-Type: text/plain
-127.0.0.1:9000 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
 127.0.0.1:9000 X-Amz-Decoded-Content-Length: 31
+127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIR1NERlFMQlFPTTRFMVNTT1YwRiIsImV4cCI6MTc4MzM4ODk5MywicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02VUhWMFQySnFaV04wSWl3aWN6TTZSMlYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=HGSDFQLBQOM4E1SSOV0F/20260707/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token,Signature=ed4582b99d88b3a55899d97ebd4d5b09314480aa961338346e0480fca8c7b18d
 127.0.0.1:9000 Content-Length: 204
+127.0.0.1:9000 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+127.0.0.1:9000 X-Amz-Date: 20260707T004953Z
 127.0.0.1:9000 <BLOB>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:55:28.924] [ Duration 210µs TTFB 202.491µs ↑ 140 B  ↓ 327 B ]
+127.0.0.1:9000 [RESPONSE] [2026-07-07T00:49:53.449] [ Duration 182µs TTFB 163.622µs ↑ 140 B  ↓ 327 B ]
 127.0.0.1:9000 403 Forbidden
-127.0.0.1:9000 Content-Type: application/xml
-127.0.0.1:9000 X-Ratelimit-Limit: 1141211
-127.0.0.1:9000 X-Ratelimit-Remaining: 1141211
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
 127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Length: 327
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Content-Type: application/xml
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDB910A2DFC7A
+127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>out.txt</Key><BucketName>otherbucket</BucketName><Resource>/otherbucket/out.txt</Resource><RequestId>18BFDB910A2DFC7A</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+**In-session GetObject → `200 OK` (reads 31 bytes).** The in-session read of the object written
+above succeeds; the `[RESPONSE]` line reports `↓ 31 B`, exactly the 31-byte payload, matching
+the program's `read 31 bytes`:
+
+```bash
+$ sed -n '235,262p' /tmp/blitzy/logs/q4final/q4-trace-all.txt
+127.0.0.1:9000 [REQUEST s3.GetObject] [2026-07-07T00:49:53.450] [Client IP: 127.0.0.1]
+127.0.0.1:9000 GET /stsbucket/in.txt
+127.0.0.1:9000 Proto: HTTP/1.1
+127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=HGSDFQLBQOM4E1SSOV0F/20260707/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=581197c715d3846eb78bb503a7faa11fb77e36f50efe7dfaf61e19c3f4f0b5fa
+127.0.0.1:9000 Content-Length: 0
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
+127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+127.0.0.1:9000 X-Amz-Date: 20260707T004953Z
+127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIR1NERlFMQlFPTTRFMVNTT1YwRiIsImV4cCI6MTc4MzM4ODk5MywicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02VUhWMFQySnFaV04wSWl3aWN6TTZSMlYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
+127.0.0.1:9000 <BLOB>
+127.0.0.1:9000 [RESPONSE] [2026-07-07T00:49:53.450] [ Duration 778µs TTFB 748.379µs ↑ 98 B  ↓ 31 B ]
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 ETag: "e7aede4e6cc5c68b105a06df0a7c5891"
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDB910A363D75
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Type: text/plain
+127.0.0.1:9000 Last-Modified: Tue, 07 Jul 2026 00:49:53 GMT
+127.0.0.1:9000 Content-Length: 31
 127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 Vary: Origin,Accept-Encoding
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD552C49A1F87
-127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>out.txt</Key><BucketName>otherbucket</BucketName><Resource>/otherbucket/out.txt</Resource><RequestId>18BFD552C49A1F87</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 <BLOB>
 ```
 
-Same temporary credentials, but writing to `otherbucket` (outside the session policy's
-`stsbucket/*` resource) is rejected `403` with `<Code>AccessDenied</Code>` — despite the
-parent `readwrite` policy allowing `s3:*`. (`ListBuckets` with the same credentials is
-likewise denied — `q4-trace.txt` lines 269–297 — because the session policy does not grant
-`s3:ListAllMyBuckets`.)
+**Out-of-session ListBuckets → `403 AccessDenied`.** `ListBuckets` with the same credentials is
+denied because the session policy does not grant `s3:ListAllMyBuckets`:
+
+```bash
+$ sed -n '266,294p' /tmp/blitzy/logs/q4final/q4-trace-all.txt
+127.0.0.1:9000 [REQUEST s3.ListBuckets] [2026-07-07T00:49:53.451] [Client IP: 127.0.0.1]
+127.0.0.1:9000 GET /
+127.0.0.1:9000 Proto: HTTP/1.1
+127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Content-Length: 0
+127.0.0.1:9000 Delimiter: /
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) minio-go/v7.0.80
+127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIR1NERlFMQlFPTTRFMVNTT1YwRiIsImV4cCI6MTc4MzM4ODk5MywicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02VUhWMFQySnFaV04wSWl3aWN6TTZSMlYwVDJKcVpXTjBJbDBzSWxKbGMyOTFjbU5sSWpwYkltRnlianBoZDNNNmN6TTZPanB6ZEhOaWRXTnJaWFF2S2lKZGZWMTkifQ.<sig-redacted>
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=HGSDFQLBQOM4E1SSOV0F/20260707/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=c1702f30c92ae7298bda11ec82cd0b998a237ecc42aa07d2ff2b4e90167aacaa
+127.0.0.1:9000 Prefix: 
+127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+127.0.0.1:9000 X-Amz-Date: 20260707T004953Z
+127.0.0.1:9000 
+127.0.0.1:9000 [RESPONSE] [2026-07-07T00:49:53.451] [ Duration 635µs TTFB 629.011µs ↑ 115 B  ↓ 254 B ]
+127.0.0.1:9000 403 Forbidden
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDB910A45B0D7
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Content-Type: application/xml
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Ratelimit-Limit: 1142608
+127.0.0.1:9000 X-Ratelimit-Remaining: 1142608
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Length: 254
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Resource>/</Resource><RequestId>18BFDB910A45B0D7</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+(The `minio-go` client also issues a `GetBucketLocation` region probe before each write; those
+probes are likewise denied `403` in this same trace — the session policy grants neither
+`s3:GetBucketLocation` — but they are non-fatal, so the client falls back to `us-east-1` and the
+in-session `PutObject` still succeeds. This further confirms that only the two explicitly-granted
+actions are permitted.)
 
 **Root cause / intersection semantics.** On the STS handler, the inline session policy is
 read via `form.Get(stsPolicy)` [`cmd/sts-handlers.go:99`], parsed by `policy.ParseConfig`
@@ -1052,9 +1565,11 @@ PutObject and ListBuckets were denied (`403 AccessDenied`).
 > root cause of the user mappings modification behavior that you observe."*
 
 A basic, non-administrative user `basicuser` was created with an S3-only policy `basic-only`
-(file `basic-policy.json`):
+that grants only `s3:GetObject`/`s3:PutObject` on `smoke/*` (file
+`/tmp/blitzy/out/basic-policy.json`):
 
-```json
+```bash
+$ cat /tmp/blitzy/out/basic-policy.json
 {
  "Version": "2012-10-17",
  "Statement": [
@@ -1067,122 +1582,143 @@ A basic, non-administrative user `basicuser` was created with an S3-only policy 
 }
 ```
 
+The account has **working** basic access: using its own credentials (the `basic` alias) it can
+write and read within its granted `smoke/*` scope, so the escalation denials below are not an
+artifact of a broken or disabled account:
+
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/ok.txt basic/smoke/ok.txt
+`/tmp/blitzy/out/ok.txt` -> `basic/smoke/ok.txt`
+Total: 22 B, Transferred: 22 B, Speed: 1.63 KiB/s
+$ mc --config-dir /tmp/blitzy/mc-config cat basic/smoke/ok.txt
+legit basicuser write
+```
+
 ### Attack path 1 — admin API (attach `consoleAdmin` to self)
 
-Using **its own** credentials, `basicuser` attempted to attach `consoleAdmin` to itself and
-to perform other admin actions. Every attempt was denied (verbatim client output,
-`q5-client.txt`):
+Using **its own** credentials, `basicuser` attempted to attach `consoleAdmin` to itself and to
+perform other admin actions that modify user mappings. Every attempt was denied (verbatim
+client output — each command is shown above its result):
 
-```text
-$ mc admin policy attach basic consoleAdmin --user basicuser
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config admin policy attach basic consoleAdmin --user basicuser
 mc: <ERROR> Unable to make user/group policy association. Access Denied.
-$ mc admin user add basic eviluser <redacted-test-pw>
+$ mc --config-dir /tmp/blitzy/mc-config admin user add basic eviluser <redacted-test-pw>
 mc: <ERROR> Unable to add new user. Access Denied.
-$ mc admin policy list basic
+$ mc --config-dir /tmp/blitzy/mc-config admin policy list basic
 mc: <ERROR> Unable to list policy. Access Denied.
-$ mc admin user enable basic basicuser
+$ mc --config-dir /tmp/blitzy/mc-config admin user enable basic basicuser
 mc: <ERROR> Unable to enable user. Access Denied.
 ```
 
-Server-side trace of the primary attempt — `admin.AttachDetachPolicyBuiltin`
-(`q5-trace.txt`, lines 58–83):
+The primary attempt (`policy attach`) was captured server-side. The verbose trace was
+subscribed by the root alias (`mc --config-dir /tmp/blitzy/mc-config admin trace --all -v
+local`, saved to `/tmp/blitzy/logs/q5final/q5-trace-all.txt`); the
+`admin.AttachDetachPolicyBuiltin` request/response block is sliced from that single capture
+with `sed`:
 
-```text
-127.0.0.1:9000 [REQUEST admin.AttachDetachPolicyBuiltin] [2026-07-06T22:57:49.000] [Client IP: 127.0.0.1]
+```bash
+$ sed -n '64,88p' /tmp/blitzy/logs/q5final/q5-trace-all.txt
+127.0.0.1:9000 [REQUEST admin.AttachDetachPolicyBuiltin] [2026-07-07T01:16:08.430] [Client IP: 127.0.0.1]
 127.0.0.1:9000 POST /minio/admin/v3/idp/builtin/policy/attach
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 X-Amz-Date: 20260706T225749Z
-127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=basicuser/20260706//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=cbc312bc31e352aa929d9f4dec74e2d5ca1e0db9829753fc6ad2e6c415842ae4
 127.0.0.1:9000 Content-Length: 105
 127.0.0.1:9000 Content-Type: application/octet-stream
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/DEVELOPMENT.GOGET
-127.0.0.1:9000 X-Amz-Content-Sha256: 2089de70aaee5068d714b94c02e35bfc371076c8da60f5c0f9a95ba0f3e24fa4
+127.0.0.1:9000 X-Amz-Content-Sha256: 7d798cb39409e4df4036e527ba1069df333445f3de520272fbac484cea2bac56
+127.0.0.1:9000 X-Amz-Date: 20260707T011608Z
+127.0.0.1:9000 Accept-Encoding: zstd,gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=basicuser/20260707//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=b758e123057dc4d45b3abb6d365de48053cc6fd81dc222ed8bb5e3bbba4cd710
 127.0.0.1:9000 <BLOB>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:57:49.001] [ Duration 292µs TTFB 288.989µs ↑ 106 B  ↓ 213 B ]
+127.0.0.1:9000 [RESPONSE] [2026-07-07T01:16:08.431] [ Duration 190µs TTFB 188.067µs ↑ 106 B  ↓ 213 B ]
 127.0.0.1:9000 403 Forbidden
-127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Content-Length: 213
+127.0.0.1:9000 Content-Type: application/json
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDCFFBE62638A
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Accept-Ranges: bytes
 127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
 127.0.0.1:9000 Vary: Origin,Accept-Encoding
 127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD57361CE98B4
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
-127.0.0.1:9000 Content-Type: application/json
-127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 {"Code":"AccessDenied","Message":"Access Denied.","Resource":"/minio/admin/v3/idp/builtin/policy/attach","RequestId":"18BFD57361CE98B4","HostId":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8"}
-
+127.0.0.1:9000 {"Code":"AccessDenied","Message":"Access Denied.","Resource":"/minio/admin/v3/idp/builtin/policy/attach","RequestId":"18BFDCFFBE62638A","HostId":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8"}
 ```
 
-The request is signed by `Credential=basicuser/...` and is rejected in **292µs** with
+The request is signed by `Credential=basicuser/...` and is rejected in **190µs** with
 `403 Forbidden` and
 `{"Code":"AccessDenied",...,"Resource":"/minio/admin/v3/idp/builtin/policy/attach"}` — the
 sub-millisecond latency reflects that the guard denies **before** any mapping mutation (before
-the request body is even read). The other three attempts fail identically (`q5-trace.txt` —
-`admin.AddUser` → `PUT /minio/admin/v3/add-user`, `admin.ListCannedPolicies` →
-`GET /minio/admin/v3/list-canned-policies`, `admin.SetUserStatus` →
-`PUT /minio/admin/v3/set-user-status`), each returning `403` with the same `AccessDenied`
-JSON keyed to its own resource path.
+the request body is even read). The other three attempts fail identically in the same trace —
+`admin.AddUser` → `PUT /minio/admin/v3/add-user` (RequestId `18BFDCFFC37F3268`),
+`admin.ListCannedPolicies` → `GET /minio/admin/v3/list-canned-policies` (RequestId
+`18BFDCFFC56F2E82`), and `admin.SetUserStatus` → `PUT /minio/admin/v3/set-user-status`
+(RequestId `18BFDCFFC70145E4`) — each returning `403` with the same `AccessDenied` JSON keyed
+to its own resource path.
 
 ### Attack path 2 — direct storage (edit the mapping on disk)
 
 User→policy mappings live under the reserved `.minio.sys` bucket. `basicuser` cannot reach it.
-At the **client layer**, `mc` rejects the reserved name before sending
-(`q5-directstore-client.txt`):
+At the **client layer**, `mc` rejects the reserved name before sending:
 
-```text
-$ mc cp evil-mapping.json basic/.minio.sys/policydb/users/basicuser/identity.json
+```bash
+$ mc --config-dir /tmp/blitzy/mc-config cp /tmp/blitzy/out/evil-mapping.json basic/.minio.sys/policydb/users/basicuser/identity.json
 `/tmp/blitzy/out/evil-mapping.json` -> `basic/.minio.sys/policydb/users/basicuser/identity.json`
 mc: <ERROR> Failed to copy `/tmp/blitzy/out/evil-mapping.json`. Bucket name contains invalid characters
-$ mc ls basic/.minio.sys
+$ mc --config-dir /tmp/blitzy/mc-config ls basic/.minio.sys
 mc: <ERROR> Unable to list folder. Bucket name contains invalid characters
-$ mc mb basic/.minio.sys
+$ mc --config-dir /tmp/blitzy/mc-config mb basic/.minio.sys
 mc: <ERROR> Unable to make bucket `basic/.minio.sys`. Bucket name contains invalid characters
 ```
 
 To confirm the **server** also blocks it (bypassing client-side name validation), a raw
-SigV4-signed `PUT` targeting the exact on-disk mapping key was sent as `basicuser`
-(program `q5raw`, using the `minio-go` signer). The server rejects it
-(`q5-rawreserved.txt`):
+SigV4-signed `PUT` targeting the exact on-disk mapping key was sent as `basicuser`. The request
+is hand-crafted with `net/http` and signed with the `minio-go` signer by a small Go program
+(`/tmp/blitzy/scripts/q5/main.go`, module `q5raw`, built offline against the pinned
+`minio-go/v7 v7.0.80`); it was run with the exact invocation below and its complete stdout is
+shown verbatim:
 
-```text
-SIGNED-AS: basicuser
-TARGET: http://127.0.0.1:9000/.minio.sys/policydb/users/basicuser/identity.json
+```bash
+$ cd /tmp/blitzy/scripts/q5 && GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off go run .
+RAW-PUT-TARGET: http://127.0.0.1:9000/.minio.sys/policydb/users/basicuser/identity.json
+SIGNED-AS-ACCESSKEY: basicuser
 HTTP-STATUS: 403 Forbidden
 RESPONSE-BODY:
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AllAccessDisabled</Code><Message>All access to this resource has been disabled.</Message><Resource>/.minio.sys/policydb/users/basicuser/identity.json</Resource><RequestId>18BFD588DEA6C0F5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AllAccessDisabled</Code><Message>All access to this resource has been disabled.</Message><Resource>/.minio.sys/policydb/users/basicuser/identity.json</Resource><RequestId>18BFDD0C1514381E</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-Trace of that raw request (`q5-rawreserved-trace.txt`, lines 58–81):
+The corresponding server-side trace block (a separate `--all -v` capture, sliced with `sed`)
+confirms the S3 layer rejects the request at `handler.ValidRequest`:
 
-```text
-127.0.0.1:9000 [REQUEST handler.ValidRequest] [2026-07-06T22:59:21.289] [Client IP: 127.0.0.1]
+```bash
+$ sed -n '65,89p' /tmp/blitzy/logs/q5final/q5raw-trace-all.txt
+127.0.0.1:9000 [REQUEST handler.ValidRequest] [2026-07-07T01:17:01.425] [Client IP: 127.0.0.1]
 127.0.0.1:9000 PUT /.minio.sys/policydb/users/basicuser/identity.json
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 Accept-Encoding: gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=basicuser/20260706/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=6b8de9bd332bacc4dbe7e96c0263b03098c3c31a707a8707f45eb943a4ffb55b
-127.0.0.1:9000 Content-Length: 16
 127.0.0.1:9000 User-Agent: Go-http-client/1.1
-127.0.0.1:9000 X-Amz-Date: 20260706T225921Z
+127.0.0.1:9000 X-Amz-Content-Sha256: 34c67809e2b0c2e7e4842666d320ac06eb7b80e6750a67a6482117cf2aa87beb
+127.0.0.1:9000 X-Amz-Date: 20260707T011701Z
+127.0.0.1:9000 Accept-Encoding: gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=basicuser/20260707/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=921bb37fd586cdb351d6a989d6265de5cc5343fd968099e7ff34b68d577f1cc5
+127.0.0.1:9000 Content-Length: 37
 127.0.0.1:9000 <BLOB>
-127.0.0.1:9000 [RESPONSE] [2026-07-06T22:59:21.289] [ Duration 113µs TTFB 111.264µs ↑ 72 B  ↓ 340 B ]
+127.0.0.1:9000 [RESPONSE] [2026-07-07T01:17:01.425] [ Duration 82µs TTFB 81.094µs ↑ 93 B  ↓ 340 B ]
 127.0.0.1:9000 403 Forbidden
-127.0.0.1:9000 Content-Length: 340
-127.0.0.1:9000 Content-Type: application/xml
-127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
-127.0.0.1:9000 X-Amz-Request-Id: 18BFD588DEA6C0F5
 127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Content-Type: application/xml
+127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18BFDD0C1514381E
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Content-Length: 340
 127.0.0.1:9000 Vary: Origin
 127.0.0.1:9000 X-Content-Type-Options: nosniff
-127.0.0.1:9000 X-Xss-Protection: 1; mode=block
-127.0.0.1:9000 Server: MinIO
 127.0.0.1:9000 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AllAccessDisabled</Code><Message>All access to this resource has been disabled.</Message><Resource>/.minio.sys/policydb/users/basicuser/identity.json</Resource><RequestId>18BFD588DEA6C0F5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AllAccessDisabled</Code><Message>All access to this resource has been disabled.</Message><Resource>/.minio.sys/policydb/users/basicuser/identity.json</Resource><RequestId>18BFDD0C1514381E</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
 The server returns `403` with `<Code>AllAccessDisabled</Code>` for
@@ -1206,7 +1742,7 @@ if objectAPI == nil {
 admin action(s); when the caller lacks permission it writes the `AccessDenied` response and
 returns a **nil `ObjectLayer`** (and an empty `auth.Credentials{}`), so the `if objectAPI ==
 nil { return }` guard aborts the handler **before any user→policy mapping is mutated** — matching
-the observed 292µs early abort. The same guard fronts `SetPolicyForUserOrGroup`
+the observed 190µs early abort. The same guard fronts `SetPolicyForUserOrGroup`
 [`cmd/admin-handlers-users.go:1770`], `AddUser` [`cmd/admin-handlers-users.go:444`], and
 `SetUserStatus` [`cmd/admin-handlers-users.go:406`]. The direct-storage path is closed because
 the mappings live under `minioMetaBucket = ".minio.sys"` [`cmd/object-api-utils.go:60`] at
@@ -1246,7 +1782,7 @@ the `validateAdminReq` authorization guard.
 | Q4 | AssumeRole + inline session policy | temp creds minted; session policy embedded as JWT claim | `cmd/sts-handlers.go:99,104,123,127,256`; size `:89` (2048) |
 | Q4 | **In-session** PutObject/GetObject | **ALLOWED** (200) | `cmd/iam.go:2311-2312` (AND) |
 | Q4 | **Out-of-session** PutObject/ListBuckets | **DENIED** (403) | `cmd/iam.go:2242,2381,2136` |
-| Q5 | Admin API self-attach `consoleAdmin` (+ AddUser/List/SetUserStatus) | **403 AccessDenied**, aborts pre-mutation (292µs) | `cmd/admin-handler-utils.go:37`; `cmd/auth-handler.go:189`; `cmd/admin-handlers-users.go:1908,1770,444,406` |
+| Q5 | Admin API self-attach `consoleAdmin` (+ AddUser/List/SetUserStatus) | **403 AccessDenied**, aborts pre-mutation (190µs) | `cmd/admin-handler-utils.go:37`; `cmd/auth-handler.go:189`; `cmd/admin-handlers-users.go:1908,1770,444,406` |
 | Q5 | Direct-storage into `.minio.sys` (client + server) | client "invalid characters"; server **`AllAccessDisabled`** 403 | `cmd/object-api-utils.go:60,472`; `cmd/iam-object-store.go:478,479`; `cmd/api-errors.go:764-768` |
 
 ## Notes — corrections, nuances, and inferred items
@@ -1288,7 +1824,7 @@ bit-rot read path at `cmd/xl-storage.go:1875`; and `HealObject` at
   `HealObject` [`cmd/erasure-healing.go:1039`] is grounded in code, while the trace line itself
   is the observed artifact.
 
-**Secret handling (rule compliance).** The captured Q4 STS artifacts are expired, ephemeral, local-only credentials (minted `2026-07-06T22:55:28Z`, `exp` `2026-07-06T23:55:28Z`, from a throwaway `127.0.0.1` server that no longer exists). To comply with secret-sanitization policy, the STS `SecretAccessKey` value and the JWT **signature** segment were redacted, and a throwaway test password was replaced with `<redacted-test-pw>`. The evidentiary content is fully preserved: the JWT **header and payload** remain (they base64-decode to the `parent` and `sessionPolicy` claims — see the decoded block in Q4), and the temporary **AccessKeyId** (`Y9ZODVYTJQVMILNIX5J3`, an identifier, not a secret) is retained so the request/response blocks cross-reference correctly.
+**Secret handling (rule compliance).** The captured Q4 STS artifacts are expired, ephemeral, local-only credentials (minted `2026-07-07T00:49:53Z`, `exp` `2026-07-07T01:49:53Z`, from a throwaway `127.0.0.1` server that no longer exists). To comply with secret-sanitization policy, the STS `SecretAccessKey` value and the JWT **signature** segment were redacted, and a throwaway test password was replaced with `<redacted-test-pw>`. The evidentiary content is fully preserved: the JWT **header and payload** remain (they base64-decode to the `parent` and `sessionPolicy` claims — see the decoded block in Q4), and the temporary **AccessKeyId** (`HGSDFQLBQOM4E1SSOV0F`, an identifier, not a secret) is retained so the request/response blocks cross-reference correctly.
 
 **Non-canonical values:** the Q1 KMS master key (`MINIO_KMS_SECRET_KEY`) is an
 investigation-time key and is redacted as `<base64-32-bytes>`; it does not affect the observed
