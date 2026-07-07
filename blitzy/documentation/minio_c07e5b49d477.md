@@ -70,11 +70,23 @@ The generated `LDFLAGS` (verbatim) embed the version metadata:
 -s -w -X github.com/minio/minio/cmd.Version=2024-11-25T17:10:22Z -X github.com/minio/minio/cmd.CopyrightYear=2024 -X github.com/minio/minio/cmd.ReleaseTag=DEVELOPMENT.2024-11-25T17-10-22Z -X github.com/minio/minio/cmd.CommitID=c07e5b49d477b0774f23db3b290745aef8c01bd2 -X github.com/minio/minio/cmd.ShortCommitID=c07e5b49d477 -X github.com/minio/minio/cmd.GOPATH=/root/go -X github.com/minio/minio/cmd.GOROOT=/usr/local/go
 ```
 
-**Version derivation (verified).** This checkout has **no git tags**, so
-`buildscripts/gen-ldflags.go` cannot use `git describe --tags`; it falls back to the HEAD
-commit time. HEAD commit time `2024-11-25T17:10:22Z` becomes the `ReleaseTag`
-`DEVELOPMENT.2024-11-25T17-10-22Z` (colons rewritten to dashes; the `DEVELOPMENT` prefix is
-used because `MINIO_RELEASE` is unset). This is the canonical build path for this checkout.
+**Version derivation (verified).** The canonical `build:` target consumes `LDFLAGS`, which is
+computed by invoking `buildscripts/gen-ldflags.go` with **no version argument**
+[`Makefile:3`]. With no argument, `main()` takes its `else` branch and derives the version
+from the HEAD commit time — `version = commitTime().Format(time.RFC3339)`
+[`buildscripts/gen-ldflags.go:117`], where `commitTime()` runs `git log --format=%cI -n1`
+[`buildscripts/gen-ldflags.go:90-110`]. Note that `gen-ldflags.go` never calls
+`git describe --tags`; the only `git describe --tags` in the build is the **separate**
+`VERSION` variable [`Makefile:8`], which feeds the docker/release/hotfix targets (e.g. `TAG`
+[`Makefile:10`], `hotfix` [`Makefile:182-184`]), **not** the build `LDFLAGS`. This checkout
+has no git tags, but that fact is irrelevant to the canonical build's version because the
+tag-derived `VERSION` is not on the `build:` path — the version is `commitTime()`
+unconditionally. HEAD commit time `2024-11-25T17:10:22Z` is then formatted into the
+`ReleaseTag` `DEVELOPMENT.2024-11-25T17-10-22Z` by `releaseTag()`
+[`buildscripts/gen-ldflags.go:47-71`] (colons rewritten to dashes at
+[`buildscripts/gen-ldflags.go:59`]; the `DEVELOPMENT` prefix is used because `MINIO_RELEASE`
+is unset [`buildscripts/gen-ldflags.go:48-51`]). This is the canonical build path for this
+checkout.
 
 `minio --version` (verbatim):
 
