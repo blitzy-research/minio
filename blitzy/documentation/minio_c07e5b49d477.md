@@ -1318,7 +1318,7 @@ PARENT-ACCESSKEY: stsparent
 TEMP-ACCESSKEY: HGSDFQLBQOM4E1SSOV0F
 SESSION-TOKEN-PRESENT: true
 SIGNER-TYPE: S3v4
-IN-SESSION  PutObject stsbucket/in.txt  => ALLOWED (success)
+IN-SESSION  PutObject stsbucket/in.txt  => ALLOWED
 OUT-OF-SESSION PutObject otherbucket/out.txt => DENIED: Access Denied.
 IN-SESSION  GetObject stsbucket/in.txt  => ALLOWED (read 31 bytes)
 OUT-OF-SESSION ListBuckets            => DENIED: Access Denied.
