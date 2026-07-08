@@ -31,7 +31,7 @@ cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > late
 
 The line that separates outcome (2) *purge* from outcome (3) *refuse* is inside **`deleteIfDangling`** (**`cmd/erasure-object.go:482`**): it consults `isObjectDangling` (**`cmd/erasure-healing.go:968`**), and if that classifier returns `ok=false` (a **non-actionable** error is present), `deleteIfDangling` returns `errErasureReadQuorum` at **`cmd/erasure-object.go:487`** instead of purging.
 
-> **Causality note (two distinct purge callers).** There are **two** call sites of `deleteIfDangling` in `healObject`. The one central to this question is the **`cannotHeal` branch at `:438`** (metadata has quorum, but too many *data parts* are bad). A *separate, earlier* branch at **`:309`** fires only when `objectQuorumFromMeta` (`:307`) itself errors — i.e. when read quorum is already lost across the *surviving `xl.meta`* files. The dangling-deletion audit distinguishes them via its `caller` tag (`:438` vs `:309`). This document proves the `:438 cannotHeal` branch directly (§7.5, §6.3) and also exercises the `:309` branch via an in-process probe (§7.8), because on a single-node server an object with 3-of-4 `xl.meta` gone becomes unlistable through `mc admin heal` and only the in-process `HealObject` API can reach it.
+> **Causality note (two distinct purge callers).** There are **two** call sites of `deleteIfDangling` in `healObject`. The one central to this question is the **`cannotHeal` branch at `:438`** (metadata has quorum, but too many *data parts* are bad). A *separate, earlier* branch at **`:309`** fires only when `objectQuorumFromMeta` (`:307`) itself errors — i.e. when read quorum is already lost across the *surviving `xl.meta`* files. The dangling-deletion audit distinguishes them via its `caller` tag (`:438` vs `:309`). This document proves the `:438 cannotHeal` branch directly (§7.5, §6.3) and also exercises the `:309` branch via an in-process probe (§7.4), because on a single-node server an object with 3-of-4 `xl.meta` gone becomes unlistable through `mc admin heal` and only the in-process `HealObject` API can reach it.
 
 The rest of this document proves each outcome with captured output, walks the exact boundary numbers for a 4-disk EC:2 set, decodes the logs that justify the decision, and shows why a partially-failed **write** and a partially-failed **delete** take *structurally different* code paths (even though, for EC:2, both dangling thresholds evaluate to the same number, 2).
 
@@ -496,7 +496,7 @@ Cause → effect:
 - **`disksToHealCount > parityBlocks` is FALSE** (damage within the parity budget of 2) → `cannotHeal = false` → fall through to Reed-Solomon **reconstruction** (outcome 1).
 - **`disksToHealCount > parityBlocks` is TRUE** (damage exceeds budget) → `cannotHeal = true` → call `deleteIfDangling` **from `:438`** (passing the real `dataErrsByPart`). If the object is provably dangling, it is **purged** and the heal returns `errFileNotFound`/`errFileVersionNotFound` (outcome 2). If it is *not* provably dangling, `deleteIfDangling` returns `errErasureReadQuorum` and the object is **left in place** (outcome 3).
 
-> **The `quorumETag` override (`:429-432`) — (inferred from code; it did NOT fire in any scenario here, and here is exactly why).** The override sets `cannotHeal = false` "to give it a shot" *only when `quorumETag != ""`*. But `quorumETag` is the third return value of `listOnlineDisks` (`cmd/erasure-healing-common.go:219`), which returns a **non-empty** etag **only** in its fallback path — i.e. only when **no common `modTime` reaches quorum** (`if modTime.IsZero() || modTime.Equal(timeSentinel)`, `:227`); otherwise it returns `""` via `return onlineDisks, modTime, ""` (`:254`). In every scenario in this document the surviving `xl.meta` files share a common `modTime`, so `commonTime` succeeds, `quorumETag == ""`, and **the override cannot fire**. Therefore no runtime evidence of the override is presented; the behavior above is stated **as read from the source**, not as observed. (This corrects a prior draft that claimed the override was "observed indirectly.")
+> **The `quorumETag` override (`:429-432`) — (inferred from code; it did NOT fire in any scenario here, and here is exactly why).** The override sets `cannotHeal = false` "to give it a shot" *only when `quorumETag != ""`*. But `quorumETag` is the third return value of `listOnlineDisks` (`cmd/erasure-healing-common.go:219`), which returns a **non-empty** etag **only** in its fallback path — i.e. only when **no common `modTime` reaches quorum** (`if modTime.IsZero() || modTime.Equal(timeSentinel)`, `:228`); otherwise it returns `""` via `return onlineDisks, modTime, ""` (`:254`). In every scenario in this document the surviving `xl.meta` files share a common `modTime`, so `commonTime` succeeds, `quorumETag == ""`, and **the override cannot fire**. Therefore no runtime evidence of the override is presented; the behavior above is stated **as read from the source**, not as observed. (This corrects a prior draft that claimed the override was "observed indirectly.")
 
 **Step 6 — `deleteIfDangling` (`cmd/erasure-object.go:482`) — purge vs. refuse.** It first consults `isObjectDangling`; if that says "not provably dangling" (`ok=false`), it refuses by returning `errErasureReadQuorum` at `:487`; otherwise it builds the audit tag map and `DeleteVersion`s the object on **all** disks (verbatim head of the function):
 
@@ -811,13 +811,13 @@ This is emitted by `healTrace` (**`cmd/erasure-healing.go:1090`**), called at `:
 
 | Field | Value | Source |
 |---|---|---|
-| `heal.Object` | the healing metric name | `FuncName: "heal." + funcName.String()` (`:1094`); `funcName = healingMetricObject` (`:272`) |
-| `disks=4` | drive count in the set | `tr.Custom["disks"] = result.DiskCount` (`:1108`) |
+| `heal.Object` | the healing metric name | `FuncName: "heal." + funcName.String()` (`:1095`); `funcName = healingMetricObject` (`:272`) |
+| `disks=4` | drive count in the set | `tr.Custom["disks"] = result.DiskCount` (`:1107`) |
 | `dry=false` | not a dry run | `tr.Custom["dry"] = opts.DryRun` (`:1101`) |
 | `mode=1` | **`HealNormalScan`** | `tr.Custom["mode"] = opts.ScanMode` (`:1103`) |
 | `remove=false` | `--remove` not set on this call | `tr.Custom["remove"] = opts.Remove` (`:1102`) |
 | `13.302636ms` | heal duration | `Duration: time.Since(startTime)` (`:1096`) |
-| `1.0 MiB` | object size | `tr.Bytes = result.ObjectSize` (`:1109`) |
+| `1.0 MiB` | object size | `tr.Bytes = result.ObjectSize` (`:1108`) |
 
 `mode=1` is the causally important value: on-demand `mc admin heal` always runs a **normal** scan (mode 1), never a deep/bitrot scan (mode 2). This is why silent same-size bitrot is not caught by `mc admin heal` (§9).
 
@@ -879,7 +879,7 @@ When the same heal call **purges** the object, the `HealObject` event carries an
 Decoding, with cause:
 
 - `tags.healObject = "name=obj1,pool=1,set=1"` comes from `auditHealObject` building an `auditObjectOp{Name, Pool: er.poolIndex + 1, Set: er.setIndex + 1}` (`cmd/erasure-healing.go:246-251`). **Note the `+1`**: the `HealObject` event reports the pool/set **1-indexed** (`pool=1,set=1`), whereas the `DeleteDanglingObject` event in §6.3 reports them **0-indexed** (`pool=0,set=0`) because `deleteIfDangling` uses the raw `er.setIndex`/`er.poolIndex` (`cmd/erasure-object.go:490-491`). Same physical set, two indexing conventions — worth knowing when correlating the two events.
-- `error: "file version not found"` is the purge signal: `healObject` returned `errFileVersionNotFound` after `deleteIfDangling` removed the version, and the deferred `auditHealObject` captured it (`opts.Error = err.Error()`, `:234`).
+- `error: "file version not found"` is the purge signal: `healObject` returned `errFileVersionNotFound` after `deleteIfDangling` removed the version, and the deferred `auditHealObject` captured it (`opts.Error = err.Error()`, `:233`).
 - The two events share the timestamp `06:00:18.166…` to the microsecond, so they are the **same purge**: `DeleteDanglingObject` (the why) + `HealObject error` (the result).
 
 **A why-string that exists in code but did *not* fire here (labeled inferred).** `auditHealObject` also sets a descriptive error when *all* damaged drives share the same failure — `:236-243`:
@@ -901,7 +901,7 @@ Decoding, with cause:
 
 ### 6.3 The `DeleteDanglingObject` audit event — the decisive "why we purged it"
 
-This is the single richest "why" record. Complete, unedited (from `/tmp/evidence/audit.log`), emitted by `auditDanglingObjectDeletion` (**`cmd/erasure-object.go:451`**), which `deleteIfDangling` arms with `defer` at `:538`:
+This is the single richest "why" record. Complete, unedited (from `/tmp/evidence/audit.log`), emitted by `auditDanglingObjectDeletion` (**`cmd/erasure-object.go:451`**), which `deleteIfDangling` arms with `defer` at `:531`. **Audit-target caveat (code-level):** this event only emits when at least one audit target is configured — `auditDanglingObjectDeletion` returns early at its top when none is set (`cmd/erasure-object.go:452`, `if len(logger.AuditTargets()) == 0 {` → `return`), so without a configured `MINIO_AUDIT_*` target the record is silently skipped even though the purge still happens (the log below was captured by pointing MinIO's audit webhook at a small local sink):
 
 ```json
 {
@@ -941,12 +941,12 @@ Every tag decoded, with its source line and causal meaning:
 
 | Tag | Value | Source (`cmd/erasure-object.go`) | Meaning |
 |---|---|---|---|
-| `caller` | `github.com/minio/minio/cmd/erasure-healing.go:438` | `runtime.Caller(1)` → `:536` | **Proves this purge came from the `:438` `cannotHeal` branch** (not the `:309` quorum-loss branch). This single tag disambiguates the two purge callers from §4. |
-| `derrs` | `map[0:[4 4 4 1]]` | `fmt.Sprintf("%v", dataErrsByPart)` `:492` | Part 0's per-disk `checkPart` codes: `4,4,4,1` = `checkPartFileNotFound(4)` on 3 disks, `checkPartSuccess(1)` on 1. **3 missing > `parityBlocks`(2) → dangling.** This is the raw numeric evidence for the verdict. |
+| `caller` | `github.com/minio/minio/cmd/erasure-healing.go:438` | `runtime.Caller(1)` → `:526` | **Proves this purge came from the `:438` `cannotHeal` branch** (not the `:309` quorum-loss branch). This single tag disambiguates the two purge callers from §4. |
+| `derrs` | `map[0:[4 4 4 1]]` | `fmt.Sprintf("%v", dataErrsByPart)` `:493` | Part 0's per-disk `checkPart` codes: `4,4,4,1` = `checkPartFileNotFound(4)` on 3 disks, `checkPartSuccess(1)` on 1. **3 missing > `parityBlocks`(2) → dangling.** This is the raw numeric evidence for the verdict. |
 | `d:p` | `2:2` | `fmt.Sprintf("%d:%d", m.Erasure.DataBlocks, m.Erasure.ParityBlocks)` `:497` | `DataBlocks:ParityBlocks` = 2:2 — confirms the EC:2 scheme at the moment of decision. |
 | `merrs` | `""` (empty) | `joinErrs(errs)` `:492` | Metadata errors — **empty due to a bug in `joinErrs`** (see below), independent of the actual (all-`nil`) metadata state. |
-| `sz` | `1048576` | `strconv.FormatInt(m.Size, 10)` `:496` | Object size, 1 MiB — from the still-valid `FileInfo`. |
-| `mt` | `20260708T060018Z` | `m.ModTime.Format(iso8601Format)` `:497` | Object mod-time. |
+| `sz` | `1048576` | `strconv.FormatInt(m.Size, 10)` `:495` | Object size, 1 MiB — from the still-valid `FileInfo`. |
+| `mt` | `20260708T060018Z` | `m.ModTime.Format(iso8601Format)` `:496` | Object mod-time. |
 | `pool` / `set` | `0` / `0` | `strconv.Itoa(er.poolIndex/ er.setIndex)` `:490-491` | Pool/set, 0-indexed (contrast §6.2's 1-indexed). |
 | `ddisk-0..3` | `<nil>` | `tags[fmt.Sprintf("ddisk-%d", index)] = errStr` `:559` | Per-disk `DeleteVersion` results — all `<nil>` = the version was successfully removed on all 4 disks. |
 | `offline` | *(absent)* | only set `if offline > 0` `:520-522` | No drive was offline, so the tag is omitted — consistent with a "provably garbage" (not "temporarily unavailable") purge. |
