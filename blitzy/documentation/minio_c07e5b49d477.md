@@ -1,83 +1,126 @@
-# MinIO Read‑Only IAM Boundary Under Concurrent Write Stress — A Run‑First Security Investigation
+# Does MinIO's read‑only IAM boundary hold under concurrent write stress?
 
-> **Scope of this document.** This is a *run‑first* security investigation. Every behavioral claim below is backed by output actually captured from a MinIO server that was built from this repository at `HEAD c07e5b49d477b0774f23db3b290745aef8c01bd2` (branch `minio_c07e5b49d477`), run in its default configuration, and driven through the **real, signed S3 API** by a genuinely read‑only identity while other clients concurrently hammered the same bucket with writes and metadata traffic. Server‑side `[REQUEST]`/`[RESPONSE]` traces come from the admin `ServiceTrace` feed; client‑side status codes and error bodies come from `boto3` and raw `curl --aws-sigv4`; storage side effects come from direct inspection of the single‑node `xl.meta` backend. Code claims are grounded with `file:line` anchors verified at that HEAD. Anything derived from reading rather than running is explicitly labeled **(inferred)**.
+> A run‑first security investigation. The MinIO server was **built and run** in its
+> default configuration; a genuinely read‑only identity was driven against the full
+> write‑adjacent S3 surface **while other clients hammered the same bucket with
+> writes and metadata traffic**; and every claim below is backed by an actual
+> request/response trace, client status/body, and an observed storage side effect
+> (or the proven absence of one). All source references are anchored to the MinIO
+> source at HEAD `c07e5b49d477`.
 
 ---
 
 ## 1. The question, and the direct answer
 
-### 1.1 The question
+**The question (restated).** Can a principal who is *supposed* to be read‑only on a
+bucket and prefix still **mutate data** through less‑obvious S3 surface area —
+multipart operations, copy‑style writes, metadata changes (tagging, retention,
+legal‑hold, ACL), or deletes — especially **while the same bucket is under heavy
+concurrent write load**? And separately, **what metadata can such a principal learn**
+from listing and `HEAD`/attributes behavior without full object reads?
 
-> Does MinIO's IAM policy boundary reliably confine a read‑only principal to read‑only behavior **even while other clients concurrently write/mutate the same bucket**, or can that principal mutate data through **less‑obvious S3 surface area** — multipart operations, copy‑style (server‑side) writes, metadata changes (tagging, retention, legal‑hold, ACL), or deletes? And separately: **what metadata can a read‑only caller learn from listing and `HEAD` behavior without full object reads?**
+**Direct answer: No — the boundary holds. There was no bypass.**
 
-### 1.2 The direct answer (verdict first)
+Across **two full runs**, while 12 concurrent writer threads drove the shared bucket
+from ~14k to ~44k objects, a faithfully read‑only identity (`rouser`) **could not
+mutate data through any write‑adjacent surface**. Every write‑adjacent operation was
+**denied before any mutation occurred and produced no storage side effect**:
 
-**The boundary holds. Under concurrent write stress, a faithfully read‑only principal could not mutate data through any of the "write‑adjacent" surfaces tested — every one of them was denied at handler entry, before the object layer was ever reached, and left no storage side effect.** This result was **identical across two independent full runs** of the entire probe matrix under live concurrent load (2/2 runs, 0 differences). Concurrency did **not** manufacture a bypass window, and the causal reason is structural: the authorization decision is evaluated **per request against the caller's own policy** and is **stateless with respect to other clients' traffic** (`IAMSys.IsAllowed`, `cmd/iam.go:2437`), and it happens at the top of each handler *before* any erasure/object‑layer call (`checkRequestAuthType` `cmd/auth-handler.go:339`, `isPutActionAllowed` `cmd/auth-handler.go:749`). A denial is mapped to HTTP `403 AccessDenied` (`cmd/api-errors.go:539`) with no write performed.
-
-Concretely, driving the read‑only identity `rouser` (custom prefix‑scoped policy: `s3:GetObject` on `probe-bucket/ro-prefix/*` + prefix‑gated `s3:ListBucket`) against every named operation produced:
-
-| Category | Operations probed | Observed outcome |
+| Surface area probed | rouser result | Storage side effect |
 |---|---|---|
-| Multipart (7) | Create, UploadPart, UploadPartCopy, Complete, Abort, ListParts, ListMultipartUploads | **All `403 AccessDenied`**; no orphan upload‑ID created |
-| Copy‑style (2) | CopyObject, UploadPartCopy | **Both `403 AccessDenied`**; destination object never created |
-| Metadata (5) | PutObjectTagging, DeleteObjectTagging, PutObjectRetention, PutObjectLegalHold, PutObjectAcl | **All denied**; tagging/legal‑hold/ACL → `403`; retention → `400 InvalidRequest` on a non‑lock bucket and a **genuine `403 AccessDenied`** on a lock‑enabled bucket (see §6.3.3) |
-| Deletes (2) | DeleteObject, DeleteObjects (multi) | DeleteObject → **`403`**, object still present; DeleteObjects (multi) → **HTTP `200` with a per‑key `AccessDenied`** body, nothing deleted (see §6.4.2) |
-| Listing/HEAD leakage (6) | ListObjectsV2, ListObjectsV1, ListObjectVersions, HeadObject, HeadBucket, GetObjectAttributes | Allowed **only within the granted prefix** for list/HEAD/GET; `HeadBucket`, unqualified/other‑prefix list, and `GetObjectAttributes` denied. The *intended* metadata a "read + list‑within‑prefix" principal is designed to see (key, size, ETag, last‑modified) is visible; nothing beyond that leaked |
+| Multipart (create, upload‑part, upload‑part‑copy, complete, abort, list‑parts, list‑uploads) | **Denied** — HTTP `403 AccessDenied` | None (no object, no orphan upload) |
+| Copy‑style writes (`CopyObject`, `UploadPartCopy`) | **Denied** — HTTP `403 AccessDenied` | None |
+| Metadata (`PutObjectTagging`, `DeleteObjectTagging`, `PutObjectRetention`, `PutObjectLegalHold`, `PutObjectAcl`) | **Denied** — `403` (retention reaches the IAM check only when `Content‑MD5` is supplied; then `403`) | None (tags stayed empty; no retention/hold applied) |
+| Deletes (`DeleteObject`, multi‑`DeleteObjects`) | **Denied** — single `403`; multi returns `200` with **per‑key `AccessDenied`** and **no deletion** | None (all seed objects intact) |
 
-### 1.3 The nuances layered on top (not bypasses)
+**What a read‑only principal *can* learn (the leakage surface).** Within its granted
+prefix, `rouser` can read object **content** (`GetObject` → `200`) and object
+**metadata** via `HeadObject`/listing — namely **existence, size, ETag, content‑type,
+last‑modified**, and the presence of lock/retention headers. Outside its granted
+prefix, and for the distinct `GetObjectAttributes` action, it is **denied `403`**. This
+is the intended, prefix‑scoped read surface, not a leak beyond the grant.
 
-Three behaviors *look* unusual but are correct‑by‑design, not boundary breaks. They are documented in full with evidence in §7:
+**The mechanism, in one sentence.** Every write‑adjacent operation `rouser` attempted
+was **denied by the IAM policy decision (`IAMSys.IsAllowed`, `cmd/iam.go:2437`) before
+any write to the object/erasure backend**, so no amount of concurrent traffic could
+turn a denied read‑only call into a mutation — the authorization decision is
+**per‑request and independent of other clients' load** (§5.1). A few handlers perform
+some *pre‑IAM validation* and even an *object‑info read* before the permission check
+(`DeleteObjectTagging`, `PutObjectRetention`); those nuances are documented in §6.7 and
+do **not** weaken the result — the deny still lands **before any mutation**.
 
-1. **Multi‑object delete returns HTTP `200`, not `403`** — with a per‑key `<Error><Code>AccessDenied</Code></Error>` for each object. No object was actually deleted (`cmd/bucket-handlers.go:416`, per‑object check at `:505`).
-2. **PutObjectRetention on a non‑lock bucket returns `400 InvalidRequest`, not `403`** — because the bucket object‑lock‑configuration gate precedes the IAM check (`cmd/object-handlers.go:2890`). On a lock‑*enabled* bucket the same call yields a genuine `403 AccessDenied` from IAM.
-3. **The built‑in canned `readonly` policy cannot list at all** — it grants only `s3:GetBucketLocation` + `s3:GetObject` (no `s3:ListBucket`), so a principal with only canned `readonly` gets `403` on `ListObjectsV2`. This is why the faithful "read‑only to a bucket **and prefix**" model requires a *custom* prefix‑scoped policy (§3).
+**Nuances layered on top of the direct answer** (each demonstrated with evidence
+below):
 
-The remainder of this document shows the exact commands, the raw server/client traces, and the before/after storage proofs behind every one of these statements.
+1. **Multi‑object delete is not a single `403`.** `DeleteObjects` returns HTTP `200`
+   with a per‑key `<Error><Code>AccessDenied</Code></Error>` for each key, and deletes
+   nothing (§5.5, §6.1).
+2. **Retention/multi‑delete have a pre‑IAM `Content‑MD5` gate.** A client that omits
+   `Content‑MD5` (e.g., botocore 1.43, which sends a CRC32 checksum instead) is rejected
+   with `400 MissingContentMD5` **before** the IAM check; supplying `Content‑MD5`
+   reaches the IAM check, which then denies (`403`) or returns per‑key `AccessDenied`
+   (§6.2, §6.7).
+3. **The built‑in `readonly` policy cannot list.** It grants `GetObject` but **not**
+   `ListBucket`; a principal on canned `readonly` (`rocanned`) reads objects (`200`) but
+   is **denied `403`** on `ListObjectsV2` (§5.7, §6.4). Modeling "read‑only on a bucket
+   **and prefix**" (which implies listing within the prefix) therefore requires a
+   **custom** prefix‑scoped policy — which `rouser` uses (§3.2).
+4. **The empty‑header retention skip is real but not a bypass.** The `PutObject`
+   retention sub‑check *short‑circuits* when no object‑lock headers are present
+   (`cmd/auth-handler.go:772‑775`); it only demands `PutObjectRetentionAction` when the
+   caller actually sends lock headers. Demonstrated empirically with a dedicated
+   principal `rwnoret` (§6.2): identical `PutObject`s differing *only* by lock headers
+   flip the outcome `200`→`403`. A read‑only principal is denied either way because it
+   lacks even `PutObjectAction`.
+
+The remainder of this document is the evidence: the exact environment and commands
+(§2), the identities/policies/seed data (§3), the concurrent‑load design (§4), the
+per‑operation results with raw traces and storage proofs (§5), the behavioral nuances
+(§6), the two‑run stability result (§7), and the verdict, methodology, cleanup, and a
+named‑item coverage pass (§8).
 
 ---
 
 ## 2. Environment, exact build, and canonical run
 
-### 2.1 Toolchain and client tooling (observed)
+Everything was built and run as a normal user in MinIO's **default configuration**.
+The exact commands and their real output follow.
 
-The module is `github.com/minio/minio` (`go.mod:1`) and declares `go 1.23` (`go.mod:3`). The build used the repository's pinned toolchain:
+### 2.1 Toolchain and source revision
 
 ```
 $ go version
 go version go1.23.2 linux/amd64
+
+$ git rev-parse --abbrev-ref HEAD
+blitzy-b8fad361-f2c2-4f2e-90a6-30ee12dd6565
+$ git rev-parse HEAD
+b956b2f4f6c683381ea7c125839cc7e412078aa4
 ```
 
-Client/cross‑check tooling actually present in this environment:
+The MinIO **source** under investigation is HEAD `c07e5b49d477`. The working‑tree commit
+above only *adds this answer document* under `blitzy/documentation/`; it does not modify
+any file under `cmd/` or `internal/`, so the built binary reflects the `c07e5b49d477`
+source. All `file:line` citations in this document are anchored to `c07e5b49d477`.
+
+### 2.2 Build (verbatim command)
 
 ```
-$ python3 --version
-Python 3.13.7
-$ python3 -c "import boto3; print(boto3.__version__)"
-1.43.42
-$ curl --version | head -1
-curl 8.14.1 (x86_64-pc-linux-gnu) ...
+$ CGO_ENABLED=0 go build -tags kqueue -trimpath -o /tmp/minio .
+$ echo "exit=$?"
+exit=0
 ```
 
-`mc` was **not** installed in this environment, so the admin surface was driven **programmatically via the real `madmin-go/v3` admin API** (v3.0.77, `go.mod:52`) — provisioning users/policies and streaming the `ServiceTrace` feed — rather than via the `mc` CLI. This keeps the admin path canonical (the same API `mc admin` uses) and requires no external download and no repository change.
-
-### 2.2 Exact build command (verbatim)
+The build completed with **no output on stderr**. The resulting binary:
 
 ```
-CGO_ENABLED=0 go build -tags kqueue -trimpath -o /tmp/minio .
-```
-
-Run from the repository root. Observed result: **exit code 0, no stderr**, producing a statically‑linked binary:
-
-```
-$ file /tmp/minio
-/tmp/minio: ELF 64-bit LSB executable, x86-64, ... statically linked, ...
 $ stat -c '%s bytes' /tmp/minio
 156592469 bytes
+$ file /tmp/minio
+/tmp/minio: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=VgTH6mNkvqVyDlGyq8Xl/a8Egdu6J8KI_zwNcPWsT/jdul98ntFttrpI0zPRK7/KYKkx3EhnijRcU1-cKRU, with debug_info, not stripped
 ```
 
-### 2.3 The `DEVELOPMENT.GOGET` version banner — a build‑configuration artifact, **not a defect**
-
-A plain `go build` bypasses the Makefile's version‑stamping step (`buildscripts/gen-ldflags.go`), so the binary reports a development banner:
+### 2.3 Version banner (a build‑configuration artifact, labeled as such)
 
 ```
 $ /tmp/minio --version
@@ -87,131 +130,161 @@ License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Copyright: 2015-0000 MinIO, Inc.
 ```
 
-**`DEVELOPMENT.GOGET` is expected for an un‑stamped local build and is explicitly a build‑configuration artifact, not a defect.** It has no bearing on IAM behavior; the same server binary is used throughout this investigation.
+`DEVELOPMENT.GOGET` is the version string produced by a **plain `go build`** (the
+Makefile's `buildscripts/gen-ldflags.go` version stamping was intentionally not used).
+It is a *build‑configuration artifact, not a defect*, and does not affect the S3/admin
+code paths under test.
 
-### 2.4 Canonical run (default configuration, default credentials)
+### 2.4 Canonical run (verbatim command) and health
 
 ```
-/tmp/minio server /tmp/minio-data --address :9000
+$ /tmp/minio server /tmp/minio-data --address :9000
 ```
 
-No non‑default environment variables or configuration were set — this is the canonical/default single‑node configuration. In the absence of overrides MinIO uses the default root credentials `minioadmin:minioadmin`, which the server itself warns about at startup. Observed startup banner (from the server log):
+Startup log (default configuration, single node, single drive; default root credentials),
+reproduced verbatim (the listed `10.236.0.194`/`172.17.0.1` addresses are the container's
+private pod/docker interfaces; probes use `127.0.0.1`):
 
 ```
 INFO: Formatting 1st pool, 1 set(s), 1 drives per set.
+INFO: WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.
 MinIO Object Storage Server
+Copyright: 2015-2026 MinIO, Inc.
+License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Version: DEVELOPMENT.GOGET (go1.23.2 linux/amd64)
-API: http://127.0.0.1:9000
-WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values ...
+
+API: http://10.236.0.194:9000  http://172.17.0.1:9000  http://127.0.0.1:9000 
+WebUI: http://10.236.0.194:34527 http://172.17.0.1:34527 http://127.0.0.1:34527   
+
+Docs: https://docs.min.io
+WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
 ```
 
-Health checks confirmed the endpoint was up before any provisioning:
+Health endpoints (all `200`):
 
 ```
-$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/minio/health/live
-200
-$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/minio/health/ready
-200
+$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/minio/health/live     # 200
+$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/minio/health/ready    # 200
+$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/minio/health/cluster  # 200
 ```
 
-### 2.5 Backend layout (why side effects are directly inspectable)
+### 2.5 On‑disk backend layout (used for storage side‑effect proofs)
 
-A single‑node deployment persists each object under `<DATA_DIR>/<bucket>/<object>/xl.meta` (plus data parts). This makes storage side effects directly observable on disk. For example, the seed object `ro-prefix/a.txt`:
+The single‑node server uses the single‑drive erasure ("XL") backend: each object is a
+directory containing `xl.meta` (and data). A denied write would manifest as a **new
+`<object>/xl.meta` directory** under the prefix, so a filesystem snapshot before/after a
+write probe — combined with an authorized root re‑list and `StatObject` ETag comparison
+— conclusively demonstrates the presence or absence of a storage side effect (§5, §6).
 
 ```
-$ ls -la /tmp/minio-data/probe-bucket/ro-prefix/a.txt/
--rw-r--r-- 1 root root 480 Jul  8 05:17 xl.meta
+$ find /tmp/minio-data/probe-bucket/ro-prefix -name xl.meta | sort
+/tmp/minio-data/probe-bucket/ro-prefix/a.txt/xl.meta
+/tmp/minio-data/probe-bucket/ro-prefix/b.txt/xl.meta
+/tmp/minio-data/probe-bucket/ro-prefix/sub/c.txt/xl.meta
 ```
 
-The `xl.meta` **modification time (05:17:41)** is the moment the object was seeded; because it never changes across the probes (which ran at 05:21 and 05:32), the filesystem itself is direct proof that no denied write ever rewrote the object (§5, §6).
+### 2.6 Client tooling (drives probes; nothing added to the repository)
+
+- **`madmin-go/v3` v3.0.77** — provision users/policies and stream the server‑side
+  `ServiceTrace` request/response feed.
+- **`minio-go/v7` v7.0.80** — signed S3 client for the concurrent writer load and for
+  the streaming `PutObject` retention‑skip probes.
+- **`boto3` 1.43.42 / botocore 1.43.42** — independent signed S3 client for the read‑only
+  probe matrix.
+- **`curl` 8.14.1** with `--aws-sigv4` — byte‑level SigV4 request/response inspection.
+
+All reproduction logic lives in ephemeral scripts under `/tmp` and is removed afterward
+(§8.3).
 
 ---
 
 ## 3. Identities, policies, and seed data (provisioned via the real admin API)
 
-All provisioning was performed through the `madmin-go/v3` admin API (the same surface `mc admin user add` / `mc admin policy create/attach` uses). Three principals were created plus the root account.
+All identities and policies were created through the **real admin API**
+(`madmin-go`, the same surface as `mc admin user add` / `mc admin policy
+create/attach`) against the running server — no simulation, no debug hooks. The
+policy JSON shown below is **read back from the server** with
+`madmin.InfoCannedPolicy` after attachment, i.e. it is what the server actually
+stored and evaluates.
 
 ### 3.1 Buckets and seed objects
 
-Two buckets were created: `probe-bucket` (default, **no** object‑lock) and `lock-bucket` (**object‑lock enabled**, needed to exercise a genuine retention denial — see §6.2). Objects were seeded as root with known byte content so ETag/size are byte‑verifiable (single‑part uploads, so `ETag == md5(content)`):
-
-| Object | Bucket/prefix | Size (bytes) | ETag | Note |
-|---|---|---:|---|---|
-| `ro-prefix/a.txt` | probe-bucket | 32 | `ceb0af67cd0aa67b448930821fb4d13d` | inside granted prefix |
-| `ro-prefix/b.txt` | probe-bucket | 34 | `5ed7a3c27adbc08f643f9d7980b36722` | inside granted prefix |
-| `ro-prefix/sub/c.txt` | probe-bucket | 35 | `3838836a58b105b1a9f62c72d7e2b71f` | inside granted prefix |
-| `other-prefix/x.txt` | probe-bucket | 33 | `f26a4590daae83e03c2c69c5a4cfac46` | **outside** granted prefix (leakage boundary) |
-| `lock-prefix/obj.txt` | lock-bucket | 34 | `b7c03ca910cfacea64f17e7f3c226a6e` | inside lock bucket, for retention probe |
-
-Object‑lock configuration observed (root):
+Two buckets were created as root: `probe-bucket` (no object lock) and `lock-bucket`
+(object‑locking enabled, for the retention/legal‑hold probes). Five seed objects were
+written as root, with **known byte content** so that each ETag equals the MD5 of its
+content (single‑part uploads). Raw provisioning output:
 
 ```
-probe-bucket : ObjectLockConfigurationNotFoundError  (no lock configured)
-lock-bucket  : ObjectLockEnabled = Enabled
+=== SEED OBJECTS (bucket key size etag) ===
+probe-bucket ro-prefix/a.txt        size=32 etag=5216ddcc58e8dade5256075e77f642da (md5=5216ddcc58e8dade5256075e77f642da)
+probe-bucket ro-prefix/b.txt        size=34 etag=cc9b8aab6a7164192c280d67647f60e9 (md5=cc9b8aab6a7164192c280d67647f60e9)
+probe-bucket ro-prefix/sub/c.txt    size=35 etag=6c870fac6991ca112725627766424949 (md5=6c870fac6991ca112725627766424949)
+probe-bucket other-prefix/x.txt     size=33 etag=d45e1549301eb727bde58d14554ce087 (md5=d45e1549301eb727bde58d14554ce087)
+lock-bucket  lock-prefix/obj.txt    size=34 etag=9dc2339c3556f6b3882ca300b94bd754 (md5=9dc2339c3556f6b3882ca300b94bd754)
 ```
 
-The storage owner reported in listing `<Owner>` blocks was `ID=02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4`, `DisplayName=minio`.
+Roles of the seeds:
+
+- `ro-prefix/a.txt`, `ro-prefix/b.txt`, `ro-prefix/sub/c.txt` — **inside** `rouser`'s
+  granted prefix (`ro-prefix/*`).
+- `other-prefix/x.txt` — **outside** the grant (used to prove the read boundary denies).
+- `lock-bucket/lock-prefix/obj.txt` — target for retention/legal‑hold probes.
 
 ### 3.2 `rouser` — the faithful read‑only principal (custom prefix‑scoped policy)
 
-To faithfully model *"read‑only access to a bucket **and prefix**"* (GET within the prefix **plus** listing gated to that prefix), a **custom** policy was created and attached to `rouser`. This is the exact JSON that was attached (read back from the admin API):
+`rouser` models "read‑only access to a bucket **and prefix**". Because the built‑in
+`readonly` policy cannot list (§3.3, §6.4), a **custom** policy is attached: `GetObject`
+on `ro-prefix/*` plus `ListBucket` gated by an `s3:prefix` condition, mirrored for
+`lock-bucket/lock-prefix/*`. Policy as **read back from the server**:
 
-```json
+```
+=== POLICY rouser-policy (read back from admin API) ===
 {
  "Version": "2012-10-17",
  "Statement": [
-  {
-   "Effect": "Allow",
-   "Action": ["s3:GetObject"],
-   "Resource": ["arn:aws:s3:::probe-bucket/ro-prefix/*"]
-  },
-  {
-   "Effect": "Allow",
-   "Action": ["s3:ListBucket"],
-   "Resource": ["arn:aws:s3:::probe-bucket"],
-   "Condition": {"StringLike": {"s3:prefix": ["ro-prefix/*"]}}
-  },
-  {
-   "Effect": "Allow",
-   "Action": ["s3:GetObject"],
-   "Resource": ["arn:aws:s3:::lock-bucket/lock-prefix/*"]
-  },
-  {
-   "Effect": "Allow",
-   "Action": ["s3:ListBucket"],
-   "Resource": ["arn:aws:s3:::lock-bucket"],
-   "Condition": {"StringLike": {"s3:prefix": ["lock-prefix/*"]}}
-  }
+  {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::probe-bucket/ro-prefix/*"]},
+  {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::probe-bucket"],
+   "Condition": {"StringLike": {"s3:prefix": ["ro-prefix/*"]}}},
+  {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::lock-bucket/lock-prefix/*"]},
+  {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::lock-bucket"],
+   "Condition": {"StringLike": {"s3:prefix": ["lock-prefix/*"]}}}
  ]
 }
 ```
 
-Statements **(1)–(2)** are the exact model the question calls for on `probe-bucket`. Statements **(3)–(4)** extend the identical read‑only shape to `lock-bucket` so that the retention probe (§6.3 / §7.2) exercises a genuine `PutObjectRetentionAction` IAM denial rather than being short‑circuited by the bucket‑lock gate — this extension is transparently noted here and does not grant any write action. Crucially, **no `Put*`, `Delete*`, `Abort*`, `*Tagging`, `*Retention`, `*LegalHold`, or `GetObjectAttributes` action is granted anywhere in this policy.**
+Note what this policy grants and, crucially, what it does **not**: no
+`PutObject`, no `DeleteObject`, no multipart action, no `PutObjectTagging`,
+`PutObjectRetention`, `PutObjectLegalHold`, `PutObjectAcl`, `GetObjectAttributes`, or
+`ListBucketMultipartUploads`. Every write‑adjacent probe in §5 therefore requests an
+action `rouser` is not granted, and MinIO's deny‑by‑default (`cmd/iam.go:2437`) rejects it.
 
-### 3.3 `rocanned` — the built‑in canned `readonly` policy and its `ListBucket` gap
+### 3.3 `rocanned` — the built‑in `readonly` principal (to document the `ListBucket` gap)
 
-A second principal `rocanned` was attached MinIO's **built‑in** `readonly` policy. Its effective JSON, read back from the admin API, is:
+`rocanned` is attached the distributed built‑in `readonly` canned policy. Policy as read
+back from the server:
 
-```json
+```
+=== POLICY readonly (read back from admin API) ===
 {
  "Version": "2012-10-17",
  "Statement": [
-  {
-   "Effect": "Allow",
-   "Action": ["s3:GetBucketLocation", "s3:GetObject"],
-   "Resource": ["arn:aws:s3:::*"]
-  }
+  {"Effect": "Allow", "Action": ["s3:GetBucketLocation", "s3:GetObject"], "Resource": ["arn:aws:s3:::*"]}
  ]
 }
 ```
 
-This matches the canned definition in `github.com/minio/pkg/v3@v3.0.22/policy/constants.go` (~L51‑L63). **It grants only `s3:GetBucketLocation` and `s3:GetObject` — there is no `s3:ListBucket`.** Consequently the built‑in `readonly` alone **cannot list** objects (proven empirically in §6.6), which is exactly why the faithful "bucket AND prefix" model in §3.2 needs a custom prefix‑scoped policy.
+This confirms directly from the running server what the source defines at
+`github.com/minio/pkg/v3@v3.0.22/policy/constants.go:53‑63`: built‑in `readonly` grants
+only `GetBucketLocation` and `GetObject` — **no `ListBucket`**. Consequences are
+demonstrated in §5.7/§6.4.
 
-### 3.4 `rwuser` — the read‑write principal that generates the concurrent load
+### 3.4 `rwuser` — the read‑write load driver (built‑in `readwrite`)
 
-The concurrent writers authenticate as `rwuser`, attached the built‑in `readwrite` policy:
+`rwuser` drives the concurrent write load (§4) and owns the live multipart upload that
+`rouser` probes against. Policy as read back:
 
-```json
+```
+=== POLICY readwrite (read back from admin API) ===
 {
  "Version": "2012-10-17",
  "Statement": [
@@ -220,684 +293,897 @@ The concurrent writers authenticate as `rwuser`, attached the built‑in `readwr
 }
 ```
 
-> **Security note.** All secret keys used here are throwaway local test values and are **redacted** from this document. The captured server traces contain a SigV4 `Authorization` header on every request; the trace collector records only `"<SigV4 present; redacted> (principal=<accessKey>)"` and never the live signature or secret material.
+### 3.5 `rwnoret` — a writer *without* retention permission (for the empty‑header skip probe, §6.2)
+
+`rwnoret` can put/get/list on `lock-bucket` but is **not** granted
+`s3:PutObjectRetention` (or `s3:PutObjectLegalHold`). It is used in §6.2 to demonstrate
+empirically that the `PutObject` retention sub‑check *skips* the retention permission
+when no object‑lock headers are present, and *enforces* it when they are. Policy as read
+back:
+
+```
+=== POLICY rwnoret-policy (read back from admin API) ===
+{
+ "Version": "2012-10-17",
+ "Statement": [
+  {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": ["arn:aws:s3:::lock-bucket/*"]},
+  {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::lock-bucket"]}
+ ]
+}
+```
+
 
 ---
 
 ## 4. Concurrent "under stress" load design
 
-While the read‑only probe matrix ran, a separate writer harness authenticated as `rwuser` (full `s3:*`) hammered `probe-bucket` continuously through the real signed S3 API (`minio-go`/`boto3`). This is the "under stress" condition the question asks about.
+To satisfy the "while other clients are hammering the same bucket" condition, **12
+concurrent writer goroutines** (signed `minio-go` clients authenticated as `rwuser`)
+continuously issued a mix of normal write and metadata traffic against `probe-bucket`
+for **90 seconds per run**, *while* the read‑only probe matrix (§5) executed. Each thread
+looped over a randomized mix of:
 
-- **Concurrency:** 12 writer threads running in a tight loop.
-- **Operation mix per loop (weighted):** `PutObject` (weight 5, varied keys), a full **multipart cycle** create → upload a 5 MiB part → complete, with ~30% of cycles **aborted** instead (weight 2), `PutObjectTagging` (weight 2), and `DeleteObject` (weight 2).
-- **Key space:** writer keys are written under `ro-prefix/w*`, `other-prefix/w*`, and `load/*` — deliberately **distinct** from the five seeded anchor keys, so the seeds remain stable side‑effect anchors while churn happens all around them.
-- **Scale reached:** during the second run, `probe-bucket` held **118,840 live objects** while the probes executed, confirming the boundary was exercised against a genuinely busy, mutating bucket rather than a quiescent one.
-- **Duration/repetition:** the writers ran continuously (multi‑hundred‑second windows) across **two full probe runs** (§8).
+- `PutObject` (single‑shot writes),
+- full **multipart** cycles (`NewMultipartUpload` → `PutObjectPart` (5 MiB) →
+  `CompleteMultipartUpload`, with ~30% of cycles **aborted** instead),
+- `PutObject` **with tags** (`PutObjectTagging` traffic), and
+- create‑then‑`DeleteObject` (delete traffic).
 
-The thesis being tested empirically is that this concurrent write traffic — no matter how heavy — cannot open a window for `rouser` to mutate data, because the authorization decision for `rouser` is computed solely from `rouser`'s own policy on each request. §5 explains the mechanism; §6 and §8 show it holding.
+**Key design choice that also fixes truncated evidence.** All writer traffic is confined
+to a **separate `load/` prefix**. The read‑only seeds live under `ro-prefix/` and
+`other-prefix/`, which the writers never touch. This keeps the bucket under genuine heavy
+concurrent churn **while** the `ro-prefix/` listing stays small and deterministic — so the
+listing/`HEAD` evidence in §5.6 is **complete and untruncated** (exactly the 3 seeds),
+yet still captured against a bucket holding tens of thousands of objects.
+
+**Observed load (run 1).** The writer summary and the live object count *during* the probe
+matrix and *after* the load window:
+
+```
+WRITERS_DONE threads=12 secs=90 puts=9521 mpu_complete=2769 mpu_abort=1152 tagged=3893 put_del=3949
+
+COUNT probe-bucket total=14471 load_prefix=14467      # measured DURING the probe matrix (under stress)
+COUNT probe-bucket total=30099 load_prefix=30095      # measured AFTER the 90s load window
+```
+
+So the read‑only probes in §5 executed against a bucket that was actively growing from
+**~14.5k to ~30k objects** under 12‑way concurrent writes, multipart cycles, tagging, and
+deletes. Run 2 reproduced the same design at even higher volume (§7). A **live
+`rwuser`‑owned multipart upload** (`load/writer-mpu.bin`) was also created each run so
+that `rouser`'s `UploadPart`/`UploadPartCopy`/`ListParts`/`Complete`/`Abort` probes target
+a **real, in‑progress upload ID** owned by another principal — not a fabricated one.
+
+**Server‑side evidence capture.** A single admin `ServiceTrace` subscriber (via
+`madmin-go`, the mechanism behind `mc admin trace`) recorded every `[REQUEST]`/`[RESPONSE]`
+for the probe principals (`rouser`, `rocanned`, `rwnoret`). The SigV4 `Authorization` header
+is **redacted** in all captured traces — reproduced here as
+`<SigV4 present; redacted> (principal=…)` — because it carries credential‑scoped signing
+material; the `X-Amz-Content-Sha256` payload hash is retained as it is not secret. Client
+side, `boto3` and `curl --aws-sigv4` recorded the HTTP status and full response body.
+
 
 ---
 
-## 5. The authorization mechanism (grounded, `file:line` verified at HEAD `c07e5b49d477`)
+## 5. Per‑operation results (the probe matrix)
 
-Every authenticated, state‑mutating S3 request is gated at **handler entry**, before the object/erasure layer is touched. The funnel, as cause → effect:
+Every probe below leads with its **raw evidence** — the exact request, the server‑side
+`[REQUEST]`/`[RESPONSE]` trace, the client status/body (or full header dump for `HEAD`),
+and the storage side‑effect proof — followed by a short interpretation grounded in a
+`file:line` reference.
 
-1. **Routing.** Handlers are registered behind `s3APIMiddleware` (`cmd/api-router.go:210`), which wraps each S3 operation.
-2. **Entry‑point authorization** in `cmd/auth-handler.go`:
-   - `checkRequestAuthType` (`:339`) → `checkRequestAuthTypeCredential` (`:523`) — used by most mutating handlers.
-   - `checkRequestAuthTypeWithVID` (`:349`) — adds a version ID; used by per‑object multi‑delete.
-   - `authenticateRequest` (`:358`) — used by `HEAD`.
-   - `isPutActionAllowed` (`:749`) — the PUT/streaming‑auth variant used by `UploadPart`/`PutObject`; it calls `globalIAMSys.IsAllowed(...)` at `:793`, returning `ErrNone` (`:803`) or `ErrAccessDenied` (`:805`).
-3. **The policy decision** — `IAMSys.IsAllowed` (`cmd/iam.go:2437`), dispatched in this order:
-   - external authZ/OPA plugin (`:2439`);
-   - **owner/root short‑circuit** `if args.IsOwner { return true }` (`:2448`);
-   - STS temporary user (`:2453`–`:2459`);
-   - service account (`:2462`–`:2468`);
-   - **regular user** → `PolicyDBGet` (`:2471`) → deny‑if‑no‑policy (`:2476`–`:2479`) → `GetCombinedPolicy(policies...).IsAllowed(args)` (`:2482`);
-   - otherwise **deny by default**. Policy storage/combination is backed by `cmd/iam-store.go`.
-4. **Error → HTTP mapping.** `ErrAccessDenied` maps to `Code: "AccessDenied"`, `HTTPStatusCode: http.StatusForbidden` (403) at `cmd/api-errors.go:539`. (The `writeErrorResponse` plumbing lives in `cmd/api-response.go`; the *mapping* is in `api-errors.go`.)
+### 5.1 The authorization mechanism (why concurrency cannot create a bypass)
 
-### 5.1 Core causal thesis (stated, then demonstrated in §6/§8)
+**How a signed request is authorized.** A signed S3 request is routed through
+`s3APIMiddleware` (`cmd/api-router.go:210`) to its handler. The handler resolves the
+required `policy` action and calls one of the entry‑point authorization primitives in
+`cmd/auth-handler.go` — `checkRequestAuthType` (`:339`), `checkRequestAuthTypeWithVID`
+(`:349`, used by per‑object multi‑delete), or, for streaming PUT‑style bodies,
+`isPutActionAllowed` (`:749`). These funnel into `IAMSys.IsAllowed()` (`cmd/iam.go:2437`),
+whose dispatch order is: authorization‑plugin → owner(root) → STS → **service/regular
+user policy** → deny‑by‑default. On denial the handler writes an `AccessDenied` response
+and returns; `AccessDenied` maps to **HTTP 403** at `cmd/api-errors.go:539‑542`.
 
-`IsAllowed` evaluates the **caller's own** policy on **each request** and is **stateless with respect to other clients' concurrent traffic**. Therefore **no volume of concurrent writes by other principals can change `rouser`'s decision** — concurrency cannot manufacture a write bypass. Because the deny happens at handler entry *before* any object‑layer/erasure call, a denied write leaves **no storage side effect**. The evidence for each probe below is exactly this pair: a `403` (or per‑key `AccessDenied`) trace **and** a proven‑absent storage side effect.
+**The narrow, evidence‑backed claim (not an over‑broad one).** For a faithfully
+read‑only principal, **every write‑adjacent operation is denied by the IAM policy
+decision before any write to the object/erasure backend, and therefore leaves no storage
+side effect.** For most operations the IAM check is at or very near handler entry
+(`checkRequestAuthType`/`isPutActionAllowed`). A few handlers first perform **pre‑IAM
+validation** and even an **object‑info/bucket‑info read** before the permission decision
+— for example `DeleteObjectTaggingHandler` reads `GetObjectInfo` (`cmd/object-handlers.go:3259`)
+*before* its `checkRequestAuthType(DeleteObjectTaggingAction)` (`:3301`), and
+`PutObjectRetentionHandler` validates the signature, reads bucket info, and requires
+`Content‑MD5` (`cmd/object-handlers.go:2874‑2890`) *before* reaching the retention
+permission. These are read/validation steps, **not** mutations; the deny still lands
+before any write. This precise distinction is expanded in §6.7.
+
+**Why concurrency is irrelevant.** `IAMSys.IsAllowed()` evaluates the caller's own
+policy against the requested action and resource for **that single request**. It does not
+consult, and is not affected by, what other clients are doing to the bucket. There is no
+code path where a concurrently‑running writer's request relaxes another principal's
+authorization decision. The evidence in §5.2–§5.7 was captured while 12 writers hammered
+the bucket (§4), and the read‑only outcomes are identical to a quiescent server and
+identical across two runs (§7) — empirically confirming that the decision is per‑request
+and load‑independent.
 
 ```mermaid
 flowchart TD
-    A[rouser signed S3 request] --> B["cmd/api-router.go s3APIMiddleware (L210)"]
-    B --> C["Handler entry: checkRequestAuthType / isPutActionAllowed (auth-handler.go L339 / L749)"]
-    C --> D["cmd/iam.go IAMSys.IsAllowed (L2437) evaluate rouser policy"]
-    D -->|action NOT in read-only set| E["writeErrorResponse AccessDenied -> HTTP 403 (api-errors.go L539)"]
-    D -->|action granted e.g. GetObject in prefix| F[Object layer read]
-    E --> G[No storage side effect]
-    F --> H[200 OK]
+    A["Read-only client: signed S3 request<br/>(write-adjacent op)"] --> B["cmd/api-router.go:210<br/>s3APIMiddleware routes to handler"]
+    B --> C["Handler entry: resolve required policy action"]
+    C --> V{"handler-specific<br/>pre-IAM validation?<br/>(sig / Content-MD5 / bucket-info /<br/>object-info read)"}
+    V -->|"fails (e.g. no Content-MD5)"| E400["400 before IAM check<br/>(no mutation)"]
+    V -->|"passes / not applicable"| D["cmd/auth-handler.go:339/749<br/>checkRequestAuthType / isPutActionAllowed<br/>-> cmd/iam.go:2437 IAMSys.IsAllowed"]
+    D -->|"action NOT in principal policy"| E["writeErrorResponse AccessDenied<br/>cmd/api-errors.go:539-542 -> HTTP 403"]
+    D -->|"action granted (e.g. GetObject in-prefix)"| F["object-layer read"]
+    E --> G["NO storage side effect"]
+    E400 --> G
+    F --> H["200 OK (read/leakage surface)"]
+    %% Deny (and the pre-IAM 400) both return before any object-layer MUTATION.
+    %% Concurrent writers never enter this principal's decision.
 ```
 
----
+The subsections that follow walk the four named write‑adjacent categories (multipart,
+copy, metadata, deletes) and the leakage surface, each with raw evidence.
 
-## 6. Per‑operation results (the probe matrix)
 
-Each probe below was issued as `rouser` through the real signed S3 API while the concurrent writers ran. For each, the **raw server‑side `[REQUEST]`/`[RESPONSE]` trace** (from the admin `ServiceTrace` feed) is shown *before* any summary, followed by the required policy action, the handler `file:line`, and the storage side‑effect proof. All error bodies are complete and unedited. Every error response carries the same `HostId dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8`.
+### 5.2 Multipart operations — all denied `403`, no object, no orphan upload
 
-### 6.1 Multipart operations (7)
+`rouser` attempted the full multipart surface. `CreateMultipartUpload` targeted a *new*
+key inside its readable prefix (`ro-prefix/rouser-created.bin`); the other six operations
+targeted the **live `rwuser`‑owned upload** `load/writer-mpu.bin` (a real, in‑progress
+upload ID, §4) to prove `rouser` cannot hijack another principal's multipart session.
 
-Handlers in `cmd/object-multipart-handlers.go` (and `ListMultipartUploads` in `cmd/bucket-handlers.go`). To probe `UploadPart`/`UploadPartCopy`/`Complete`/`Abort`/`ListParts`, `rouser` referenced a **writer‑created** `uploadId` (from the concurrent load), since `rouser` cannot create one itself — the point is to confirm the auth deny **precedes** any multipart state change.
-
-**6.1.1 CreateMultipartUpload** — required `PutObjectAction`; `NewMultipartUploadHandler` `cmd/object-multipart-handlers.go:64`, check at `:83`.
+**Full trace block (representative), `CreateMultipartUpload`.** The SigV4‑signed request
+headers shown here (User‑Agent, `Amz-Sdk-*`, redacted `Authorization`,
+`X-Amz-Content-Sha256`, `X-Amz-Date`) are common to all boto3 probes; subsequent probes
+show only the distinguishing request line, headers, and the response.
 
 ```
-[REQUEST s3.NewMultipartUpload] 05:21:56.808462 ak=rouser client=127.0.0.1
+[REQUEST s3.NewMultipartUpload] 06:48:26.413295 ak=rouser client=127.0.0.1
 POST /probe-bucket/ro-prefix/rouser-created.bin?uploads HTTP/1.1
+Accept-Encoding: identity
+Amz-Sdk-Invocation-Id: 7c6bf6d6-faa6-40f0-b28a-f4b7663ff410
+Amz-Sdk-Request: attempt=1
 Authorization: <SigV4 present; redacted> (principal=rouser)
 Content-Length: 0
 Host: 127.0.0.1:9000
+User-Agent: Boto3/1.43.42 md/Botocore#1.43.42 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/Z,D,N,e,b cfg/retry-mode#legacy Botocore/1.43.42
 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=209.315µs bytes=502
+X-Amz-Date: 20260708T064826Z
+[RESPONSE] 403 dur=170.945µs bytes=502
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-created.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-created.bin</Resource><RequestId>18C038FE2F7FA30B</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-created.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-created.bin</Resource><RequestId>18C03DB67C0D13E5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
+Client side (boto3): `HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67C0D13E5`.
 
-*Storage proof:* `/tmp/minio-data/probe-bucket/ro-prefix/rouser-created.bin` is **ABSENT** after the probe, and an authorized `ListMultipartUploads` (root) shows **no orphan upload‑ID** for that key — the denied create allocated nothing.
-
-**6.1.2 UploadPart** — required `PutObjectAction` (via `isPutActionAllowed`); `PutObjectPartHandler` `cmd/object-multipart-handlers.go:583`, check at `:667`.
+**The other six multipart requests and responses (server trace).** These six target the
+live `rwuser` upload, so they carry the same in‑progress `uploadId`
+`ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy`.
+Request lines and full response bodies are shown verbatim; the common SigV4 headers are as
+in the representative block above.
 
 ```
-[REQUEST s3.PutObjectPart] 05:21:56.814175 ak=rouser client=127.0.0.1
-PUT /probe-bucket/ro-prefix/writer-mpu.bin?partNumber=1&uploadId=ZGRmZDMxY2EtNWUzMS00OTMzLWI5MjktYjc0Mjc1ZTdjYjQ4LmVhMjRlNzBlLWM2MjItNDlmNy1hM2VmLTc2M2Y0M2IyYmVlZngxNzgzNDg4MTE2NzUwNDA5NzUz HTTP/1.1
-X-Amz-Content-Sha256: e6a4ff9df5c3e4523900da36e7b538681c2ae36b0170cb17e1a3522a94e08c86
-X-Amz-Date: 20260708T052156Z
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 8
-Host: 127.0.0.1:9000
-[RESPONSE] 403 dur=80.626µs bytes=501
+[REQUEST s3.PutObjectPart] ak=rouser
+PUT /probe-bucket/load/writer-mpu.bin?partNumber=1&uploadId=ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy HTTP/1.1
+X-Amz-Checksum-Crc32: GLykeA==
+X-Amz-Sdk-Checksum-Algorithm: CRC32
+--body(6 bytes)--
+[RESPONSE] 403 dur=107.978µs bytes=541
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/writer-mpu.bin</Resource><RequestId>18C038FE2FD6D509</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>load/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/load/writer-mpu.bin</Resource><RequestId>18C03DB67C4CAEE6</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.1.3 UploadPartCopy** — required `PutObjectAction` (dst) + `GetObjectAction` (src); `CopyObjectPartHandler` `cmd/object-multipart-handlers.go:244` (dst check `:268`, src `:301`).
-
-```
-[REQUEST s3.CopyObjectPart] 05:21:56.816606 ak=rouser client=127.0.0.1
-PUT /probe-bucket/ro-prefix/writer-mpu.bin?partNumber=1&uploadId=ZGRmZDMxY2EtNWUzMS00OTMzLWI5MjktYjc0Mjc1ZTdjYjQ4LmVhMjRlNzBlLWM2MjItNDlmNy1hM2VmLTc2M2Y0M2IyYmVlZngxNzgzNDg4MTE2NzUwNDA5NzUz HTTP/1.1
-X-Amz-Date: 20260708T052156Z
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Host: 127.0.0.1:9000
+[REQUEST s3.CopyObjectPart] ak=rouser
+PUT /probe-bucket/load/writer-mpu.bin?partNumber=2&uploadId=ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy HTTP/1.1
 X-Amz-Copy-Source: probe-bucket/ro-prefix/a.txt
-Content-Length: 0
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-[RESPONSE] 403 dur=139.934µs bytes=512
+[RESPONSE] 403 dur=141.482µs bytes=502
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/writer-mpu.bin</Resource><RequestId>18C038FE2FFBEBDE</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>load/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/load/writer-mpu.bin</Resource><RequestId>18C03DB67C7C633E</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.1.4 CompleteMultipartUpload** — required `PutObjectAction`; `CompleteMultipartUploadHandler` `cmd/object-multipart-handlers.go:908`, check at `:927`.
-
-```
-[REQUEST s3.CompleteMultipartUpload] 05:21:56.818809 ak=rouser client=127.0.0.1
-POST /probe-bucket/ro-prefix/writer-mpu.bin?uploadId=ZGRmZDMxY2EtNWUzMS00OTMzLWI5MjktYjc0Mjc1ZTdjYjQ4LmVhMjRlNzBlLWM2MjItNDlmNy1hM2VmLTc2M2Y0M2IyYmVlZngxNzgzNDg4MTE2NzUwNDA5NzUz HTTP/1.1
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: b320bfe5778b5ef02cb08ea60b4f329a93b5c24f872a0f76d0e73a7168480f17
-X-Amz-Date: 20260708T052156Z
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 185
-[RESPONSE] 403 dur=114.962µs bytes=494
+[REQUEST s3.ListObjectParts] ak=rouser
+GET /probe-bucket/load/writer-mpu.bin?uploadId=ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy HTTP/1.1
+[RESPONSE] 403 dur=115.077µs bytes=484
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/writer-mpu.bin</Resource><RequestId>18C038FE301D8516</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>load/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/load/writer-mpu.bin</Resource><RequestId>18C03DB67C9B0A95</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.1.5 AbortMultipartUpload** — required `AbortMultipartUploadAction`; `AbortMultipartUploadHandler` `cmd/object-multipart-handlers.go:1098`, check at `:1118`.
-
-```
-[REQUEST s3.AbortMultipartUpload] 05:21:56.820642 ak=rouser client=127.0.0.1
-DELETE /probe-bucket/ro-prefix/writer-mpu.bin?uploadId=ZGRmZDMxY2EtNWUzMS00OTMzLWI5MjktYjc0Mjc1ZTdjYjQ4LmVhMjRlNzBlLWM2MjItNDlmNy1hM2VmLTc2M2Y0M2IyYmVlZngxNzgzNDg4MTE2NzUwNDA5NzUz HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=100.575µs bytes=494
+[REQUEST s3.CompleteMultipartUpload] ak=rouser
+POST /probe-bucket/load/writer-mpu.bin?uploadId=ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy HTTP/1.1
+[RESPONSE] 403 dur=101.242µs bytes=484
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/writer-mpu.bin</Resource><RequestId>18C038FE303983DA</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>load/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/load/writer-mpu.bin</Resource><RequestId>18C03DB67CBBF34A</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.1.6 ListParts** — required `ListMultipartUploadPartsAction`; `ListObjectPartsHandler` `cmd/object-multipart-handlers.go:1143`, check at `:1162`.
-
-```
-[REQUEST s3.ListObjectParts] 05:21:56.822535 ak=rouser client=127.0.0.1
-GET /probe-bucket/ro-prefix/writer-mpu.bin?uploadId=ZGRmZDMxY2EtNWUzMS00OTMzLWI5MjktYjc0Mjc1ZTdjYjQ4LmVhMjRlNzBlLWM2MjItNDlmNy1hM2VmLTc2M2Y0M2IyYmVlZngxNzgzNDg4MTE2NzUwNDA5NzUz HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Host: 127.0.0.1:9000
-Content-Length: 0
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=97.958µs bytes=494
+[REQUEST s3.AbortMultipartUpload] ak=rouser
+DELETE /probe-bucket/load/writer-mpu.bin?uploadId=ZTRhODkxNzctNzQ4OS00ODJjLWE1MWYtNmZmNWE3ZjAyOGI0LjYyNDRmNTc3LTJhNzgtNGZlNS04MTQwLWI2ZDc0NWVmOWE0ZngxNzgzNDkzMzA1MTk3NzY5NTYy HTTP/1.1
+[RESPONSE] 403 dur=92.046µs bytes=484
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/writer-mpu.bin</Resource><RequestId>18C038FE30566163</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>load/writer-mpu.bin</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/load/writer-mpu.bin</Resource><RequestId>18C03DB67CD7DFB2</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.1.7 ListMultipartUploads** — required `ListBucketMultipartUploadsAction`; `ListMultipartUploadsHandler` `cmd/bucket-handlers.go:251`, check at `:265`.
-
-```
-[REQUEST s3.ListMultipartUploads] 05:21:56.824306 ak=rouser client=127.0.0.1
-GET /probe-bucket?uploads= HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=114.295µs bytes=434
+[REQUEST s3.ListMultipartUploads] ak=rouser
+GET /probe-bucket?uploads HTTP/1.1
+[RESPONSE] 403 dur=105.565µs bytes=434
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C038FE30716B4D</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C03DB67CF31D66</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-**Multipart summary:** all 7 operations denied `403 AccessDenied` at handler entry. The denied `CreateMultipartUpload` created **no** upload‑ID (authorized `ListMultipartUploads` confirmed no orphan), and none of the part/complete/abort operations against the writer's `uploadId` touched state — the deny is on `rouser`'s missing `PutObjectAction`/`AbortMultipartUploadAction`/`ListMultipartUploadPartsAction`, evaluated before the multipart subsystem is engaged.
-
-### 6.2 Copy‑style (server‑side) writes (2)
-
-**6.2.1 CopyObject** — required `PutObjectAction` on dst (+ `GetObjectAction` on src); `CopyObjectHandler` `cmd/object-handlers.go:1154`, check at `:1173`. Probed twice (boto3 and an independent raw `curl --aws-sigv4` for byte‑level corroboration).
-
-boto3 trace:
+Client statuses (boto3), one line per probe:
 
 ```
-[REQUEST s3.CopyObject] 05:21:56.826489 ak=rouser client=127.0.0.1
+###PROBE 01 CreateMultipartUpload         HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67C0D13E5
+###PROBE 02 UploadPart                    HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67C4CAEE6
+###PROBE 03 UploadPartCopy                HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67C7C633E
+###PROBE 04 ListParts                     HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67C9B0A95
+###PROBE 05 CompleteMultipartUpload       HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67CBBF34A
+###PROBE 06 AbortMultipartUpload          HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67CD7DFB2
+###PROBE 07 ListMultipartUploads          HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67CF31D66
+```
+
+**Storage side‑effect proof (authorized root re‑check, after the probes).** The new key
+`rouser` tried to create does not exist, and the denied `CreateMultipartUpload` left **no
+orphan upload**:
+
+```
+ABSENT probe-bucket ro-prefix/rouser-created.bin CONFIRMED-ABSENT (NoSuchKey)
+ORPHAN-MPU ro-prefix/rouser-created.bin uploads=0
+RELIST ro-prefix/ (root):
+  ro-prefix/a.txt        size=32 etag=5216ddcc58e8dade5256075e77f642da
+  ro-prefix/b.txt        size=34 etag=cc9b8aab6a7164192c280d67647f60e9
+  ro-prefix/sub/c.txt    size=35 etag=6c870fac6991ca112725627766424949
+```
+
+**Interpretation.** Each multipart handler resolves a multipart‑specific action and denies
+`rouser` at entry: `NewMultipartUploadHandler` requires `PutObjectAction`
+(`cmd/object-multipart-handlers.go:64`); `PutObjectPartHandler` uses `isPutActionAllowed`
+for `PutObjectAction` (`:583`, check at `:667`); `CopyObjectPartHandler` needs
+`PutObjectAction`+source `GetObjectAction` (`:244`); `CompleteMultipartUploadHandler`
+`PutObjectAction` (`:908`); `AbortMultipartUploadHandler` `AbortMultipartUploadAction`
+(`:1098`); `ListObjectPartsHandler` `ListMultipartUploadPartsAction` (`:1143`);
+`ListMultipartUploadsHandler` `ListBucketMultipartUploadsAction`
+(`cmd/bucket-handlers.go:251`). `rouser` holds none of these, so all seven are denied
+`403` before the object layer performs any multipart mutation.
+
+
+### 5.3 Copy‑style (server‑side) writes — all denied `403`, no object created
+
+Two server‑side copy surfaces: `CopyObject` (whole‑object, `PUT` with `X-Amz-Copy-Source`)
+and `UploadPartCopy` (copy into a multipart part — its trace is in §5.2 as
+`s3.CopyObjectPart`). `rouser` attempted to copy its *readable* seed `ro-prefix/a.txt`
+into a new key `ro-prefix/rouser-copy.txt`. Even though the **source** read is within its
+grant, the **destination** write requires `PutObjectAction`, which it lacks.
+
+**Full server trace, `CopyObject`:**
+
+```
+[REQUEST s3.CopyObject] 06:48:26.430330 ak=rouser client=127.0.0.1
 PUT /probe-bucket/ro-prefix/rouser-copy.txt HTTP/1.1
 Authorization: <SigV4 present; redacted> (principal=rouser)
+Content-Length: 0
 Host: 127.0.0.1:9000
+X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 X-Amz-Copy-Source: probe-bucket/ro-prefix/a.txt
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=95.242µs bytes=514
+X-Amz-Date: 20260708T064826Z
+[RESPONSE] 403 dur=95.436µs bytes=514
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-copy.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-copy.txt</Resource><RequestId>18C038FE3092BAC5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-copy.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-copy.txt</Resource><RequestId>18C03DB67D110A9D</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
+Client side (boto3): `HTTPStatus: 403  Code: AccessDenied  RequestId: 18C03DB67D110A9D`.
 
-Independent `curl --aws-sigv4` cross‑check (different signer, different target key):
-
-```
-[REQUEST s3.CopyObject] 05:32:25.662504 ak=rouser client=127.0.0.1
-PUT /probe-bucket/ro-prefix/rouser-copy-curl.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Host: 127.0.0.1:9000
-X-Amz-Copy-Source: /probe-bucket/ro-prefix/a.txt
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T053225Z
-[RESPONSE] 403 dur=151.89µs bytes=477
-<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-copy-curl.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-copy-curl.txt</Resource><RequestId>18C039909A1ED0A3</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
-
-*Storage proof:* both destination keys are **ABSENT** on disk before and after (`/tmp/minio-data/probe-bucket/ro-prefix/rouser-copy.txt` and `…/rouser-copy-curl.txt` never created; authorized `HeadObject` as root returns 404). The source `ro-prefix/a.txt` remained byte‑identical (size 32, ETag `ceb0af67cd0aa67b448930821fb4d13d`).
-
-**6.2.2 UploadPartCopy** — covered in §6.1.3 (`CopyObjectPart`, `403`). It is the multipart form of a server‑side copy and is denied for the same reason (missing dst `PutObjectAction`).
-
-### 6.3 Metadata changes (5)
-
-**6.3.1 PutObjectTagging** — required `PutObjectTaggingAction`; `PutObjectTaggingHandler` `cmd/object-handlers.go:3122`, check at `:3151`.
+**Storage side‑effect proof (root, after probes):**
 
 ```
-[REQUEST s3.PutObjectTagging] 05:21:56.833593 ak=rouser client=127.0.0.1
+ABSENT probe-bucket ro-prefix/rouser-copy.txt  CONFIRMED-ABSENT (NoSuchKey)
+ABSENT probe-bucket ro-prefix/rouser-copy-curl.txt CONFIRMED-ABSENT (NoSuchKey)
+```
+(The `-curl` key is the same probe repeated through `curl --aws-sigv4`; it too created
+nothing. The `ro-prefix/` re‑list in §5.2 shows only the 3 original seeds.)
+
+**Interpretation.** `CopyObjectHandler` (`cmd/object-handlers.go:1154`) authorizes the
+destination with `PutObjectAction` (and the source with `GetObjectAction`) at handler
+entry (`:1173`). `rouser` lacks `PutObjectAction`, so the copy is denied `403` before any
+object is written — the read‑only grant on the source does not extend to writing a copy.
+
+
+### 5.4 Metadata changes — all denied, no metadata mutated
+
+`rouser` attempted to mutate object metadata five ways: object tagging (put + delete),
+retention, legal‑hold, and ACL. All were denied; §6.2/§6.7 expand the retention nuance.
+
+**Server traces (distinguishing request line + response):**
+
+```
+[REQUEST s3.PutObjectTagging] 06:48:26.432279 ak=rouser client=127.0.0.1
 PUT /probe-bucket/ro-prefix/a.txt?tagging HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 130
-Host: 127.0.0.1:9000
-X-Amz-Checksum-Crc32: s9mpkQ==
-X-Amz-Sdk-Checksum-Algorithm: CRC32
-X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
-X-Amz-Date: 20260708T052156Z
-X-Amz-Tagging: env=hacked
-[RESPONSE] 403 dur=183.042µs bytes=670
+X-Amz-Tagging: injected=byrouser
+[RESPONSE] 403 dur=176.928µs bytes=677
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE30FF1D6A</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB67D2EC62A</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-*Storage proof:* an authorized `GetObjectTagging` (root) on `ro-prefix/a.txt` afterward returns an **empty tag set** — the attempted `env=hacked` tag was never applied.
-
-**6.3.2 DeleteObjectTagging** — required `DeleteObjectTaggingAction`; `DeleteObjectTaggingHandler` `cmd/object-handlers.go:3235`, check at `:3301`.
-
-```
-[REQUEST s3.DeleteObjectTagging] 05:21:56.840427 ak=rouser client=127.0.0.1
+[REQUEST s3.DeleteObjectTagging] ak=rouser
 DELETE /probe-bucket/ro-prefix/a.txt?tagging HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=350.64µs bytes=476
+[RESPONSE] 403 dur=340.623µs bytes=476
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE31675FD8</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB67D49FF4C</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-**6.3.3 PutObjectRetention** — required `PutObjectRetentionAction`; `PutObjectRetentionHandler` `cmd/object-handlers.go:2855`. This probe has **two distinct paths** (a nuance analyzed in §7.2). The retention request carried both object‑lock headers (a real `GOVERNANCE` mode + retain‑until date) and an explicit `Content-MD5`, so it is not short‑circuited by the empty‑header early‑return in `isPutActionAllowed` (`cmd/auth-handler.go:769`–`775`).
-
-Path A — against `probe-bucket` (**no** object‑lock config). The bucket object‑lock‑configuration gate at `cmd/object-handlers.go:2890` fires **before** IAM, yielding `400 InvalidRequest`:
-
-```
-[REQUEST s3.PutObjectRetention] 05:32:25.606151 ak=rouser client=127.0.0.1
-PUT /probe-bucket/ro-prefix/a.txt?retention HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 153
-Content-Md5: JusyXIPJFSIvT0lcz6nvxg==
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: 129597d6a602f6f8fdcc6519a6c03f890bc354393dfe229e71c611cbed211d53
-X-Amz-Date: 20260708T053225Z
-[RESPONSE] 400 dur=187.202µs bytes=483
+[REQUEST s3.PutObjectLegalHold] ak=rouser
+PUT /lock-bucket/lock-prefix/obj.txt?legal-hold HTTP/1.1
+[RESPONSE] 403 dur=105.249µs bytes=532
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>InvalidRequest</Code><Message>Bucket is missing ObjectLockConfiguration</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C0399096C2F2E1</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>lock-prefix/obj.txt</Key><BucketName>lock-bucket</BucketName><Resource>/lock-bucket/lock-prefix/obj.txt</Resource><RequestId>18C03DB67D8D78FA</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 
-Path B — against `lock-bucket` (**object‑lock enabled**). The lock gate passes, execution reaches `enforceRetentionBypassForPut` → `isPutRetentionAllowed` (`cmd/auth-handler.go:704`) → `IsAllowed(PutObjectRetentionAction)` (`:728`), which denies; the deny is mapped to `403 AccessDenied` (`errAuthentication` → `ErrAccessDenied` at `cmd/api-errors.go:2176`). Note the timing tell — `25.2ms` here vs `187µs` for the early `400`, because this path runs deeper before denying:
-
-```
-[REQUEST s3.PutObjectRetention] 05:32:25.615830 ak=rouser client=127.0.0.1
-PUT /lock-bucket/lock-prefix/obj.txt?retention HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 153
-Content-Md5: JusyXIPJFSIvT0lcz6nvxg==
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: 129597d6a602f6f8fdcc6519a6c03f890bc354393dfe229e71c611cbed211d53
-X-Amz-Date: 20260708T053225Z
-[RESPONSE] 403 dur=25.220319ms bytes=613
-<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>lock-prefix/obj.txt</Key><BucketName>lock-bucket</BucketName><Resource>/lock-bucket/lock-prefix/obj.txt</Resource><RequestId>18C039909756A37B</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
-
-*Storage proof:* on both buckets the target objects were unchanged; an authorized retention read (root) on `lock-prefix/obj.txt` returns `NoSuchObjectLockConfiguration` (no retention was ever set).
-
-**6.3.4 PutObjectLegalHold** — required `PutObjectLegalHoldAction`; `PutObjectLegalHoldHandler` `cmd/object-handlers.go:2698`, check at `:2718`. Unlike retention, the IAM check here precedes the bucket‑lock gate (`:2732`), so `rouser` is denied `403` **directly** even on `probe-bucket`:
-
-```
-[REQUEST s3.PutObjectLegalHold] 05:21:56.846285 ak=rouser client=127.0.0.1
-PUT /probe-bucket/ro-prefix/a.txt?legal-hold HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 90
-Host: 127.0.0.1:9000
-X-Amz-Checksum-Crc32: 6XWxlw==
-X-Amz-Sdk-Checksum-Algorithm: CRC32
-X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=114.554µs bytes=526
-<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE31C0C448</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
-
-**6.3.5 PutObjectAcl** — required `PutBucketPolicyAction` (re‑purposed, see §7.3); `PutObjectACLHandler` `cmd/acl-handlers.go:172`, check at `:193`.
-
-```
-[REQUEST s3.PutObjectACL] 05:21:56.848120 ak=rouser client=127.0.0.1
+[REQUEST s3.PutObjectACL] ak=rouser
 PUT /probe-bucket/ro-prefix/a.txt?acl HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Acl: private
-X-Amz-Checksum-Crc32: AAAAAA==
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=130.941µs bytes=510
+[RESPONSE] 403 dur=110.239µs bytes=510
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE31DCC888</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB67DA9D23D</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-(Note: this response has no `<Key>` element — the ACL handler emits a bucket/resource‑scoped `AccessDenied`.) **Metadata summary:** every metadata‑mutating call was denied; tagging/legal‑hold/ACL returned `403` directly, retention returned `400` (non‑lock bucket, lock‑config gate) and a genuine `403` (lock bucket, IAM). No object's tags, retention, legal‑hold, or ACL changed.
-
-### 6.4 Deletes (2)
-
-**6.4.1 DeleteObject (single)** — required `DeleteObjectAction`; `DeleteObjectHandler` `cmd/object-handlers.go:2509`, check at `:2528`. Probed via boto3 and raw `curl`:
-
-boto3:
+**Retention has a pre‑IAM `Content‑MD5` gate — both observations captured.** botocore 1.43
+sends a CRC32 checksum instead of `Content‑MD5`, so the boto3 `PutObjectRetention` is
+rejected **before** the IAM check with `400 MissingContentMD5`:
 
 ```
-[REQUEST s3.DeleteObject] 05:21:56.849946 ak=rouser client=127.0.0.1
+[REQUEST s3.PutObjectRetention] 06:48:26.436525 ak=rouser client=127.0.0.1
+PUT /lock-bucket/lock-prefix/obj.txt?retention HTTP/1.1
+X-Amz-Checksum-Crc32: nFTw3Q==
+X-Amz-Sdk-Checksum-Algorithm: CRC32
+[RESPONSE] 400 dur=160.371µs bytes=577
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>MissingContentMD5</Code><Message>Missing required header for this request: Content-Md5.</Message><Key>lock-prefix/obj.txt</Key><BucketName>lock-bucket</BucketName><Resource>/lock-bucket/lock-prefix/obj.txt</Resource><RequestId>18C03DB67D6F909E</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Supplying `Content‑MD5` (via `curl --aws-sigv4`) reaches the IAM check, which **denies**:
+
+```
+$ RBODY='<Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>GOVERNANCE</Mode><RetainUntilDate>2026-07-10T00:00:00.000Z</RetainUntilDate></Retention>'
+$ curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "rouser:..." -X PUT \
+    "http://127.0.0.1:9000/lock-bucket/lock-prefix/obj.txt?retention" \
+    -H "Content-MD5: kXWORN7hc0JUDaHjRxWT2Q==" -H "Content-Type: application/xml" --data-binary "$RBODY"
+curl_http=403
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>lock-prefix/obj.txt</Key><BucketName>lock-bucket</BucketName><Resource>/lock-bucket/lock-prefix/obj.txt</Resource><RequestId>18C03DB68CB0972C</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Client statuses (boto3), one line per probe:
+
+```
+###PROBE 09 PutObjectTagging     HTTPStatus: 403  Code: AccessDenied     RequestId: 18C03DB67D2EC62A
+###PROBE 10 DeleteObjectTagging  HTTPStatus: 403  Code: AccessDenied     RequestId: 18C03DB67D49FF4C
+###PROBE 11 PutObjectRetention   HTTPStatus: 400  Code: MissingContentMD5 RequestId: 18C03DB67D6F909E   (curl+Content-MD5 -> 403 AccessDenied)
+###PROBE 12 PutObjectLegalHold   HTTPStatus: 403  Code: AccessDenied     RequestId: 18C03DB67D8D78FA
+###PROBE 13 PutObjectAcl         HTTPStatus: 403  Code: AccessDenied     RequestId: 18C03DB67DA9D23D
+```
+
+**Storage side‑effect proof (root, after probes):** the tags on `ro-prefix/a.txt` are
+still empty (the denied `PutObjectTagging` applied nothing), and `lock-prefix/obj.txt` is
+byte‑stable (no retention/legal‑hold applied):
+
+```
+TAGS ro-prefix/a.txt count=0 map=map[]
+STAT lock-bucket  lock-prefix/obj.txt size=34 etag=9dc2339c3556f6b3882ca300b94bd754 lastmod=2026-07-08T06:37:51Z
+```
+
+**Interpretation.** Each metadata handler requires a distinct mutating action `rouser`
+lacks: `PutObjectTaggingHandler` → `PutObjectTaggingAction` (`cmd/object-handlers.go:3122`,
+check at `:3151`); `DeleteObjectTaggingHandler` → `DeleteObjectTaggingAction` (`:3235`,
+check at `:3301`); `PutObjectRetentionHandler` → `PutObjectRetentionAction` (`:2855`,
+reached after the pre‑IAM `Content‑MD5` gate at `:2885`); `PutObjectLegalHoldHandler` →
+`PutObjectLegalHoldAction` (`:2698`, check at `:2718`); `PutObjectACLHandler` →
+`PutBucketPolicyAction` (`cmd/acl-handlers.go:172`, §6.3). Note the `PutObjectACL` error
+`Resource` is the object path but carries **no `<Key>`** element — a small handler‑specific
+response detail, faithfully reproduced above.
+
+
+### 5.5 Deletes — single denied `403`; multi returns `200` with per‑key `AccessDenied` and no deletion
+
+**Single `DeleteObject` (server trace):**
+
+```
+[REQUEST s3.DeleteObject] 06:48:26.442119 ak=rouser client=127.0.0.1
 DELETE /probe-bucket/ro-prefix/a.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052156Z
-[RESPONSE] 403 dur=112.995µs bytes=476
+[RESPONSE] 403 dur=104.883µs bytes=476
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE31F8A4C6</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB67DC4F052</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-curl `--aws-sigv4` cross‑check:
+**Byte‑level cross‑check via `curl --aws-sigv4`** (independent client, raw wire bytes):
 
 ```
-[REQUEST s3.DeleteObject] 05:32:25.653883 ak=rouser client=127.0.0.1
-DELETE /probe-bucket/ro-prefix/a.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 0
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T053225Z
-[RESPONSE] 403 dur=162.84µs bytes=429
+$ curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "rouser:..." -X DELETE \
+    "http://127.0.0.1:9000/probe-bucket/ro-prefix/a.txt"
+curl_http=403
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03990999B44ED</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB68B3DDE75</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-*Storage proof (the decisive one):* `ro-prefix/a.txt` was still present and byte‑identical after both deletes — its `xl.meta` retained `size=480 mtime=05:17:41` (the seed time), i.e. the file on disk was never touched:
+**Multi‑object `DeleteObjects`.** botocore 1.43 again omits `Content‑MD5` (sends CRC32),
+so the boto3 call is rejected at the pre‑IAM gate with `400 MissingContentMD5`:
 
 ```
-$ ls -la /tmp/minio-data/probe-bucket/ro-prefix/a.txt/
--rw-r--r-- 1 root root 480 Jul  8 05:17 xl.meta
+[REQUEST s3.DeleteMultipleObjects] 06:48:26.444088 ak=rouser client=127.0.0.1
+POST /probe-bucket?delete HTTP/1.1
+X-Amz-Checksum-Crc32: NZDbHg==
+X-Amz-Sdk-Checksum-Algorithm: CRC32
+[RESPONSE] 400 dur=50.018µs bytes=529
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>MissingContentMD5</Code><Message>Missing required header for this request: Content-Md5.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C03DB67DE2F8D7</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-**6.4.2 DeleteObjects (multi‑object)** — required `DeleteObjectAction` (bucket‑level `cmd/bucket-handlers.go:471` + per‑object `:505`); `DeleteMultipleObjectsHandler` `cmd/bucket-handlers.go:416`. This is the per‑key‑`200` nuance detailed in §7.1. The request carried the required `Content-MD5`:
+Supplying `Content‑MD5` (via `curl --aws-sigv4`) reaches the per‑object authorization,
+which returns **HTTP 200** with a **per‑key `AccessDenied`** for every key — and deletes
+nothing:
 
 ```
-[REQUEST s3.DeleteMultipleObjects] 05:32:25.592223 ak=rouser client=127.0.0.1
-POST /probe-bucket?delete= HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-Content-Length: 123
-Content-Md5: dcMriinezglVnRWB7tqCSQ==
-Host: 127.0.0.1:9000
-X-Amz-Content-Sha256: 2e59a4b62f4fc962d24a45b729b0a6aa6fb29bfb555ce4507e3b6cc927510e55
-X-Amz-Date: 20260708T053225Z
-[RESPONSE] 200 dur=382.439µs bytes=592
+$ DBODY='<Delete><Object><Key>ro-prefix/a.txt</Key></Object><Object><Key>ro-prefix/b.txt</Key></Object></Delete>'
+$ curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "rouser:..." -X POST \
+    "http://127.0.0.1:9000/probe-bucket?delete" \
+    -H "Content-MD5: kQ1CJwyYdxKAiUEB/WMPHA==" -H "Content-Type: application/xml" --data-binary "$DBODY"
+curl_http=200
 <?xml version="1.0" encoding="UTF-8"?>
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><VersionId></VersionId></Error><Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/b.txt</Key><VersionId></VersionId></Error></DeleteResult>
 ```
 
-*Storage proof:* an authorized re‑list and `HeadObject` (root) confirmed **both** `ro-prefix/a.txt` and `ro-prefix/b.txt` still present with unchanged sizes/ETags — the top‑level `200` carried per‑key `AccessDenied` and deleted nothing.
-
-### 6.5 Information‑leakage surface: listing / HEAD / attributes (6)
-
-This quantifies **exactly** what `rouser` can learn without a full object read, and the precise in‑prefix vs out‑of‑prefix boundary.
-
-**6.5.1 ListObjectsV2 — inside the granted prefix (ALLOWED, `200`)** — required `ListBucketAction`; `ListObjectsV2Handler` `cmd/bucket-listobjects-handlers.go:154`, check at `:172`. The prefix‑gated `ListBucket` condition is satisfied, so the call succeeds and returns object metadata. Response (truncated to the three seeds; the page held `KeyCount=1000`, the remaining ~997 being writer‑churn `ro-prefix/w*` keys created by the concurrent load):
+**Storage side‑effect proof (root, after probes):** both keys the multi‑delete named are
+still present and byte‑identical (the `ro-prefix/` re‑list in §5.2 confirms all 3 seeds
+remain):
 
 ```
-[REQUEST s3.ListObjectsV2] 05:21:57.061499 ak=rouser client=127.0.0.1
-GET /probe-bucket?list-type=2&prefix=ro-prefix%2F&encoding-type=url HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 200 dur=29.939943ms bytes=220336
+STAT probe-bucket ro-prefix/a.txt size=32 etag=5216ddcc58e8dade5256075e77f642da lastmod=2026-07-08T06:37:51Z
+STAT probe-bucket ro-prefix/b.txt size=34 etag=cc9b8aab6a7164192c280d67647f60e9 lastmod=2026-07-08T06:37:51Z
+```
+
+**Interpretation.** `DeleteObjectHandler` (`cmd/object-handlers.go:2509`) requires
+`DeleteObjectAction` at entry (`:2528`) → single `403`. `DeleteMultipleObjectsHandler`
+(`cmd/bucket-handlers.go:416`) first validates the request (including `Content‑MD5`), does
+a bucket‑level check (`:471`), then a **per‑object** authorization (`:505`); denied keys
+are reported as per‑key `<Error>` entries inside a `200` `DeleteResult` rather than a
+single top‑level `403`. This transitional/edge behavior is expanded in §6.1. Either way,
+`rouser` deletes nothing.
+
+
+### 5.6 Information‑leakage surface — what a read‑only caller can and cannot learn
+
+This is the "what metadata can be learned from listing and `HEAD` behavior without full
+reads" question. Because writers are confined to `load/*` (§4), the `ro-prefix/` views are
+**complete and untruncated** (exactly the 3 seeds) even though the bucket held ~14–30k
+objects during capture.
+
+**Baseline read within the grant (`GetObject` → `200`).** The client received the exact
+32 bytes and the ETag; the server trace masks object payloads as `<BLOB>`, but the client
+bytes are authoritative:
+
+```
+###PROBE 16 GetObject(in-grant)  principal=rouser  target=probe-bucket/ro-prefix/a.txt
+CLIENT HTTPStatus: 200
+CLIENT ETag: "5216ddcc58e8dade5256075e77f642da" ContentLength: 32
+CLIENT BodyBytes(len=32): b'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+```
+
+**`ListObjectsV2` within the grant — COMPLETE server response (no truncation).** The full
+`[RESPONSE]` body, verbatim:
+
+```
+[REQUEST s3.ListObjectsV2] 06:48:26.450474 ak=rouser client=127.0.0.1
+GET /probe-bucket?list-type=2&prefix=ro-prefix%2F&max-keys=100&encoding-type=url HTTP/1.1
+[RESPONSE] 200 dur=608.843µs bytes=1040
 <?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>probe-bucket</Name><Prefix>ro-prefix/</Prefix><NextContinuationToken>cm8tcHJlZml4L3cxMF8xODI3XzQ2Mi5iaW5bbWluaW9fY2FjaGU6djIscmV0dXJuOl0=</NextContinuationToken><KeyCount>1000</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
-<Contents><Key>ro-prefix/a.txt</Key><LastModified>2026-07-08T05:17:41.235Z</LastModified><ETag>&#34;ceb0af67cd0aa67b448930821fb4d13d&#34;</ETag><Size>32</Size><StorageClass>STANDARD</StorageClass></Contents>
-<Contents><Key>ro-prefix/b.txt</Key><LastModified>2026-07-08T05:17:41.239Z</LastModified><ETag>&#34;5ed7a3c27adbc08f643f9d7980b36722&#34;</ETag><Size>34</Size><StorageClass>STANDARD</StorageClass></Contents>
-<Contents><Key>ro-prefix/sub/c.txt</Key><LastModified>2026-07-08T05:17:41.242Z</LastModified><ETag>&#34;3838836a58b105b1a9f62c72d7e2b71f&#34;</ETag><Size>35</Size><StorageClass>STANDARD</StorageClass></Contents>
-... (997 more <Contents> entries, all writer-churn keys ro-prefix/w*, each exposing Key/LastModified/ETag/Size/StorageClass) ...
-</ListBucketResult>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>probe-bucket</Name><Prefix>ro-prefix/</Prefix><KeyCount>3</KeyCount><MaxKeys>100</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>ro-prefix/a.txt</Key><LastModified>2026-07-08T06:37:51.773Z</LastModified><ETag>&#34;5216ddcc58e8dade5256075e77f642da&#34;</ETag><Size>32</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>ro-prefix/b.txt</Key><LastModified>2026-07-08T06:37:51.775Z</LastModified><ETag>&#34;cc9b8aab6a7164192c280d67647f60e9&#34;</ETag><Size>34</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>ro-prefix/sub/c.txt</Key><LastModified>2026-07-08T06:37:51.778Z</LastModified><ETag>&#34;6c870fac6991ca112725627766424949&#34;</ETag><Size>35</Size><StorageClass>STANDARD</StorageClass></Contents><EncodingType>url</EncodingType></ListBucketResult>
 ```
 
-**Leaked metadata (by design for a list‑capable read‑only principal):** for every key **under the granted prefix**, `rouser` learns the **key name, last‑modified time, ETag, size, and storage class**. This is exactly the metadata `s3:ListBucket` is defined to expose; it is not object content and not anything outside the prefix.
-
-**6.5.2 ListObjectsV2 — outside the granted prefix (DENIED, `403`)** — the `s3:prefix` condition fails, so listing `other-prefix/` is denied:
-
-```
-[REQUEST s3.ListObjectsV2] 05:21:57.160760 ak=rouser client=127.0.0.1
-GET /probe-bucket?list-type=2&prefix=other-prefix%2F&encoding-type=url HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 403 dur=151.329µs bytes=434
-<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C038FE447F4956</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
-
-**6.5.3 ListObjectsV2 — no prefix (DENIED, `403`)** — an unqualified bucket list also fails the prefix condition:
+`ListObjectsV1` and `ListObjectVersions` within the grant return the same three keys
+(client‑parsed, complete):
 
 ```
-[REQUEST s3.ListObjectsV2] 05:21:57.162342 ak=rouser client=127.0.0.1
-GET /probe-bucket?list-type=2&encoding-type=url HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 403 dur=146.794µs bytes=434
-<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C038FE44976E70</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+###PROBE 19 ListObjectsV1(in-grant)      HTTPStatus: 200  IsTruncated: False
+  KEY ro-prefix/a.txt        Size=32 ETag="5216ddcc58e8dade5256075e77f642da"
+  KEY ro-prefix/b.txt        Size=34 ETag="cc9b8aab6a7164192c280d67647f60e9"
+  KEY ro-prefix/sub/c.txt    Size=35 ETag="6c870fac6991ca112725627766424949"
+###PROBE 22 ListObjectVersions(in-grant) HTTPStatus: 200  IsTruncated: False
+  VER ro-prefix/a.txt        Size=32 ETag="5216ddcc58e8dade5256075e77f642da" VersionId=null IsLatest=True
+  VER ro-prefix/b.txt        Size=34 ETag="cc9b8aab6a7164192c280d67647f60e9" VersionId=null IsLatest=True
+  VER ro-prefix/sub/c.txt    Size=35 ETag="6c870fac6991ca112725627766424949" VersionId=null IsLatest=True
 ```
 
-**6.5.4 ListObjectsV1 — inside prefix (ALLOWED, `200`)** — required `ListBucketAction`; `ListObjectsV1Handler` `cmd/bucket-listobjects-handlers.go:273`, check at `:287`. Same prefix‑gated behavior as V2; the V1 form additionally includes an `<Owner>` block per entry:
+**`HeadObject` within the grant — the precise metadata that leaks (`200`, full headers).**
+Captured via `curl -I` (raw wire headers) and corroborated by boto3:
 
 ```
-[REQUEST s3.ListObjectsV1] 05:21:57.164166 ak=rouser client=127.0.0.1
-GET /probe-bucket?prefix=ro-prefix%2F&encoding-type=url HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 200 dur=50.636607ms bytes=340294
-<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>probe-bucket</Name><Prefix>ro-prefix/</Prefix><Marker></Marker><NextMarker>ro-prefix/w10_1826_4250.bin</NextMarker><MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
-<Contents><Key>ro-prefix/a.txt</Key><LastModified>2026-07-08T05:17:41.235Z</LastModified><ETag>&#34;ceb0af67cd0aa67b448930821fb4d13d&#34;</ETag><Size>32</Size><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Contents>
-... (seeds b.txt, sub/c.txt then writer-churn keys, each with Key/LastModified/ETag/Size/Owner/StorageClass) ...
-</ListBucketResult>
+$ curl -I --aws-sigv4 "aws:amz:us-east-1:s3" --user "rouser:..." \
+    "http://127.0.0.1:9000/probe-bucket/ro-prefix/a.txt"
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 32
+Content-Type: text/plain
+ETag: "5216ddcc58e8dade5256075e77f642da"
+Last-Modified: Wed, 08 Jul 2026 06:37:51 GMT
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C03DB68BD5D2B9
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 1140294
+X-Ratelimit-Remaining: 1140282
+X-Xss-Protection: 1; mode=block
+Date: Wed, 08 Jul 2026 06:48:26 GMT
 ```
 
-**6.5.5 ListObjectVersions — inside prefix (ALLOWED, `200`)** — required `ListBucketVersionsAction`; `ListObjectVersionsHandler` `cmd/bucket-listobjects-handlers.go:62`, check at `:87`. On this non‑versioned bucket each entry reports `VersionId=null`, `IsLatest=true`:
+So within its prefix a read‑only caller learns **existence, size (32), ETag, content‑type,
+last‑modified**, and (for a locked object) the presence of retention/legal‑hold headers.
+This is exactly the read surface the grant intends.
+
+**The boundary of the leakage surface — denied outside the grant and for `GetObjectAttributes`:**
 
 ```
-[REQUEST s3.ListObjectVersions] 05:21:57.297965 ak=rouser client=127.0.0.1
-GET /probe-bucket?versions&prefix=ro-prefix%2F&encoding-type=url HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 200 dur=31.763601ms bytes=390388
-<?xml version="1.0" encoding="UTF-8"?>
-<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>probe-bucket</Name><Prefix>ro-prefix/</Prefix><MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
-<Version><Key>ro-prefix/a.txt</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>2026-07-08T05:17:41.235Z</LastModified><ETag>&#34;ceb0af67cd0aa67b448930821fb4d13d&#34;</ETag><Size>32</Size><StorageClass>STANDARD</StorageClass><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>minio</DisplayName></Owner></Version>
-... (seeds then writer-churn keys) ...
-</ListVersionsResult>
+###PROBE 17 GetObject(out-of-grant)      target=other-prefix/x.txt   HTTPStatus: 403  Code: AccessDenied  (RequestId 18C03DB67E221C5C)
+###PROBE 20 ListObjectsV2(out-of-grant)  prefix=other-prefix/        HTTPStatus: 403  Code: AccessDenied
+###PROBE 21 ListObjectsV2(no-prefix)     (no prefix)                 HTTPStatus: 403  Code: AccessDenied
+###PROBE 24 HeadObject(out-of-grant)     target=other-prefix/x.txt   HTTPStatus: 403  (bodyless: "Forbidden")
+###PROBE 25 HeadBucket                   probe-bucket                HTTPStatus: 403  (bodyless: "Forbidden")
+###PROBE 26 GetObjectAttributes          target=ro-prefix/a.txt      HTTPStatus: 403  Code: AccessDenied
 ```
 
-> Note: `ListObjectVersions` succeeded here because MinIO gates it with `ListBucketVersionsAction`, and the request satisfies the prefix‑`StringLike` condition attached to the `ListBucket`‑family grant. This is the *intended* list surface within the granted prefix; nothing outside `ro-prefix/` is listable (as shown in 6.5.2/6.5.3).
-
-**6.5.6 HeadObject — inside prefix (ALLOWED, `200`)** — required `GetObjectAction`; `headObjectHandler` `cmd/object-handlers.go:744`, auth `authenticateRequest(..., policy.GetObjectAction)` at `:760`. `HEAD` returns headers only (no body):
-
-```
-[REQUEST s3.HeadObject] 05:21:57.413923 ak=rouser client=127.0.0.1
-HEAD /probe-bucket/ro-prefix/a.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 200 dur=360.087µs bytes=131
-```
-
-Client‑side (boto3) confirmed the leaked headers: `ContentLength=32`, `ETag="ceb0af67cd0aa67b448930821fb4d13d"`, `LastModified=2026-07-08 05:17:41+00:00`. So within its prefix `rouser` learns **existence, size, ETag, last‑modified, and the presence/absence of retention/legal‑hold headers** — but this requires `GetObjectAction`, which it holds only for `ro-prefix/*`.
-
-**6.5.7 HeadObject — outside prefix (DENIED, `403`)** — same handler; the object `other-prefix/x.txt` is outside the granted resource so `GetObjectAction` is not allowed:
+Server traces for the two `HEAD` denials are bodyless (S3 `HEAD` returns no error body),
+and `GetObjectAttributes` is denied even *inside* the readable prefix because it is a
+**distinct action**:
 
 ```
-[REQUEST s3.HeadObject] 05:21:57.417471 ak=rouser client=127.0.0.1
-HEAD /probe-bucket/other-prefix/x.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 403 dur=254.888µs bytes=131
-```
-
-**6.5.8 HeadBucket (DENIED, `403`)** — required `ListBucketAction`; `HeadBucketHandler` `cmd/bucket-handlers.go:1644`, auth at `:1658`. Because `rouser`'s `ListBucket` grant is **conditioned on `s3:prefix`**, an unconditioned `HeadBucket` does not satisfy it:
-
-```
-[REQUEST s3.HeadBucket] 05:21:57.419265 ak=rouser client=127.0.0.1
-HEAD /probe-bucket HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 403 dur=118.835µs bytes=131
-```
-
-**6.5.9 GetObjectAttributes — inside prefix (DENIED, `403`)** — required `GetObjectAttributesAction`; `getObjectAttributesHandler` `cmd/object-handlers.go:580`, which checks `GetObjectAttributesAction` **first** at `:593` (falling through to `GetObjectAction` at `:595` only if that passes). `rouser` holds `GetObjectAction` but **not** `GetObjectAttributesAction`, so it is denied **even for an in‑prefix object**:
-
-```
-[REQUEST s3.GetObjectAttributes] 05:21:57.421057 ak=rouser client=127.0.0.1
+[REQUEST s3.HeadObject] ak=rouser   HEAD /probe-bucket/other-prefix/x.txt   [RESPONSE] 403 bytes=131
+[REQUEST s3.HeadBucket] ak=rouser   HEAD /probe-bucket                      [RESPONSE] 403 bytes=131
+[REQUEST s3.GetObjectAttributes] ak=rouser
 GET /probe-bucket/ro-prefix/a.txt?attributes HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rouser)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
 X-Amz-Object-Attributes: ETag,ObjectSize
-[RESPONSE] 403 dur=119.844µs bytes=500
+[RESPONSE] 403 dur=113.358µs bytes=500
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C038FE54031607</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C03DB67F3C2DBD</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-**Leakage summary:** `rouser`'s learnable surface is precisely bounded — it can list and `HEAD` (and `GET`) **only within `ro-prefix/`**, exposing key/size/ETag/last‑modified/storage‑class there; it learns **nothing** about `other-prefix/`, cannot `HeadBucket`, and cannot even read object attributes (a distinct action) inside its own prefix. This is the intended, minimal metadata surface — not an over‑exposure.
+*(Byte‑accuracy note: the `ServiceTrace` `RespInfo.Body` for the out‑of‑grant `GetObject`
+error printed the error document twice in the trace log, while the `[RESPONSE]` byte
+counter reads `bytes=502` and both boto3 and `curl` received a **single** document. This
+is a `GetObject`‑specific trace‑capture artifact; the on‑wire response is one
+`AccessDenied` document.)*
 
-### 6.6 Built‑in `readonly` (`rocanned`) — the `ListBucket` gap, empirically
+**Interpretation.** `headObjectHandler` requires `GetObjectAction`
+(`cmd/object-handlers.go:744`), so `HeadObject` succeeds inside the grant and is denied
+outside it. `ListObjectsV2/V1` require `ListBucketAction`
+(`cmd/bucket-listobjects-handlers.go:154`/`:273`); `rouser`'s `ListBucket` is **conditioned**
+on `s3:prefix` matching `ro-prefix/*`, so a matching‑prefix list is allowed while a
+non‑matching prefix and a **no‑prefix** list fail the condition → `403`. `HeadBucketHandler`
+requires `ListBucketAction` with no prefix in context (`cmd/bucket-handlers.go:1644`), so it
+too fails the prefix condition → `403`. `getObjectAttributesHandler` requires the distinct
+`GetObjectAttributesAction` (`cmd/object-handlers.go:580`), which `rouser` lacks — hence
+`403` even though `GetObject` on the same key is allowed. The leakage surface is therefore
+exactly bounded by the granted prefix and the granted actions.
 
-To show the built‑in canned `readonly` gap (§3.3) is real and not just a reading of the policy JSON, `rocanned` was driven against the same operations.
 
-**6.6.1 ListObjectsV2 as `rocanned` (DENIED, `403`)** — canned `readonly` lacks `s3:ListBucket`, so even an in‑prefix list is denied:
+### 5.7 The built‑in `readonly` policy cannot list (the `rocanned` gap)
+
+To document why the reproduction uses a *custom* prefix‑scoped policy for `rouser`, the
+`rocanned` principal (built‑in `readonly`, §3.3) was driven against the same bucket.
+`GetObject` succeeds (`readonly` grants it on `*`), but `ListObjectsV2` is **denied `403`**
+because `readonly` does not include `ListBucket`:
 
 ```
-[REQUEST s3.ListObjectsV2] 05:21:57.423579 ak=rocanned client=127.0.0.1
-GET /probe-bucket?list-type=2&prefix=ro-prefix%2F&encoding-type=url HTTP/1.1
+###PROBE 27 GetObject(rocanned)          principal=rocanned  target=probe-bucket/ro-prefix/a.txt
+CLIENT HTTPStatus: 200  ETag: "5216ddcc58e8dade5256075e77f642da"  BodyBytes(len=32): b'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+
+[REQUEST s3.ListObjectsV2] 06:48:26.471954 ak=rocanned client=127.0.0.1
+GET /probe-bucket?list-type=2&prefix=ro-prefix%2F&max-keys=100&encoding-type=url HTTP/1.1
 Authorization: <SigV4 present; redacted> (principal=rocanned)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 403 dur=203.826µs bytes=434
+[RESPONSE] 403 dur=90.343µs bytes=434
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C038FE542990A4</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C03DB67F8C2BD7</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
+Client side (boto3): `###PROBE 28 ListObjectsV2(rocanned-gap)  HTTPStatus: 403  Code: AccessDenied`.
 
-**6.6.2 GetObject as `rocanned` (ALLOWED, `200`)** — canned `readonly` **does** grant `s3:GetObject` on `*`, so `rocanned` can read the object content directly (even though it cannot list):
+**Interpretation.** This matches the built‑in policy definition read back from the server
+in §3.3 and the source at `github.com/minio/pkg/v3@v3.0.22/policy/constants.go:53‑63`:
+built‑in `readonly` = `GetBucketLocation` + `GetObject` only. A caller on canned `readonly`
+can therefore read a known key but cannot enumerate the bucket — which is why "read‑only on
+a bucket **and prefix**" (implying prefix listing) is modeled with the custom
+prefix‑scoped policy in §3.2, and is expanded as a nuance in §6.4.
 
-```
-[REQUEST s3.GetObject] 05:21:57.426857 ak=rocanned client=127.0.0.1
-GET /probe-bucket/ro-prefix/a.txt HTTP/1.1
-Authorization: <SigV4 present; redacted> (principal=rocanned)
-X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-X-Amz-Date: 20260708T052157Z
-[RESPONSE] 200 dur=430.58µs bytes=163
-```
-
-Client‑side the body was 32 bytes with `ETag "ceb0af67cd0aa67b448930821fb4d13d"` — matching the seed exactly. **This is the concrete manifestation of the gap:** the built‑in `readonly` is a *get‑by‑known‑key* policy, not a *browse* policy; the faithful "bucket AND prefix" read‑only model requires the custom prefix‑scoped `ListBucket` grant of §3.2.
 
 ---
 
-## 7. Critical behavioral nuances (correct‑by‑design, not bypasses)
+## 6. Critical behavioral nuances (correct‑by‑design, not bypasses)
 
-### 7.1 Multi‑object delete returns HTTP `200` with per‑key `AccessDenied`
+These are the "corners" the question worried about. Each is a real behavioral subtlety,
+each is grounded in source, and none is a bypass of the read‑only boundary.
 
-`DeleteMultipleObjectsHandler` (`cmd/bucket-handlers.go:416`) performs a **bucket‑level** `checkRequestAuthType(policy.DeleteObjectAction, bucket, "")` at `:471` (whose error is deliberately ignored — the comment notes it only populates `ReqInfo.AccessKey`), then a **per‑object** `checkRequestAuthTypeWithVID(policy.DeleteObjectAction, bucket, object.ObjectName, object.VersionID)` inside the loop at `:505`. On `AccessDenied` the handler does **not** abort the whole request — only `ErrSignatureDoesNotMatch`/`ErrInvalidAccessKeyID` abort top‑level (`:506`–`:509`); an `AccessDenied` populates a per‑key `DeleteError{Code,Message,Key,VersionID}` and `continue`s (`:510`–`:517`). **Result: a read‑only caller receives HTTP `200 OK` with a `<DeleteResult>` containing per‑key `<Error><Code>AccessDenied</Code></Error>` entries — not a single top‑level `403`.** The raw `200`/per‑key body is in §6.4.2, and the authorized re‑list proved nothing was deleted. This is an S3‑API‑compatible shape (AWS behaves the same way), and it is **not** a bypass: no key was removed.
+### 6.1 Multi‑object delete returns `200` with per‑key `AccessDenied` (not a top‑level `403`)
 
-### 7.2 PutObjectRetention: the bucket‑lock gate (and Content‑MD5 gate) precede IAM
+Shown empirically in §5.5. `DeleteMultipleObjectsHandler` (`cmd/bucket-handlers.go:416`)
+performs a bucket‑level check (`:471`) and then a **per‑object** authorization (`:505`).
+When the caller lacks `DeleteObjectAction`, each key is reported as
+`<Error><Code>AccessDenied</Code></Error>` inside a `200` `DeleteResult`, and **no object
+is deleted** — confirmed by the post‑probe `StatObject` on `ro-prefix/a.txt` and
+`ro-prefix/b.txt` (both still present, §5.5). A caller who only reads the top‑level HTTP
+status would see `200`, but the per‑key errors and the intact storage prove no deletion
+occurred. This is the S3‑compatible multi‑delete contract, not a boundary hole.
 
-Two independent gates run **before** the retention IAM check inside `PutObjectRetentionHandler` (`cmd/object-handlers.go:2855`):
+### 6.2 Retention: a two‑gate handler, and the empty‑header skip (demonstrated empirically)
 
-1. **Content‑MD5 presence** (`hasContentMD5`) — a retention request without `Content-MD5` is rejected early (this is why the SDK probe that omitted it produced a `400 MissingContentMD5`, which was then driven correctly via `curl` with an explicit `Content-MD5`).
-2. **Bucket object‑lock configuration** — `if ... !rcfg.LockEnabled { return ErrInvalidBucketObjectLockConfiguration }` at `cmd/object-handlers.go:2890`, mapped to `400 InvalidRequest` "Bucket is missing ObjectLockConfiguration" (`cmd/api-errors.go:919`).
+There are two distinct retention paths, and it is important not to conflate them:
 
-Only after both gates does execution reach `enforceRetentionBypassForPut` → `isPutRetentionAllowed` (`cmd/auth-handler.go:704`) → `IsAllowed(PutObjectRetentionAction)` (`:728`), whose deny becomes `403 AccessDenied` (`errAuthentication` → `ErrAccessDenied`, `cmd/api-errors.go:2176`).
+**(a) `PutObjectRetentionHandler` (the explicit retention API).** As shown in §5.4, this
+handler validates the signature, reads bucket info, and requires `Content‑MD5`
+(`cmd/object-handlers.go:2874‑2890`) *before* the retention IAM permission. A client that
+omits `Content‑MD5` gets `400 MissingContentMD5` (pre‑IAM); a client that supplies it
+reaches `IsAllowed(PutObjectRetentionAction)` and, for `rouser`, gets `403 AccessDenied`.
+Either way, no retention is applied.
 
-**Consequence, proven in §6.3.3:** on `probe-bucket` (no lock) the retention probe returns `400 InvalidRequest` (`187µs`), because the lock‑config gate fires first; on `lock-bucket` (lock enabled) the identical call returns a genuine `403 AccessDenied` (`25.2ms`, deeper path). The timing difference is itself evidence of *where* each denial occurs.
+**(b) The `PutObject` retention *sub‑check* and its empty‑header skip.** A normal
+`PutObject` can carry object‑lock headers. Its authorization therefore includes a
+retention sub‑check that **short‑circuits when no lock headers are present**. The relevant
+early return is in `isPutActionAllowed` at `cmd/auth-handler.go:772‑775`, reached from the
+`PutObjectHandler` retention sub‑check (`cmd/object-handlers.go:1977`); whether lock
+headers are "requested" is decided by `IsObjectLockRetentionRequested`
+(`internal/bucket/object/lock/lock.go:387`), which is true iff `X-Amz-Object-Lock-Mode` or
+`X-Amz-Object-Lock-Retain-Until-Date` is present.
 
-There is a related early‑return worth noting for completeness. In `isPutActionAllowed` (`cmd/auth-handler.go:749`), a `PutObjectRetentionAction` request with **both** lock headers empty returns `ErrNone` early (`:769`–`:775`):
+**Empirical demonstration with `rwnoret`** (has `PutObject`, lacks
+`PutObjectRetentionAction`). Two `PutObject`s to `lock-bucket` that differ **only** by the
+object‑lock headers flip the outcome — this is the skip path as cause→effect:
 
-```go
-if action == policy.PutObjectRetentionAction &&
-    r.Header.Get(xhttp.AmzObjectLockMode) == "" &&
-    r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" {
-    return ErrNone
-}
+```
+# (1) headerless PUT -> retention sub-check short-circuits (no lock headers) -> PutObjectAction granted -> 200 CREATED
+[REQUEST s3.PutObject] 06:48:26.562538 ak=rwnoret client=127.0.0.1
+PUT /lock-bucket/lock-prefix/noret-headerless.txt HTTP/1.1
+Content-Type: text/plain
+X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+X-Amz-Decoded-Content-Length: 20
+[RESPONSE] 200 dur=82.729175ms bytes=312
+
+# (2) identical PUT + object-lock headers -> retention sub-check now enforces PutObjectRetentionAction -> 403 (rwnoret lacks it)
+[REQUEST s3.PutObject] 06:48:26.645765 ak=rwnoret client=127.0.0.1
+PUT /lock-bucket/lock-prefix/noret-withhdr.txt HTTP/1.1
+Content-Md5: /qydd7sIS4Aj1d2HCLVAOA==
+Content-Type: text/plain
+X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+X-Amz-Decoded-Content-Length: 20
+X-Amz-Object-Lock-Mode: GOVERNANCE
+X-Amz-Object-Lock-Retain-Until-Date: 2026-07-10T06:48:26Z
+[RESPONSE] 403 dur=228.909µs bytes=561
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>lock-prefix/noret-withhdr.txt</Key><BucketName>lock-bucket</BucketName><Resource>/lock-bucket/lock-prefix/noret-withhdr.txt</Resource><RequestId>18C03DB689E84EDF</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-This is why the §6.3.3 probes deliberately sent a real `GOVERNANCE` mode **and** a retain‑until date — to exercise the genuine `PutObjectRetentionAction` authorization rather than the header‑less short‑circuit. (Even when this early‑return is hit, no retention is applied without passing the handler's own gates; it does not constitute a write bypass.)
+Client + storage proof (harness output):
 
-### 7.3 PutObjectAcl re‑purposes `PutBucketPolicyAction`
+```
+PUTNORET headerless:  OK    etag=6de75cb07c00dc4a6208166f42891a80 size=20
+PUTNORET withheaders: ERROR code=AccessDenied status=403
+PROOF lock-prefix/noret-headerless.txt PRESENT size=20 etag=6de75cb07c00dc4a6208166f42891a80
+PROOF lock-prefix/noret-withhdr.txt    ABSENT (NoSuchKey)
+```
 
-`PutObjectACLHandler` (`cmd/acl-handlers.go:172`) authorizes with `policy.PutBucketPolicyAction` — the source comment at `:192` states it is "simply re‑purposing the bucketPolicyAction" — checked at `:193`, **not** a put‑object action. MinIO supports only **canned** ACLs. A read‑only principal holds neither `PutBucketPolicyAction` nor any ACL‑write capability, so the call is denied `403` (§6.3.5). The takeaway: even this unusual action mapping does not open a write path for `rouser`.
+**Why this is not a bypass.** The skip only decides whether the *extra*
+`PutObjectRetentionAction` is demanded on top of the base `PutObjectAction`. The base
+`PutObjectAction` is still required for any `PutObject`. A read‑only principal lacks even
+`PutObjectAction`, so its `PutObject` is denied regardless of headers — the skip can never
+help it write. `rwnoret` (which *does* have `PutObjectAction`) can create an object only
+when it does **not** assert a lock; the moment it asserts a lock it needs the retention
+permission and is denied. The boundary is intact in both cases.
 
-### 7.4 Built‑in `readonly` has no `ListBucket` (get‑by‑key, not browse)
+### 6.3 `PutObjectAcl` maps to `PutBucketPolicyAction`, and only canned ACLs exist
 
-Covered in §3.3 (quoted JSON) and proven in §6.6 (`rocanned` → `403` on list, `200` on get). The built‑in canned `readonly` grants only `s3:GetBucketLocation` + `s3:GetObject`; it is a *get‑by‑known‑key* policy. This is a modeling nuance, not a boundary weakness — it is *more* restrictive on listing, not less.
+`PutObjectACLHandler` (`cmd/acl-handlers.go:172`) authorizes with
+**`PutBucketPolicyAction`** — not a put‑object action — and MinIO supports only canned
+ACLs. `rouser` lacks `PutBucketPolicyAction`, so its `PutObjectAcl` is denied `403` (§5.4).
+This is a MinIO‑specific action mapping worth calling out, but it changes nothing about the
+result: a read‑only principal cannot alter an object ACL.
 
-### 7.5 WORM / object‑lock enforcement is independent of the IAM action check
+### 6.4 Built‑in `readonly` grants no `ListBucket`
 
-Object‑lock/WORM enforcement lives in `cmd/bucket-object-lock.go` — `enforceRetentionForDeletion` (`:54`), `enforceRetentionBypassForDelete` (`:84`), `enforceRetentionBypassForPut` (`:167`), `checkPutObjectLockAllowed` (`:245`) — and runs **independently** of the IAM action check. In this investigation every denial `rouser` received came from **IAM** (the `IsAllowed` funnel of §5), not from object‑lock; the lock subsystem is noted here only so the reader understands the two are separate mechanisms. **(This separation is inferred from reading `cmd/bucket-object-lock.go` in conjunction with the observed IAM denials; the probes did not need WORM to deny `rouser`.)**
+Demonstrated in §5.7 and confirmed against the server's own policy read‑back (§3.3) and the
+source (`github.com/minio/pkg/v3@v3.0.22/policy/constants.go:53‑63`). The practical
+consequence: if an operator intends "read‑only **and can list a prefix**", the built‑in
+`readonly` is insufficient (it denies `ListObjectsV2` with `403`), and a custom
+prefix‑scoped policy like `rouser`'s (§3.2) is required. This is a configuration nuance, not
+a boundary weakness — canned `readonly` is *more* restrictive than the custom policy, not
+less.
 
-### 7.6 Leakage boundary precision
 
-Covered empirically in §6.5: `HeadObject`/`GetObject`/list succeed **only within `ro-prefix/`** (because `GetObjectAction`/prefix‑gated `ListBucket` are granted there), and are `403` for `other-prefix/`, for `HeadBucket`, and for `GetObjectAttributes` (a distinct, ungranted action). The learnable metadata is exactly key/size/ETag/last‑modified/storage‑class within the prefix — the intended minimal surface.
+### 6.5 Object‑lock/WORM enforcement is independent of the IAM action check (inferred from source)
+
+MinIO enforces object‑lock/WORM constraints in `cmd/bucket-object-lock.go`
+(`enforceRetentionBypassForPut:167`, `checkPutObjectLockAllowed:245`) independently of the
+IAM action check. For a read‑only principal this layer is never reached, because the IAM
+check denies first (§5.4, §6.2). **This independence is inferred from reading the source,
+not separately exercised at runtime** for `rouser`, precisely because `rouser` is stopped
+at the IAM layer before any lock evaluation. It is noted for completeness and clearly
+labeled as inferred.
+
+### 6.6 The leakage boundary, restated
+
+From §5.6: within the granted prefix a read‑only caller can learn object **existence,
+size, ETag, content‑type, last‑modified**, and the presence of lock headers via
+`GetObject`/`HeadObject`/`List*`. Outside the granted prefix, for a no‑prefix bucket list,
+for `HeadBucket`, and for the distinct `GetObjectAttributes` action, it is denied `403`.
+The leakage is exactly bounded by the prefix condition and the granted actions — there is
+no metadata disclosure beyond what the policy authorizes.
+
+### 6.7 Handler‑specific pre‑IAM validation and object‑info reads (why the thesis is stated narrowly)
+
+The result must be stated precisely: for a read‑only principal, **denied write‑adjacent
+operations are denied before any mutation and leave no storage side effect** (proven
+throughout §5). It would be *inaccurate* to claim every request is authorized "before the
+object layer is touched at all," because two handlers do work before the permission
+decision:
+
+- **`DeleteObjectTaggingHandler` reads object info before its IAM check (inferred from
+  source).** It calls `getOpts` and then `objAPI.GetObjectInfo` (`cmd/object-handlers.go:3259`)
+  *before* `checkRequestAuthType(DeleteObjectTaggingAction)` (`:3301`). That is an
+  object‑layer **read**, ahead of the permission check — but the tag **deletion** (the
+  mutation) only happens after the check, which denies `rouser`. The observed result is a
+  clean `403` with tags unchanged (§5.4); the internal ordering is inferred from the source,
+  as the trace does not expose intra‑handler steps.
+- **`PutObjectRetentionHandler` validates before the permission check (observed).** It runs
+  signature validation, a bucket‑info read, a `Content‑MD5` requirement, and a
+  `LockEnabled` gate (`cmd/object-handlers.go:2874‑2890`) *before* the retention IAM
+  permission. This ordering is **directly observed**: omitting `Content‑MD5` yields
+  `400 MissingContentMD5` (§5.4) — a rejection that can only occur *before* the IAM check.
+  Likewise `DeleteMultipleObjectsHandler` validates `Content‑MD5` before per‑object authz
+  (§5.5).
+
+None of these pre‑IAM steps is a mutation. In every case the write is denied before any
+data or metadata is changed, and the storage proofs in §5 confirm no side effect. This is
+why the verdict (§1, §8.1) is phrased as "denied before any mutation / no storage side
+effect" rather than the stronger, and here inaccurate, "before the object layer is touched."
+
 
 ---
 
-## 8. Stability across ≥2 runs
+## 7. Stability across ≥2 runs
 
-The **entire** probe matrix was replayed across **two independent full runs**, each under live concurrent write load, to confirm the result is not an artifact of a single short run.
-
-- **Run 1** executed under the initial writer fleet (12 threads).
-- **Run 2** executed under a freshly relaunched writer fleet (12 threads) while `probe-bucket` held **118,840 live objects**, i.e. a substantially busier bucket.
-
-A **programmatic diff** of the two runs' structured outcomes (HTTP status + error code per probe) was computed:
-
-- boto3 matrix (28 probes): **run1 == run2, 0 differences**.
-- curl `--aws-sigv4` fixed/cross‑check set (5 probes: DeleteObjects, retention‑probe, retention‑lock, DeleteObject, CopyObject): **run1b == run2b, 0 differences**.
-- Merged authoritative set (28 probes, with the curl‑obtained values authoritative for the three Content‑MD5‑gated probes): **run1 == run2, 0 differences**.
-
-**Observed distribution: 2/2 runs identical.** The full stable outcome set:
+The entire probe matrix (multipart, copy, metadata, deletes, listing/`HEAD`/attributes,
+the `rocanned` gap, and the `rwnoret` retention‑skip pair) was executed **twice**, each
+time under a fresh 90‑second, 12‑thread writer load. The two runs saw **different**
+concurrent load volumes, confirming the outcome is not an artifact of a specific load:
 
 ```
-AbortMultipartUpload            403 AccessDenied        ListObjectsV2_inprefix          200 (allowed)
-CompleteMultipartUpload         403 AccessDenied        ListObjectsV1_inprefix          200 (allowed)
-CopyObject                      403 AccessDenied        ListObjectVersions              200 (allowed)
-CreateMultipartUpload           403 AccessDenied        ListObjectsV2_outprefix         403 AccessDenied
-UploadPart                      403 AccessDenied        ListObjectsV2_noprefix          403 AccessDenied
-UploadPartCopy                  403 AccessDenied        HeadObject_in                   200 (allowed)
-ListParts                       403 AccessDenied        HeadObject_out                  403
-ListMultipartUploads            403 AccessDenied        HeadBucket                      403
-PutObjectTagging                403 AccessDenied        GetObjectAttributes             403 AccessDenied
-DeleteObjectTagging             403 AccessDenied        ListObjectsV2_rocanned          403 AccessDenied
-PutObjectLegalHold              403 AccessDenied        GetObject_rocanned              200 (allowed)
-PutObjectAcl                    403 AccessDenied        DeleteObject                    403 AccessDenied
-PutObjectRetention_probebucket  400 InvalidRequest      DeleteObjects                   200 per-key:AccessDenied
-PutObjectRetention_lockbucket   403 AccessDenied
+run1 writers: puts=9521 mpu_complete=2769 mpu_abort=1152 tagged=3893 put_del=3949
+     probe-bucket count: 14471 (during probes) -> 30099 (after load window)
+run2 writers: puts=8128 mpu_complete=2258 mpu_abort=1006 tagged=3343 put_del=3316
+     probe-bucket count: 30872 (during probes) -> 43828 (after load window)
 ```
 
-**Storage side‑effect proof after run 2 (root‑authorized HEAD/list):** all four probe‑bucket/lock‑bucket seed objects were byte‑stable — `ro-prefix/a.txt` size 32 / ETag `ceb0af67cd0aa67b448930821fb4d13d`, `ro-prefix/b.txt` size 34 / ETag `5ed7a3c27adbc08f643f9d7980b36722`, `other-prefix/x.txt` size 33 / ETag `f26a4590daae83e03c2c69c5a4cfac46`, `lock-prefix/obj.txt` size 34 / ETag `b7c03ca910cfacea64f17e7f3c226a6e`. All three `rouser`‑attempted write artifacts (`ro-prefix/rouser-copy.txt`, `ro-prefix/rouser-copy-curl.txt`, `ro-prefix/rouser-created.bin`) were confirmed **ABSENT** — the denied writes left **no** storage side effect in either run.
+**The read‑only outcomes were identical across both runs.** A normalized diff of the two
+probe transcripts (dropping only volatile request IDs, timestamps, and the writer‑owned
+upload ID) is empty:
 
-**Conclusion:** 28/28 probe outcomes were identical run‑to‑run; there was **no** run‑to‑run variation. Concurrency (up to ~119k live objects churning under 12 writer threads) did not manufacture any bypass window.
+```
+$ diff -u norm.run1.txt norm.run2.txt && echo IDENTICAL
+IDENTICAL
+```
+
+Every probe returned the same status in both runs (all `403` for write‑adjacent ops, the
+two pre‑IAM `400 MissingContentMD5` gates, `200` for the in‑grant reads/lists, `403` for
+out‑of‑grant/attributes/`HeadBucket`). The `rwnoret` retention‑skip pair
+(`headerless → 200`, `withheaders → 403`) and the `curl` cross‑checks
+(`DELETE 403`, `HEAD 200`, `retention 403`, `multi‑delete 200`) were identical in both runs.
+
+**Storage was byte‑stable across both runs.** The five seed objects reported identical
+size, ETag, **and last‑modified** in both runs' authorized re‑checks — i.e. they were
+never rewritten:
+
+```
+run1/run2 STAT (identical):
+  ro-prefix/a.txt      size=32 etag=5216ddcc58e8dade5256075e77f642da lastmod=2026-07-08T06:37:51Z
+  ro-prefix/b.txt      size=34 etag=cc9b8aab6a7164192c280d67647f60e9 lastmod=2026-07-08T06:37:51Z
+  ro-prefix/sub/c.txt  size=35 etag=6c870fac6991ca112725627766424949 lastmod=2026-07-08T06:37:51Z
+  other-prefix/x.txt   size=33 etag=d45e1549301eb727bde58d14554ce087 lastmod=2026-07-08T06:37:51Z
+  lock-prefix/obj.txt  size=34 etag=9dc2339c3556f6b3882ca300b94bd754 lastmod=2026-07-08T06:37:51Z
+```
+
+The filesystem snapshot of `ro-prefix/` (object directories and `xl.meta` hashes) was
+`SNAPSHOT_IDENTICAL` before vs. after in **both** runs. The result is stable, not a
+one‑off.
+
 
 ---
 
-## 9. Verdict, methodology, and coverage pass
+## 8. Verdict, methodology, cleanup, and coverage pass
 
-### 9.1 Verdict (direct answer)
+### 8.1 Verdict
 
-**The read‑only IAM boundary holds under concurrent write stress.** A faithfully read‑only principal (`rouser`, custom prefix‑scoped policy) could **not** mutate data through any less‑obvious S3 surface — not multipart (create/upload/upload‑copy/complete/abort/list), not server‑side copy, not metadata changes (tagging/retention/legal‑hold/ACL), and not deletes (single or multi). Every write‑adjacent operation was denied at handler entry and left **no storage side effect**, and this was **identical across two full runs** under heavy concurrent load (§8).
+**The read‑only boundary holds. There is no bypass hiding in the corners.** Under two
+runs of heavy concurrent write load (12 threads; the bucket grew from ~14k to ~44k
+objects), a faithfully read‑only principal (`rouser`, custom prefix‑scoped policy) **could
+not mutate data through any write‑adjacent surface**: multipart, copy‑style writes,
+metadata (tagging/retention/legal‑hold/ACL), and deletes were **all denied before any
+mutation and produced no storage side effect**. The one surface that returns HTTP `200` —
+multi‑object delete — reports a **per‑key `AccessDenied`** and deletes nothing (§5.5,
+§6.1). The information a read‑only caller can learn is exactly the prefix‑scoped read
+metadata the grant authorizes (existence, size, ETag, content‑type, last‑modified, lock
+header presence), and nothing beyond it (§5.6, §6.6).
 
-**Why (causal, grounded):** the authorization decision is computed per request from the caller's own policy in `IAMSys.IsAllowed` (`cmd/iam.go:2437`) and is stateless with respect to other clients' traffic; it is invoked at handler entry via `checkRequestAuthType` (`cmd/auth-handler.go:339`) / `isPutActionAllowed` (`cmd/auth-handler.go:749`) **before** the object/erasure layer, and a denial becomes `403 AccessDenied` (`cmd/api-errors.go:539`). Because the check never consults other principals' concurrent activity, no amount of concurrent writing can widen `rouser`'s permissions — concurrency cannot create a window (§5.1).
+The causal reason (§5.1): the authorization decision `IAMSys.IsAllowed()`
+(`cmd/iam.go:2437`) is **per‑request and independent of other clients' concurrent
+traffic**, so load cannot turn a denied read‑only call into a write. The claim is stated
+narrowly and honestly: denied writes are rejected **before any mutation / with no storage
+side effect**; two handlers perform pre‑IAM validation or an object‑info read first
+(§6.7), but never a mutation. The outcome is stable across both runs (§7).
 
-**Information leakage:** the only metadata a read‑only caller learns is the *intended* surface — key name, size, ETag, last‑modified, and storage class **for objects inside the granted prefix** (via `ListObjects*` and `HeadObject`, the latter requiring `GetObjectAction`). It learns nothing outside the prefix, cannot `HeadBucket`, and cannot read `GetObjectAttributes` (a separate, ungranted action) even inside the prefix (§6.5).
+### 8.2 Methodology (run‑first, canonical, evidence‑backed)
 
-**Nuances, not bypasses:** (a) multi‑object delete returns HTTP `200` with per‑key `AccessDenied` and deletes nothing (§7.1); (b) retention on a non‑lock bucket returns `400` because the lock‑config gate precedes IAM, while on a lock bucket it returns a genuine `403` (§7.2); (c) `PutObjectAcl` is gated by a re‑purposed `PutBucketPolicyAction` and is still denied (§7.3); (d) the built‑in canned `readonly` cannot list at all (§7.4). None of these is a path to mutation.
+- **Built and ran the real server** in default configuration with the exact commands in
+  §2 (`CGO_ENABLED=0 go build -tags kqueue -trimpath -o /tmp/minio .`;
+  `/tmp/minio server /tmp/minio-data --address :9000`).
+- **Exercised only real entry points**: identities/policies via the admin API
+  (`madmin-go`); probes via signed S3 clients (`minio-go`, `boto3`) and `curl --aws-sigv4`.
+  No authorization decision was simulated and no HTTP path was bypassed.
+- **Captured full evidence per probe**: server‑side `[REQUEST]`/`[RESPONSE]` trace (admin
+  `ServiceTrace`, `Authorization` redacted), client HTTP status/body (or full header dump
+  for `HEAD`), and a storage side‑effect proof (backend snapshot + authorized root
+  re‑list/`StatObject`).
+- **Ran under concurrency and confirmed stability**: the full matrix executed twice under
+  live 12‑thread load, with identical outcomes (§7).
+- **Every named item exercised** (§8.4), with results reported exactly as observed and any
+  read‑only inference explicitly labeled (§6.5, §6.7).
 
-**No bypass "hiding in the corners" was found.** If one had been, it would be reported here with its evidence and left unpatched (findings, not fixes); none was observed.
+### 8.3 Cleanup gate (repository left unchanged except the answer document)
 
-### 9.2 Methodology and tooling
+All reproduction artifacts live **outside** the repository under `/tmp` (the built binary
+`/tmp/minio`, the data directory `/tmp/minio-data`, and the harness/scripts/logs under
+`/tmp/repro`). At the end of the session the server is stopped and every artifact is
+removed:
 
-- **Server:** built from this repo at `HEAD c07e5b49d477` with `CGO_ENABLED=0 go build -tags kqueue -trimpath -o /tmp/minio .` (Go `go1.23.2`), run canonically as `/tmp/minio server /tmp/minio-data --address :9000` with default credentials.
-- **Admin/provisioning + tracing:** `github.com/minio/madmin-go/v3` v3.0.77 (`go.mod:52`) — user/policy creation and the `ServiceTrace` `[REQUEST]`/`[RESPONSE]` feed (single subscriber, well under the server's 8‑subscriber trace limit).
-- **S3 clients:** `github.com/minio/minio-go/v7` v7.0.80 (`go.mod:53`) and `boto3` 1.43.42 for probes and the concurrent writer load; raw `curl 8.14.1 --aws-sigv4` for byte‑level cross‑checks (independent signer) and for the three Content‑MD5‑gated operations.
-- **Policy types / canned policies:** `github.com/minio/pkg/v3` v3.0.22 (`go.mod:55`).
-- **Evidence:** server‑side traces (redacted `Authorization`), client‑side HTTP status + full error XML, and direct `xl.meta` backend inspection before/after each probe plus authorized re‑lists.
-- **Security note:** captured traces contain a SigV4 `Authorization` header on every request; it is recorded only as `"<SigV4 present; redacted> (principal=<accessKey>)"`. No live secret or signature material appears in this document, and all test credentials are throwaway local values.
+```
+# stop the canonical server (launched in the background; its pid was recorded during provisioning)
+$ kill "$(cut -d= -f2 /tmp/repro/server.pid.txt)" 2>/dev/null      # pid 167648
+$ pgrep -af 'tmp/minio server' || echo '(canonical server stopped)'
+(canonical server stopped)
 
-### 9.3 Coverage pass — every named item answered with raw evidence
+# remove all out-of-repository artifacts (built binary, data dir, harness/scripts/logs)
+$ rm -rf /tmp/minio /tmp/minio-data /tmp/repro
+$ ls -d /tmp/minio /tmp/minio-data /tmp/repro 2>&1
+ls: cannot access '/tmp/minio': No such file or directory
+ls: cannot access '/tmp/minio-data': No such file or directory
+ls: cannot access '/tmp/repro': No such file or directory
+```
 
-| # | Named item | Result | Evidence |
+Because those artifacts were never inside the repository tree, the repository's working
+tree contains **only** the answer document — verified with `git status` after cleanup:
+
+```
+$ git status --porcelain
+ M blitzy/documentation/minio_c07e5b49d477.md
+```
+
+No source, configuration, dependency manifest, or test file was modified; no reproduction
+script was committed. The single repository change is this document (it already existed in
+`HEAD` from a prior revision, hence the ` M` modified status rather than untracked).
+
+### 8.4 Coverage pass — every named item answered
+
+| # | Named item (from the request/AAP) | Where | Observed result |
 |---|---|---|---|
-| Multipart 1 | CreateMultipartUpload | 403 AccessDenied; no orphan upload‑ID | §6.1.1 |
-| Multipart 2 | UploadPart | 403 AccessDenied | §6.1.2 |
-| Multipart 3 | UploadPartCopy | 403 AccessDenied | §6.1.3 / §6.2.2 |
-| Multipart 4 | CompleteMultipartUpload | 403 AccessDenied | §6.1.4 |
-| Multipart 5 | AbortMultipartUpload | 403 AccessDenied | §6.1.5 |
-| Multipart 6 | ListParts | 403 AccessDenied | §6.1.6 |
-| Multipart 7 | ListMultipartUploads | 403 AccessDenied | §6.1.7 |
-| Copy 1 | CopyObject | 403 AccessDenied; dst absent | §6.2.1 |
-| Copy 2 | UploadPartCopy | 403 AccessDenied | §6.1.3 |
-| Metadata 1 | PutObjectTagging | 403 AccessDenied; tags unchanged | §6.3.1 |
-| Metadata 2 | DeleteObjectTagging | 403 AccessDenied | §6.3.2 |
-| Metadata 3 | PutObjectRetention | 400 (non‑lock) / 403 (lock) | §6.3.3, §7.2 |
-| Metadata 4 | PutObjectLegalHold | 403 AccessDenied | §6.3.4 |
-| Metadata 5 | PutObjectAcl | 403 AccessDenied | §6.3.5, §7.3 |
-| Delete 1 | DeleteObject | 403 AccessDenied; object present | §6.4.1 |
-| Delete 2 | DeleteObjects (multi) | 200 per‑key AccessDenied; nothing deleted | §6.4.2, §7.1 |
-| Leakage 1 | ListObjectsV2 | 200 in‑prefix / 403 out / 403 no‑prefix | §6.5.1–6.5.3 |
-| Leakage 2 | ListObjectsV1 | 200 in‑prefix | §6.5.4 |
-| Leakage 3 | ListObjectVersions | 200 in‑prefix | §6.5.5 |
-| Leakage 4 | HeadObject | 200 in‑prefix / 403 out | §6.5.6–6.5.7 |
-| Leakage 5 | HeadBucket | 403 | §6.5.8 |
-| Leakage 6 | GetObjectAttributes | 403 (even in‑prefix) | §6.5.9 |
-| Bonus | Built‑in `readonly` ListBucket gap | 403 list / 200 get (rocanned) | §3.3, §6.6, §7.4 |
+| 1 | CreateMultipartUpload | §5.2 | `403 AccessDenied`; no object, no orphan upload |
+| 2 | UploadPart | §5.2 | `403 AccessDenied` (on a live rwuser upload) |
+| 3 | UploadPartCopy | §5.2 | `403 AccessDenied` |
+| 4 | CompleteMultipartUpload | §5.2 | `403 AccessDenied` |
+| 5 | AbortMultipartUpload | §5.2 | `403 AccessDenied` |
+| 6 | ListParts | §5.2 | `403 AccessDenied` |
+| 7 | ListMultipartUploads | §5.2 | `403 AccessDenied` |
+| 8 | CopyObject | §5.3 | `403 AccessDenied`; no object created |
+| 9 | PutObjectTagging | §5.4 | `403 AccessDenied`; tags stayed empty |
+| 10 | DeleteObjectTagging | §5.4 | `403 AccessDenied` (object‑info read precedes check, §6.7) |
+| 11 | PutObjectRetention | §5.4, §6.2 | `400` pre‑IAM (no `Content‑MD5`); `403` with `Content‑MD5` |
+| 12 | PutObjectLegalHold | §5.4 | `403 AccessDenied` |
+| 13 | PutObjectAcl | §5.4, §6.3 | `403 AccessDenied` (maps to `PutBucketPolicyAction`) |
+| 14 | DeleteObject | §5.5 | `403 AccessDenied`; object intact |
+| 15 | DeleteObjects (multi) | §5.5, §6.1 | `400` pre‑IAM; with `Content‑MD5` → `200` + per‑key `AccessDenied`, no deletion |
+| 16 | ListObjectsV2 | §5.6 | in‑grant `200` (complete, untruncated); out‑of‑grant/no‑prefix `403` |
+| 17 | ListObjectsV1 | §5.6 | in‑grant `200` (3 seeds) |
+| 18 | ListObjectVersions | §5.6 | in‑grant `200` (3 versions, `VersionId=null`) |
+| 19 | HeadObject | §5.6 | in‑grant `200` (full metadata headers); out‑of‑grant `403` |
+| 20 | HeadBucket | §5.6 | `403` (prefix condition not satisfied) |
+| 21 | GetObjectAttributes | §5.6 | `403` (distinct action, denied even in‑prefix) |
+| 22 | GetObject (baseline read + leakage) | §5.6 | in‑grant `200` (32 bytes, ETag); out‑of‑grant `403` |
+| 23 | Built‑in `readonly` list gap (`rocanned`) | §5.7, §6.4 | `GetObject` `200`; `ListObjectsV2` `403` |
+| 24 | Retention empty‑header skip (`rwnoret`) | §6.2 | headerless `PUT` `200` (created); with lock headers `403` (absent) |
+| 25 | Under‑concurrency / ≥2‑run stability | §4, §7 | identical outcomes across 2 runs; seeds byte‑stable |
 
-**All 7 multipart + 2 copy + 5 metadata + 2 delete + 6 leakage operations, plus the built‑in `readonly` gap, are answered with raw request/response traces, HTTP status, full error bodies, and before/after storage proofs.** The boundary holds; the only metadata exposed is the intended in‑prefix listing/HEAD surface; and the three surprising‑looking behaviors are correct‑by‑design nuances, not bypasses.
+Every mechanism, condition, and "e.g./such as" item named in the request is addressed with
+raw evidence above, leading with the direct answer and layering the nuances afterward.
 
