@@ -95,13 +95,20 @@ go version go1.23.2 linux/amd64
 $ git rev-parse --abbrev-ref HEAD
 blitzy-b8fad361-f2c2-4f2e-90a6-30ee12dd6565
 $ git rev-parse HEAD
-b956b2f4f6c683381ea7c125839cc7e412078aa4
+469e775b4da3af1e430321987f31f5c7047bcd5d
+$ git diff --name-only c07e5b49d477 HEAD
+blitzy/documentation/minio_c07e5b49d477.md
 ```
 
-The MinIO **source** under investigation is HEAD `c07e5b49d477`. The working‑tree commit
-above only *adds this answer document* under `blitzy/documentation/`; it does not modify
-any file under `cmd/` or `internal/`, so the built binary reflects the `c07e5b49d477`
-source. All `file:line` citations in this document are anchored to `c07e5b49d477`.
+The MinIO **source** under investigation is HEAD `c07e5b49d477` (the commit this branch
+was cut from). The `git rev-parse HEAD` value above is the *destination* working‑tree
+commit captured during this investigation pass — a Blitzy branch commit that advances
+as this answer document is revised and committed, and is **not** the MinIO source under
+test. The durable invariant is the `git diff --name-only c07e5b49d477 HEAD` line above:
+the only path that differs between the source commit and the working tree is *this answer
+document* — no file under `cmd/` or `internal/` (nor `go.mod`/`go.sum`) is modified, so the
+built binary reflects the `c07e5b49d477` source. All `file:line` citations in this document
+are anchored to `c07e5b49d477`.
 
 ### 2.2 Build (verbatim command)
 
@@ -846,7 +853,12 @@ is a `GetObject`‑specific trace‑capture artifact; the on‑wire response is 
 outside it. `ListObjectsV2/V1` require `ListBucketAction`
 (`cmd/bucket-listobjects-handlers.go:154`/`:273`); `rouser`'s `ListBucket` is **conditioned**
 on `s3:prefix` matching `ro-prefix/*`, so a matching‑prefix list is allowed while a
-non‑matching prefix and a **no‑prefix** list fail the condition → `403`. `HeadBucketHandler`
+non‑matching prefix and a **no‑prefix** list fail the condition → `403`. `ListObjectVersions` likewise returns `200` in‑grant even
+though the policy names only `s3:ListBucket`: `ListObjectVersionsHandler`
+(`cmd/bucket-listobjects-handlers.go:62`) authorizes `ListBucketVersionsAction` (`:87`), but
+`authorizeRequest` falls back to re‑check `ListBucketAction` for that action
+(`cmd/auth-handler.go:495`, *"s3:ListBucket permission is same as s3:ListBucketVersions"*), so
+`rouser`'s prefix‑conditioned `ListBucket` grant satisfies it. `HeadBucketHandler`
 requires `ListBucketAction` with no prefix in context (`cmd/bucket-handlers.go:1644`), so it
 too fails the prefix condition → `403`. `getObjectAttributesHandler` requires the distinct
 `GetObjectAttributesAction` (`cmd/object-handlers.go:580`), which `rouser` lacks — hence
@@ -880,6 +892,158 @@ built‑in `readonly` = `GetBucketLocation` + `GetObject` only. A caller on cann
 can therefore read a known key but cannot enumerate the bucket — which is why "read‑only on
 a bucket **and prefix**" (implying prefix listing) is modeled with the custom
 prefix‑scoped policy in §3.2, and is expanded as a nuance in §6.4.
+
+
+### 5.8 Independent bypass hunt — less‑obvious write surfaces (presigned, POST‑policy, version‑targeted delete, SELECT, restore, replication/batch)
+
+The §5.2–§5.7 matrix covered the operations the request named directly. To answer the
+"is there a bypass hiding in the corners" part head‑on, `rouser` was additionally driven
+against six *less‑obvious* surfaces that do not travel the ordinary `PutObject`/`DeleteObject`
+request line — a **presigned‑URL `PUT`**, a browser‑style **POST‑policy** upload, a
+**version‑targeted `DeleteObject`**, server‑side **`SelectObjectContent`** (S3 SELECT),
+**`RestoreObject`**, and the **replication/batch** triggers — each while the same 8‑writer
+load hammered `probe-bucket` (§4 design). The probes ran at two very different churn levels
+(**~2.1k→2.7k live objects in run 1, ~18k in run 2**, tens of thousands of writes during the
+window). Every mutation surface was **denied before any object‑layer effect, with no storage
+side effect**; the single surface that returns `200` — S3 SELECT — is a **read** gated by
+`GetObjectAction`, and it returns nothing for objects outside the grant.
+
+**Full server traces (admin `ServiceTrace`, `Authorization`/signature redacted).** The
+signing material is redacted per §4; presigned and POST‑policy requests carry their SigV4 in
+the query string / multipart form (not an `Authorization` header), which the trace reflects
+faithfully. Request lines and full `[RESPONSE]` bodies are verbatim from run 1:
+
+```
+[REQUEST s3.PutObject] 09:20:49.958861 ak=rouser client=127.0.0.1
+PUT /probe-bucket/ro-prefix/rouser-presigned.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=rouser%2F20260708%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260708T092049Z&X-Amz-Expires=600&X-Amz-SignedHeaders=host&X-Amz-Signature=<redacted>
+(SigV4 presigned in query: X-Amz-Credential=rouser/.../s3/aws4_request; X-Amz-Signature=<redacted above>)
+[RESPONSE] 403 dur=161.167µs bytes=435
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/rouser-presigned.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/rouser-presigned.txt</Resource><RequestId>18C0460761D62A55</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+
+[REQUEST s3.PostPolicyBucket] 09:20:49.959578 ak=rouser client=127.0.0.1
+POST /probe-bucket/
+(SigV4 POST-policy: X-Amz-Credential + X-Amz-Signature carried in the multipart form; principal=rouser)
+[RESPONSE] 403 dur=219.612µs bytes=2209
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/</Resource><RequestId>18C0460761E11D27</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+
+[REQUEST s3.DeleteObject] 09:20:49.960137 ak=rouser client=127.0.0.1
+DELETE /probe-bucket/ro-prefix/a.txt?versionId=null
+Authorization: <SigV4 present; redacted> (principal=rouser)
+[RESPONSE] 403 dur=147.841µs bytes=422
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C0460761E9A404</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+
+[REQUEST s3.SelectObjectContent] 09:20:49.960767 ak=rouser client=127.0.0.1
+POST /probe-bucket/ro-prefix/a.txt?select=&select-type=2
+Authorization: <SigV4 present; redacted> (principal=rouser)
+[RESPONSE] 200 dur=1.212882ms bytes=819
+<BLOB>
+
+[REQUEST s3.SelectObjectContent] 09:20:49.962320 ak=rouser client=127.0.0.1
+POST /probe-bucket/other-prefix/x.txt?select=&select-type=2
+Authorization: <SigV4 present; redacted> (principal=rouser)
+[RESPONSE] 403 dur=141.25µs bytes=440
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>other-prefix/x.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/other-prefix/x.txt</Resource><RequestId>18C04607620AF5B1</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+
+[REQUEST s3.PostRestoreObject] 09:20:49.976023 ak=rouser client=127.0.0.1
+POST /probe-bucket/ro-prefix/a.txt?restore
+Authorization: <SigV4 present; redacted> (principal=rouser)
+[RESPONSE] 403 dur=144.579µs bytes=442
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>ro-prefix/a.txt</Key><BucketName>probe-bucket</BucketName><Resource>/probe-bucket/ro-prefix/a.txt</Resource><RequestId>18C0460762DC0EA5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+
+[REQUEST s3.PutBucketReplicationConfig] 09:20:49.989078 ak=rouser client=127.0.0.1
+PUT /probe-bucket?replication
+Authorization: <SigV4 present; redacted> (principal=rouser)
+[RESPONSE] 403 dur=151.678µs bytes=400
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>probe-bucket</BucketName><Resource>/probe-bucket</Resource><RequestId>18C0460763A3419C</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+**Client‑side outcomes** (minio‑go / `curl --aws-sigv4`), one line per probe, run 1:
+
+```
+BYPASS PresignedPut               status=403  AccessDenied            (no object created)
+BYPASS PostPolicy                 status=403  AccessDenied            (no object created)
+BYPASS VersionedDelete(null)      err=Access Denied.                  (a.txt intact)
+BYPASS Select(ro-prefix/a.txt)    opened; readbytes=33                (READ within grant — not a write)
+BYPASS Select(other-prefix/x.txt) OPEN-ERR Access Denied.             (denied outside grant)
+CURL   RestoreObject              ###HTTP 403  AccessDenied
+CURL   VersionedDelete-raw        ###HTTP 403  AccessDenied
+CURL   PutBucketReplication       ###HTTP 403  AccessDenied
+CURL   AdminStartBatchJob         ###HTTP 403  AccessDenied
+```
+
+The admin batch endpoint is *not* an S3 operation at all — it lives on the admin router — and
+a regular S3 principal has no admin action, so it is denied with the admin JSON error shape:
+
+```
+$ curl -s -X POST --aws-sigv4 "aws:amz:us-east-1:s3" --user "rouser:..." \
+    http://127.0.0.1:9000/minio/admin/v3/start-job
+{"Code":"AccessDenied","Message":"Access Denied.","Resource":"/minio/admin/v3/start-job","RequestId":"18C046076412B5A4","HostId":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8"}
+```
+
+**Storage side‑effect proof (authorized root re‑check, after the probes).** The presigned and
+POST‑policy write targets do not exist; the version‑targeted delete and the restore changed
+nothing (`ro-prefix/a.txt` is byte‑identical, same 32‑byte `5216ddcc…` ETag); and the
+authorized re‑list shows exactly the three original seeds:
+
+```
+ABSENT probe-bucket ro-prefix/rouser-presigned.txt CONFIRMED-ABSENT (NoSuchKey)
+ABSENT probe-bucket ro-prefix/rouser-postpolicy.txt CONFIRMED-ABSENT (NoSuchKey)
+ABSENT probe-bucket ro-prefix/rouser-restore-curl.txt CONFIRMED-ABSENT (NoSuchKey)
+INTACT ro-prefix/a.txt size=32 etag=5216ddcc58e8dade5256075e77f642da
+RELIST ro-prefix/ (root):
+  ro-prefix/a.txt        size=32 etag=5216ddcc58e8dade5256075e77f642da
+  ro-prefix/b.txt        size=34 etag=cc9b8aab6a7164192c280d67647f60e9
+  ro-prefix/sub/c.txt    size=35 etag=6c870fac6991ca112725627766424949
+```
+
+**Interpretation.** None of these corners opens a write path, because each still resolves a
+`policy` action and calls `IAMSys.IsAllowed()` at handler entry:
+
+- **Presigned‑URL `PUT`** enters `PutObjectHandler` (`cmd/object-handlers.go:1745`) exactly
+  like a normal `PUT`; authorization is `isPutActionAllowed(..., PutObjectAction)` at
+  `:1836`. A presigned request is just SigV4‑in‑the‑query — `isPutActionAllowed`
+  (`cmd/auth-handler.go:749`) handles the presigned auth type at `:758`, calls
+  `globalIAMSys.IsAllowed` at `:793`, and returns `ErrAccessDenied` at `:805`. Signing a URL
+  changes *how* the request is authenticated, not *what* the principal is allowed to do.
+- **POST‑policy** enters `PostPolicyBucketHandler` (`cmd/bucket-handlers.go:920`); after the
+  form signature is validated it performs an explicit `globalIAMSys.IsAllowed(..., PutObjectAction)`
+  (`:1171`) and writes `ErrAccessDenied` (`:1181`). The browser‑upload form is authorized the
+  same way as a `PUT`.
+- **Version‑targeted `DeleteObject`** (`?versionId=`) enters `DeleteObjectHandler`
+  (`cmd/object-handlers.go:2509`) and is gated by `checkRequestAuthType(DeleteObjectAction)`
+  at `:2528`; supplying a version id does not change the required action. (The multi‑object
+  variant authorizes each key with the version‑aware `checkRequestAuthTypeWithVID`,
+  `cmd/bucket-handlers.go:505`, exactly the per‑key `AccessDenied` shape shown in §5.5/§6.1.)
+- **S3 SELECT** enters `SelectObjectContentHandler` (`cmd/object-handlers.go:104`) and requires
+  only `GetObjectAction` (`:139`). It is therefore a **read**, not a bypass: inside the grant
+  it streams the object (`200`, the 32 `A` bytes plus the CSV record delimiter → 33 bytes read);
+  outside the grant it is denied `403`. It can read only what `GetObject` already can, and it
+  cannot write.
+- **`RestoreObject`** enters `PostRestoreObjectHandler` (`cmd/object-handlers.go:3341`) and
+  requires the distinct `RestoreObjectAction` (`:3362`), which `rouser` lacks → `403`.
+- **Replication** is not reachable as a write either: configuring it is
+  `PutBucketReplicationConfigHandler` (`cmd/bucket-replication-handlers.go:43`) requiring
+  `PutReplicationConfigurationAction` (`:54`), and server‑side object replication is a
+  `ReplicateObjectAction` write via `isPutActionAllowed` (`cmd/object-handlers.go:1884`) —
+  both actions `rouser` does not hold. **Batch jobs** are an *admin* API
+  (`StartBatchJob`, `cmd/batch-handlers.go:1709`, registered on the admin router behind the
+  admin middleware), so a regular S3 principal cannot reach them at all.
+
+In every case the deny is emitted at handler entry, before the object/erasure backend is
+touched — which is why the storage proof above shows no created object, no deleted object, and
+byte‑identical seeds.
+
+**Both runs identical.** The full bypass matrix produced the same outcome distribution in both
+runs (normalized client‑side and server‑trace outcomes are identical except for volatile
+`RequestId`s, timestamps, and sub‑millisecond durations), even though run 1 probed a bucket at
+~2.1k objects and run 2 at ~18k, both under continuous 8‑writer churn — consistent with the
+per‑request, concurrency‑independent decision in §5.1.
 
 
 ---
@@ -1095,7 +1259,7 @@ mutation and produced no storage side effect**. The one surface that returns HTT
 multi‑object delete — reports a **per‑key `AccessDenied`** and deletes nothing (§5.5,
 §6.1). The information a read‑only caller can learn is exactly the prefix‑scoped read
 metadata the grant authorizes (existence, size, ETag, content‑type, last‑modified, lock
-header presence), and nothing beyond it (§5.6, §6.6).
+header presence), and nothing beyond it (§5.6, §6.6). An **independent bypass hunt** of the less‑obvious surfaces the question singled out — presigned‑URL `PUT`, browser‑style POST‑policy upload, version‑targeted `DeleteObject`, server‑side `SelectObjectContent`, `RestoreObject`, and the replication/batch triggers — reached the same result: every write surface was denied `403` with no storage side effect, and the only `200` (S3 SELECT) is a prefix‑scoped **read**, not a write (§5.8).
 
 The causal reason (§5.1): the authorization decision `IAMSys.IsAllowed()`
 (`cmd/iam.go:2437`) is **per‑request and independent of other clients' concurrent
@@ -1118,6 +1282,7 @@ side effect**; two handlers perform pre‑IAM validation or an object‑info rea
   re‑list/`StatObject`).
 - **Ran under concurrency and confirmed stability**: the full matrix executed twice under
   live 12‑thread load, with identical outcomes (§7).
+- **Hunted the less‑obvious corners independently**: beyond the named matrix, drove `rouser` at two churn levels (~2.1k and ~18k live objects) against presigned‑URL `PUT`, POST‑policy upload, version‑targeted `DeleteObject`, `SelectObjectContent`, `RestoreObject`, and replication/batch triggers — all denied with no side effect except the read‑only S3 SELECT read (§5.8).
 - **Every named item exercised** (§8.4), with results reported exactly as observed and any
   read‑only inference explicitly labeled (§6.5, §6.7).
 
@@ -1151,8 +1316,11 @@ $ git status --porcelain
 ```
 
 No source, configuration, dependency manifest, or test file was modified; no reproduction
-script was committed. The single repository change is this document (it already existed in
-`HEAD` from a prior revision, hence the ` M` modified status rather than untracked).
+script was committed. The single repository change is this document. Because it already
+exists in `HEAD` from an earlier authoring pass, `git status` reports it as ` M` (modified)
+before the final commit and shows a clean tree afterward; either way the *only* path that
+differs from the MinIO source commit is this one file — the durable invariant shown in §2.1
+(`git diff --name-only c07e5b49d477 HEAD` → `blitzy/documentation/minio_c07e5b49d477.md`).
 
 ### 8.4 Coverage pass — every named item answered
 
@@ -1180,9 +1348,16 @@ script was committed. The single repository change is this document (it already 
 | 20 | HeadBucket | §5.6 | `403` (prefix condition not satisfied) |
 | 21 | GetObjectAttributes | §5.6 | `403` (distinct action, denied even in‑prefix) |
 | 22 | GetObject (baseline read + leakage) | §5.6 | in‑grant `200` (32 bytes, ETag); out‑of‑grant `403` |
-| 23 | Built‑in `readonly` list gap (`rocanned`) | §5.7, §6.4 | `GetObject` `200`; `ListObjectsV2` `403` |
-| 24 | Retention empty‑header skip (`rwnoret`) | §6.2 | headerless `PUT` `200` (created); with lock headers `403` (absent) |
-| 25 | Under‑concurrency / ≥2‑run stability | §4, §7 | identical outcomes across 2 runs; seeds byte‑stable |
+| 23 | Presigned‑URL `PUT` | §5.8 | `403 AccessDenied`; no object created |
+| 24 | POST‑policy upload | §5.8 | `403 AccessDenied`; no object created |
+| 25 | Version‑targeted `DeleteObject` (`?versionId`) | §5.8 | `403 AccessDenied`; `a.txt` intact |
+| 26 | `SelectObjectContent` (S3 SELECT) | §5.8 | in‑grant `200` (read, 33 bytes); out‑of‑grant `403` — read, not a write |
+| 27 | `RestoreObject` (`PostRestoreObject`) | §5.8 | `403 AccessDenied` (distinct `RestoreObjectAction`) |
+| 28 | Replication config / server‑side replicate | §5.8 | `403 AccessDenied` (`Put`/`ReplicateObject` actions absent) |
+| 29 | Batch job trigger (admin API) | §5.8 | `403 AccessDenied` (admin router; no admin action) |
+| 30 | Built‑in `readonly` list gap (`rocanned`) | §5.7, §6.4 | `GetObject` `200`; `ListObjectsV2` `403` |
+| 31 | Retention empty‑header skip (`rwnoret`) | §6.2 | headerless `PUT` `200` (created); with lock headers `403` (absent) |
+| 32 | Under‑concurrency / ≥2‑run stability | §4, §7 | identical outcomes across 2 runs; seeds byte‑stable |
 
 Every mechanism, condition, and "e.g./such as" item named in the request is addressed with
 raw evidence above, leading with the direct answer and layering the nuances afterward.
