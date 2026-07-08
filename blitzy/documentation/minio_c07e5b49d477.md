@@ -94,12 +94,10 @@ Copyright: 2015-2024 MinIO, Inc.
 
 The stamped commit id (`c07e5b49d477b0774f23db3b290745aef8c01bd2`) is the **source‑branch base commit** these
 citations reference. This document is the only artifact this task adds; the binary is therefore built from the
-Go source at that base commit (HEAD's parent once the document is committed), and the working tree's Go source
+Go source at that base commit (an ancestor of HEAD), and the working tree's Go source
 is byte‑identical to it:
 
 ```console
-$ git rev-parse HEAD^
-c07e5b49d477b0774f23db3b290745aef8c01bd2
 $ git diff c07e5b49d477b0774f23db3b290745aef8c01bd2 --stat -- '*.go'
 $        # (empty diff = the Go source tree is byte-identical to the cited commit)
 ```
@@ -1333,5 +1331,5 @@ no ./minio in repo root (clean)
 
 The build target and its artifacts are already ignored by `.gitignore` (`minio` on line 4). All `file:line`
 citations in this document correspond to the source‑branch base commit
-`c07e5b49d477b0774f23db3b290745aef8c01bd2` (HEAD's parent), whose Go source is byte‑identical to the working
+`c07e5b49d477b0774f23db3b290745aef8c01bd2` (an ancestor of HEAD), whose Go source is byte‑identical to the working
 tree the server was built and observed from.
