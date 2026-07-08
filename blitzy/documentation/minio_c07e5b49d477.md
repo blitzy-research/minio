@@ -85,14 +85,27 @@ removed afterward, so the source tree is left unchanged.
   `buildscripts/verify-healing.sh:L122-124` fetches `/tmp/mc` (not a repository dependency).
   Metrics scraped unauthenticated via `curl`, enabled by `MINIO_PROMETHEUS_AUTH_TYPE=public`.
 
+- **Safety note on `MINIO_PROMETHEUS_AUTH_TYPE=public` (investigation/test-only):** this setting is
+  used here **solely** to make this read-only investigation's metric scrapes reproducible with plain
+  `curl` (no bearer token to mint), and it exposes the Prometheus endpoints **without authentication**.
+  It is **not a blanket production recommendation**. MinIO's canonical default is JWT-authenticated
+  scraping (`cmd/metrics-router.go:L56`); production deployments should retain that default (or restrict
+  the endpoints by network policy) rather than adopt `public`. The auth type affects only *who may
+  scrape* the endpoint — it never changes the metric values reported below.
+
 - **Drive-loss mechanism (storage layer only — NEVER edits shard files, matching
   `buildscripts/verify-healing.sh` guidance):**
   - fail a drive: `umount -l /mnt/driveN`
   - return drive WITH its data: `mount -o loop /mnt/miniodata/diskN.img /mnt/driveN`
   - return drive AS FRESH (unformatted): `mkfs.ext4 -F -q diskN.img` then `mount -o loop diskN.img /mnt/driveN`
 
-- **Test object:** a 1 MiB file, md5 `8be8929e989fb7f5497638c2153a3bd4`, uploaded into bucket
+- **Test object:** a 1 MiB file (`/tmp/blitzy-repro/obj1mb.bin`), md5
+  `d1897826d5343e70d38ff11e37708e39` (`md5sum /tmp/blitzy-repro/obj1mb.bin`), uploaded into bucket
   `myminio/q1bucket`.
+
+- **Deployment ID (this run):** `829673bc-44fc-42c4-afb8-d5c5867216bb`; server `HostId`
+  (`X-Amz-Id-2`, deterministic hex of the local node name via `globalLocalNodeNameHex`,
+  `cmd/generic-handlers.go:L550`) = `dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8`.
 
 > **Read-only note:** All temporary scripts and scratch data directories live OUTSIDE the
 > repository (under `/tmp` and `/mnt`) and were removed after the investigation, leaving the
@@ -113,36 +126,124 @@ write quorum (**≥2 offline**) → the **PUT FAILS** with the S3 error **`SlowD
 
 ### 4.1 Q1a — 1 drive offline (3 online ≥ writeQuorum 3) → SUCCEEDS
 
-Induce the loss, then confirm the degraded state:
+Induce the loss, then confirm the degraded state (complete `mc admin info` output):
 
 ```
-umount -l /mnt/drive4
-```
+$ umount -l /mnt/drive4
+$ /tmp/mc admin info myminio
+●  127.0.0.1:9000
+   Uptime: 2 minutes 
+   Version: 2024-11-25T17:10:22Z
+   Network: 1/1 OK 
+   Drives: 3/4 OK 
+   Pool: 1
 
-`mc admin info` now reports:
+┌──────┬───────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage          │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 0.2% (total: 1.8 GiB) │ 4                   │ 1            │
+└──────┴───────────────────────┴─────────────────────┴──────────────┘
 
-```
 3 drives online, 1 drive offline, EC:2
 ```
 
-Perform the write:
+Perform the write (complete `mc cp` output; shell exit status printed after):
 
 ```
-/tmp/mc cp /tmp/obj1mb.bin myminio/q1bucket/onedrive-off.bin
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin myminio/q1bucket/onedrive-off.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `myminio/q1bucket/onedrive-off.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 1.00 MiB │ 1.00 MiB    │ 00m00s   │ 38.53 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
+$ echo "exit=$?"
+exit=0
 ```
 
-Result: **success (exit 0)**; the object is listed as `1.0MiB STANDARD`.
-
-Decode the on-disk metadata via the `docs/debugging/xl-meta` tool. The `xl.meta` shows:
+A second write during the same 1-drive outage behaves identically (complete `mc cp` output):
 
 ```
-EcM (data)   = 2
-EcN (parity) = 2
-MetaSys      = {}
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin myminio/q1bucket/onedrive-off-2.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `myminio/q1bucket/onedrive-off-2.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 1.00 MiB │ 1.00 MiB    │ 00m00s   │ 32.36 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
 ```
 
-i.e. **NO upgrade marker**. Physically only 3 of 4 shards were written; drive4's shard is
-healed later.
+Both objects list as `1.0MiB STANDARD` (complete `mc ls` output):
+
+```
+$ /tmp/mc ls myminio/q1bucket/
+[2026-07-08 05:41:06 UTC] 1.0MiB STANDARD onedrive-off.bin
+[2026-07-08 05:41:06 UTC] 1.0MiB STANDARD onedrive-off-2.bin
+```
+
+Decode the on-disk metadata with the `docs/debugging/xl-meta` tool (`xl.meta` is written
+identically on every online drive; drive1 shown). Complete, unedited tool output:
+
+```
+$ go run ./docs/debugging/xl-meta /mnt/drive1/q1bucket/onedrive-off.bin/xl.meta
+{
+    "Versions": [
+        {
+            "Header": {
+                "EcM": 2,
+                "EcN": 2,
+                "Flags": 2,
+                "ModTime": "2026-07-08T05:41:06.020362005Z",
+                "Signature": "4ef99539",
+                "Type": 1,
+                "VersionID": "00000000000000000000000000000000"
+            },
+            "Idx": 0,
+            "Metadata": {
+                "Type": 1,
+                "V2Obj": {
+                    "CSumAlgo": 1,
+                    "DDir": "0H9rXh+URhyRFNN4paQcIQ==",
+                    "EcAlgo": 1,
+                    "EcBSize": 1048576,
+                    "EcDist": [
+                        2,
+                        3,
+                        4,
+                        1
+                    ],
+                    "EcIndex": 2,
+                    "EcM": 2,
+                    "EcN": 2,
+                    "ID": "AAAAAAAAAAAAAAAAAAAAAA==",
+                    "MTime": 1783489266020362005,
+                    "MetaSys": {},
+                    "MetaUsr": {
+                        "content-type": "application/octet-stream",
+                        "etag": "d1897826d5343e70d38ff11e37708e39"
+                    },
+                    "PartASizes": [
+                        1048576
+                    ],
+                    "PartETags": null,
+                    "PartNums": [
+                        1
+                    ],
+                    "PartSizes": [
+                        1048576
+                    ],
+                    "Size": 1048576
+                },
+                "v": 1732554622
+            }
+        }
+    ]
+}
+```
+
+Reading the raw output: `"EcM": 2` (data blocks), `"EcN": 2` (parity blocks), and
+`"MetaSys": {}` is **empty** → **NO upgrade marker**. The stored `"etag"` equals the source md5
+`d1897826d5343e70d38ff11e37708e39`, confirming the correct object was written. On-disk inspection
+confirms drives 1/2/3 each hold a data-dir UUID + `xl.meta` while **drive4 has no object
+directory at all** (it missed the write); drive4's shard is reconstructed later by healing
+(see Q3). Physically only 3 of 4 shards were written.
 
 **WHY there is no upgrade marker at 4 drives (causal explanation, grounded):** During PUT,
 MinIO's availability-optimized path bumps parity by one for the offline drive (2→3) but then
@@ -176,58 +277,261 @@ default parity for a 4-drive set already equals the `N/2` ceiling. Tracing it th
 > to Q1 is the canonical 4-drive EC:2 result in §4.1 and §4.3.
 
 In a 12-drive set the default parity is EC:4, which is below the `N/2 = 6` ceiling, so the
-upgrade marker is observable:
+upgrade marker is observable. **Launch (non-canonical — 12 plain directories, `MINIO_CI_CD=1`,
+port 9010):**
 
-- Healthy PUT → `xl.meta` `EcM`(data)=8 / `EcN`(parity)=4 / no marker.
-- With 1 drive offline, the PUT **SUCCEEDS** → `xl.meta` `EcM`(data)=7 / `EcN`(parity)=5, and
-  the marker **`x-minio-internal-erasure-upgraded`** IS present (base64 `NC0+NQ==` decodes to
-  `4->5`), with 11 shards written.
+```
+$ MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123 MINIO_PROMETHEUS_AUTH_TYPE=public \
+    MINIO_CI_CD=1 ./minio --config-dir /tmp/minio-config-ec server \
+    /tmp/blitzy-repro/ec-data/disk{1..12} --address :9010 --console-address :9011
+[MinIO startup banner elided — the relevant confirmation is the erasure-set formatting line:]
+INFO: Formatting 1st pool, 1 set(s), 12 drives per set.
+```
+
+Alias for this cluster: `MC_HOST_ec=http://minio:minio123@127.0.0.1:9010`.
+
+**Drive-loss mechanism for this single-node local backend (exact commands + rationale).** A plain
+`rm -rf`/`mv` of a drive directory does **not** simulate a lost drive here: MinIO's local backend
+auto-recreates a missing local path on the next access, so the "offline" drive silently comes
+back and all 12 shards get written. To make the drive genuinely un-writable, the real data is
+moved aside and the drive path is replaced by a **broken symlink** (a dangling target MinIO
+cannot recreate):
+
+```
+$ mv  /tmp/blitzy-repro/ec-data/disk12 /tmp/blitzy-repro/ec-data/disk12.off
+$ ln -s /tmp/blitzy-repro/ec-data/__does_not_exist__ /tmp/blitzy-repro/ec-data/disk12
+$ ls -la /tmp/blitzy-repro/ec-data/disk12
+lrwxrwxrwx 1 root root 44 Jul  8 05:50 /tmp/blitzy-repro/ec-data/disk12 -> /tmp/blitzy-repro/ec-data/__does_not_exist__
+```
+
+**Healthy PUT (all 12 online).** Bucket create, upload, and complete `xl-meta` decode:
+
+```
+$ /tmp/mc mb ec/ecbucket
+Bucket created successfully `ec/ecbucket`.
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin ec/ecbucket/healthy.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `ec/ecbucket/healthy.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 1.00 MiB │ 1.00 MiB    │ 00m00s   │ 26.83 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
+$ go run ./docs/debugging/xl-meta /tmp/blitzy-repro/ec-data/disk1/ecbucket/healthy.bin/xl.meta
+{
+    "Versions": [
+        {
+            "Header": {
+                "EcM": 8,
+                "EcN": 4,
+                "Flags": 6,
+                "ModTime": "2026-07-08T05:50:37.740934948Z",
+                "Signature": "d1fd7f90",
+                "Type": 1,
+                "VersionID": "00000000000000000000000000000000"
+            },
+            "Idx": 0,
+            "Metadata": {
+                "Type": 1,
+                "V2Obj": {
+                    "CSumAlgo": 1,
+                    "DDir": "ekU7A66dQkSjWw9F81oHOw==",
+                    "EcAlgo": 1,
+                    "EcBSize": 1048576,
+                    "EcDist": [ 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9 ],
+                    "EcIndex": 10,
+                    "EcM": 8,
+                    "EcN": 4,
+                    "ID": "AAAAAAAAAAAAAAAAAAAAAA==",
+                    "MTime": 1783489837740934948,
+                    "MetaSys": {
+                        "x-minio-internal-inline-data": "dHJ1ZQ=="
+                    },
+                    "MetaUsr": {
+                        "content-type": "application/octet-stream",
+                        "etag": "d1897826d5343e70d38ff11e37708e39"
+                    },
+                    "PartASizes": [ 1048576 ],
+                    "PartETags": null,
+                    "PartNums": [ 1 ],
+                    "PartSizes": [ 1048576 ],
+                    "Size": 1048576
+                },
+                "v": 1732554622
+            }
+        }
+    ]
+}
+```
+
+Reading it: `"EcM": 8` / `"EcN": 4` (default EC:4). `MetaSys` contains **only**
+`"x-minio-internal-inline-data": "dHJ1ZQ=="` (base64 decodes to `true` — the small object is
+inlined; `echo -n dHJ1ZQ== | base64 -d` → `true`); there is **NO**
+`x-minio-internal-erasure-upgraded` key → no parity upgrade, as expected when all drives are
+online.
+
+**Degraded PUT (11 online, disk12 replaced by the broken symlink above).** `mc admin info` first,
+then upload and complete `xl-meta` decode:
+
+```
+$ /tmp/mc admin info ec | tail -1
+11 drives online, 1 drive offline, EC:4
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin ec/ecbucket/degraded.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `ec/ecbucket/degraded.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 1.00 MiB │ 1.00 MiB    │ 00m00s   │ 30.64 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
+$ go run ./docs/debugging/xl-meta /tmp/blitzy-repro/ec-data/disk1/ecbucket/degraded.bin/xl.meta
+{
+    "Versions": [
+        {
+            "Header": {
+                "EcM": 7,
+                "EcN": 5,
+                "Flags": 2,
+                "ModTime": "2026-07-08T05:50:49.797291888Z",
+                "Signature": "de2760cd",
+                "Type": 1,
+                "VersionID": "00000000000000000000000000000000"
+            },
+            "Idx": 0,
+            "Metadata": {
+                "Type": 1,
+                "V2Obj": {
+                    "CSumAlgo": 1,
+                    "DDir": "OSaPJrDZTpumSKvcHMZlhA==",
+                    "EcAlgo": 1,
+                    "EcBSize": 1048576,
+                    "EcDist": [ 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7 ],
+                    "EcIndex": 8,
+                    "EcM": 7,
+                    "EcN": 5,
+                    "ID": "AAAAAAAAAAAAAAAAAAAAAA==",
+                    "MTime": 1783489849797291888,
+                    "MetaSys": {
+                        "x-minio-internal-erasure-upgraded": "NC0+NQ=="
+                    },
+                    "MetaUsr": {
+                        "content-type": "application/octet-stream",
+                        "etag": "d1897826d5343e70d38ff11e37708e39"
+                    },
+                    "PartASizes": [ 1048576 ],
+                    "PartETags": null,
+                    "PartNums": [ 1 ],
+                    "PartSizes": [ 1048576 ],
+                    "Size": 1048576
+                },
+                "v": 1732554622
+            }
+        }
+    ]
+}
+```
+
+Reading it: the PUT **SUCCEEDED** with the drive offline, and `"EcM": 7` / `"EcN": 5` shows parity
+was upgraded from 4 to 5. `MetaSys` now carries
+`"x-minio-internal-erasure-upgraded": "NC0+NQ=="`; base64-decoding the value proves the upgrade:
+
+```
+$ echo -n 'NC0+NQ==' | base64 -d
+4->5
+```
+
+Exactly **11 shards** are physically present (disk12, the broken symlink, holds none):
+
+```
+$ ls /tmp/blitzy-repro/ec-data/disk{1..12}/ecbucket/degraded.bin/*/part.1 2>/dev/null | wc -l
+11
+```
+
+The upgraded object is still fully readable and byte-identical to the source (md5 matches the
+1 MiB test object):
+
+```
+$ /tmp/mc cat ec/ecbucket/degraded.bin | md5sum
+d1897826d5343e70d38ff11e37708e39  -
+```
 
 This demonstrates the `parityOrig != parityDrives` branch (`cmd/erasure-object.go:L1315-1316`)
-recording the upgrade when default parity < `N/2`. In the canonical 4-drive set that branch is a
-no-op because default parity already equals the ceiling.
+recording the upgrade (`4->5`) when default parity < `N/2`. In the canonical 4-drive set that
+branch is a no-op because default parity already equals the ceiling — hence §4.1's empty
+`MetaSys`.
 
 ### 4.3 Q1b — 2 drives offline (2 online < writeQuorum 3) → FAILS (client-visible)
 
-Induce the second failure (drive4 already offline):
+Induce the second failure (drive4 already offline), then confirm the degraded state (complete
+`mc admin info` output):
 
 ```
-umount -l /mnt/drive3
-```
+$ umount -l /mnt/drive3
+$ /tmp/mc admin info myminio
+●  127.0.0.1:9000
+   Uptime: 4 minutes 
+   Version: 2024-11-25T17:10:22Z
+   Network: 1/1 OK 
+   Drives: 2/4 OK 
+   Pool: 1
 
-`mc admin info`:
+┌──────┬───────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage          │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 0.4% (total: 1.8 GiB) │ 4                   │ 1            │
+└──────┴───────────────────────┴─────────────────────┴──────────────┘
 
-```
+5.0 MiB Used, 1 Bucket, 5 Objects
 2 drives online, 2 drives offline, EC:2
 ```
 
-Write with a wire trace:
+Write through the **raw S3 API** using a boto3-generated presigned PUT URL and `curl -isS`, so the
+exact wire response (status line, all headers, full body) is captured verbatim rather than
+summarized by `mc`. The presigned URL used (expired; `X-Amz-Expires=300`):
 
 ```
-/tmp/mc cp /tmp/obj1mb.bin myminio/q1bucket/twodrives-off.bin --debug
+$ URL='http://127.0.0.1:9000/q1bucket/twodrives-off.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=minio%2F20260708%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260708T054251Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=a297489910e40bff1b436ee54d7c42cd8ec1e9451c0e6aeadc5bfb0d32911baa'
+$ curl -isS -X PUT --data-binary @/tmp/blitzy-repro/obj1mb.bin "$URL"
 ```
 
-Wire-level result (complete, unedited):
+Complete, unedited response — **status line + every response header** (Content-Length is `393`,
+matching the body below byte-for-byte):
 
-- Request line:
+```
+HTTP/1.1 503 Service Unavailable
+Accept-Ranges: bytes
+Content-Length: 393
+Content-Type: application/xml
+Retry-After: 60
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C03A22510E6D80
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 561721
+X-Ratelimit-Remaining: 561721
+X-Xss-Protection: 1; mode=block
+Date: Wed, 08 Jul 2026 05:42:51 GMT
+Connection: close
+```
 
-  ```
-  PUT /q1bucket/twodrives-off.bin HTTP/1.1
-  ```
+Complete, unedited **response body** — exactly 393 bytes: an XML declaration line, a newline, then
+the single-line `<Error>` element, with no trailing newline (the saved response body measures
+`wc -c` → `393`, matching the `Content-Length: 393` header above):
 
-- Response status:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>twodrives-off.bin</Key><BucketName>q1bucket</BucketName><Resource>/q1bucket/twodrives-off.bin</Resource><RequestId>18C03A22510E6D80</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
 
-  ```
-  HTTP/1.1 503 Service Unavailable
-  ```
+The `mc` client path corroborates it — every attempt returns `503 SlowDownWrite` (complete
+`mc cp` output; exit status 1):
 
-- Response body:
+```
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin myminio/q1bucket/twodrives-off-mc.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `myminio/q1bucket/twodrives-off-mc.bin`
+mc: <ERROR> Failed to copy `/tmp/blitzy-repro/obj1mb.bin`. Resource requested is unwritable, please reduce your request rate
+```
 
-  ```xml
-  <Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>twodrives-off.bin</Key><BucketName>q1bucket</BucketName>...<RequestId>18C031C0857E987C</RequestId>...</Error>
-  ```
-
-`mc` auto-retried; every attempt returned `503 SlowDownWrite`. The object was **NOT created**.
+The object was **NOT created** — a subsequent `mc ls myminio/q1bucket/twodrives-off.bin` returns
+no entry (empty output).
 
 **Q1 causal chain / citations:**
 
@@ -262,32 +566,41 @@ byte-exact integrity. Once online drives drop **below read quorum (1 of 4 online
 
 ### 5.1 Q2a — reads SUCCEED via reconstruction (read quorum retained)
 
-Reference object `readtest.bin`, md5 `8be8929e989fb7f5497638c2153a3bd4`.
+Reference object `readtest.bin` — the same 1 MiB test object, uploaded into `myminio/q1bucket`
+while all 4 drives were healthy (complete `mc cp` output):
 
-- **1 drive offline** (`3 online, 1 offline`):
+```
+$ /tmp/mc cp /tmp/blitzy-repro/obj1mb.bin myminio/q1bucket/readtest.bin
+`/tmp/blitzy-repro/obj1mb.bin` -> `myminio/q1bucket/readtest.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 1.00 MiB │ 1.00 MiB    │ 00m00s   │ 28.66 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
+```
 
-  ```
-  mc cat myminio/q1bucket/readtest.bin | md5sum
-  ```
+Its source md5 is `d1897826d5343e70d38ff11e37708e39`. Each read below is verified by downloading
+the object to a file and hashing that file, so the `md5sum` output carries the filename field
+(not a piped `-`).
 
-  Output:
-
-  ```
-  8be8929e989fb7f5497638c2153a3bd4
-  ```
-
-  ✓ MATCHES.
-
-- **2 drives offline** (`2 online, 2 offline`, the read-quorum boundary):
-
-  ```
-  mc cat myminio/q1bucket/readtest.bin | md5sum
-  ```
-
-  Output:
+- **1 drive offline** — drive-state confirmed by `mc admin info` (the complete block appears in
+  §4.1: "3 drives online, 1 drive offline, EC:2"). Download + hash (complete, unedited output):
 
   ```
-  8be8929e989fb7f5497638c2153a3bd4
+  $ /tmp/mc cat myminio/q1bucket/readtest.bin > /tmp/blitzy-repro/q2a_1off.bin
+  $ md5sum /tmp/blitzy-repro/q2a_1off.bin
+  d1897826d5343e70d38ff11e37708e39  /tmp/blitzy-repro/q2a_1off.bin
+  ```
+
+  ✓ MATCHES the source md5 — the read SUCCEEDS via reconstruction.
+
+- **2 drives offline** (the read-quorum boundary) — drive-state confirmed by `mc admin info`
+  (the complete block appears in §4.3: "2 drives online, 2 drives offline, EC:2"). Download +
+  hash (complete, unedited output):
+
+  ```
+  $ /tmp/mc cat myminio/q1bucket/readtest.bin > /tmp/blitzy-repro/q2a_2off.bin
+  $ md5sum /tmp/blitzy-repro/q2a_2off.bin
+  d1897826d5343e70d38ff11e37708e39  /tmp/blitzy-repro/q2a_2off.bin
   ```
 
   ✓ MATCHES. Reconstruction succeeds from exactly 2 healthy shards because K=2 data shards
@@ -295,44 +608,100 @@ Reference object `readtest.bin`, md5 `8be8929e989fb7f5497638c2153a3bd4`.
 
 ### 5.2 Q2b — reads FAIL below read quorum (1 online < readQuorum 2) — clean object-level GET
 
-To isolate the `GetObject` path (bypassing `mc`'s `GetBucketLocation` preflight), a presigned
-URL was used:
+To isolate the `GetObject` path (bypassing `mc`'s `GetBucketLocation` preflight), a
+**boto3-generated presigned GET URL** was fetched with `curl`, so the exact wire response is
+captured verbatim. A fresh URL is signed for each attempt (presigned URLs expire); the full
+signed URLs are shown below (both now expired).
 
-- Generate the URL:
-
-  ```
-  mc share download --expire 1h myminio/q1bucket/readtest.bin
-  ```
-
-  Output:
+- **Healthy baseline (4 online)** — generate the presigned URL and fetch it. Complete, unedited
+  output (full signed URL; `-D -` dumps the status line + all headers to stdout while the body is
+  written to a file, then the file size and md5 are printed):
 
   ```
-  Share: http://127.0.0.1:9000/q1bucket/readtest.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&...&X-Amz-Signature=...
+  $ URLH=$(python3 /tmp/blitzy-repro/presign.py get_object q1bucket readtest.bin 3600)
+  $ echo "$URLH"
+  http://127.0.0.1:9000/q1bucket/readtest.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=minio%2F20260708%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260708T054031Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=f7911e4b230156217b087d67599a0dcb85055e30216fec963176da61eb0c9dd6
+  $ curl -sS -D - -o /tmp/blitzy-repro/q2a_baseline.bin "$URLH"
+  HTTP/1.1 200 OK
+  Accept-Ranges: bytes
+  Content-Length: 1048576
+  Content-Type: application/octet-stream
+  ETag: "d1897826d5343e70d38ff11e37708e39"
+  Last-Modified: Wed, 08 Jul 2026 05:40:18 GMT
+  Server: MinIO
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Vary: Origin
+  Vary: Accept-Encoding
+  X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+  X-Amz-Request-Id: 18C03A01A50EE4C7
+  X-Content-Type-Options: nosniff
+  X-Ratelimit-Limit: 561721
+  X-Ratelimit-Remaining: 561721
+  X-Xss-Protection: 1; mode=block
+  Date: Wed, 08 Jul 2026 05:40:31 GMT
+  $ wc -c < /tmp/blitzy-repro/q2a_baseline.bin
+  1048576
+  $ md5sum /tmp/blitzy-repro/q2a_baseline.bin
+  d1897826d5343e70d38ff11e37708e39  /tmp/blitzy-repro/q2a_baseline.bin
   ```
 
-- Healthy baseline (4 online):
+  → HTTP 200, 1048576 bytes, md5 `d1897826d5343e70d38ff11e37708e39` ✓ (matches source): while
+  healthy the object reads back byte-exact.
+
+- **Degrade to 1 online** (`umount -l` drives 2, 3, 4). Drive-state (complete `mc admin info`
+  output):
 
   ```
-  curl "$PRE"
+  $ /tmp/mc admin info myminio
+  ●  127.0.0.1:9000
+     Uptime: 5 minutes 
+     Version: 2024-11-25T17:10:22Z
+     Network: 1/1 OK 
+     Drives: 1/4 OK 
+     Pool: 1
+
+  ┌──────┬───────────────────────┬─────────────────────┬──────────────┐
+  │ Pool │ Drives Usage          │ Erasure stripe size │ Erasure sets │
+  │ 1st  │ 0.4% (total: 906 MiB) │ 4                   │ 1            │
+  └──────┴───────────────────────┴─────────────────────┴──────────────┘
+
+  1 drive online, 3 drives offline, EC:2
   ```
 
-  → HTTP 200, bytes = 1048576, md5 `8be8929e989fb7f5497638c2153a3bd4` ✓.
+- **Raw object GET below read quorum** — sign a fresh URL and fetch it. Complete status line +
+  all response headers (Content-Length `382`, matching the body below byte-for-byte):
 
-- Degrade to 1 online (`umount -l` drives 2, 3, 4), then raw object GET via the same presigned URL:
+  ```
+  $ URL=$(python3 /tmp/blitzy-repro/presign.py get_object q1bucket readtest.bin 300)
+  $ echo "$URL"
+  http://127.0.0.1:9000/q1bucket/readtest.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=minio%2F20260708%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260708T054350Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=6fa8cd4c9cdd5ca021ce05751c27ba53b76d1c8560b96e00d3c0abf9d6540b0a
+  $ curl -isS "$URL"
+  HTTP/1.1 503 Service Unavailable
+  Accept-Ranges: bytes
+  Content-Length: 382
+  Content-Type: application/xml
+  Retry-After: 60
+  Server: MinIO
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Vary: Origin
+  Vary: Accept-Encoding
+  X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+  X-Amz-Request-Id: 18C03A301CBD7EB5
+  X-Content-Type-Options: nosniff
+  X-Ratelimit-Limit: 561721
+  X-Ratelimit-Remaining: 561721
+  X-Xss-Protection: 1; mode=block
+  Date: Wed, 08 Jul 2026 05:43:50 GMT
+  ```
 
-  - Status / headers:
+  Complete, unedited response body — exactly 382 bytes (declaration line, a newline, then the
+  single-line `<Error>` element, no trailing newline; `wc -c` → `382`, matching
+  `Content-Length: 382`):
 
-    ```
-    HTTP/1.1 503 Service Unavailable
-    Content-Type: application/xml
-    X-Amz-Request-Id: 18C03220FA50501B
-    ```
-
-  - Body (complete, unedited):
-
-    ```xml
-    <?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>readtest.bin</Key><BucketName>q1bucket</BucketName><Resource>/q1bucket/readtest.bin</Resource><RequestId>18C03220FA50501B</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-    ```
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>readtest.bin</Key><BucketName>q1bucket</BucketName><Resource>/q1bucket/readtest.bin</Resource><RequestId>18C03A301CBD7EB5</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+  ```
 
 The `<Key>readtest.bin</Key>` element proves this is the object read path (not bucket-location).
 `mc cat --debug` (which does `GetBucketLocation` first) returns the same `503 SlowDownRead`.
@@ -342,12 +711,12 @@ Stability confirmed on repeat.
 
 - Read-quorum computed per object: `objectQuorumFromMeta` at `cmd/erasure-metadata.go:L531`,
   with `expectedRQuorum := len(partsMetaData)/2` (`cmd/erasure-metadata.go:L533`) = 2 for a
-  4-drive set; `reduceReadQuorumErrs(...)` at `cmd/erasure-metadata.go:L539` returns
+  4-drive set; `reduceReadQuorumErrs` at `cmd/erasure-metadata.go:L539` returns
   `errErasureReadQuorum` when fewer than 2 valid `xl.meta` reads are available.
 - Reduction helper: `reduceReadQuorumErrs` at `cmd/erasure-metadata-utils.go:L150-151`
   (delegates to `reduceQuorumErrs` `cmd/erasure-metadata-utils.go:L137-145`).
 - Additional read-quorum return sites: `cmd/erasure-object.go:L487`
-  `return FileInfo{}, errErasureReadQuorum`; `cmd/erasure-object.go:L836` `reduceReadQuorumErrs(...)`
+  `return FileInfo{}, errErasureReadQuorum`; `cmd/erasure-object.go:L836` `reduceReadQuorumErrs`
   in the `getObjectFileInfo` path; `cmd/erasure-object.go:L691` handles the read-quorum case in
   `shouldCheckForDangling`.
 - Reconstruction: `cmd/erasure-object.go` (`GetObjectNInfo` → `getObjectWithFileInfo`) +
@@ -373,14 +742,17 @@ Stability confirmed on repeat.
 **Scenario (storage-layer only, never editing shard files):** uploaded `healme-base.bin` while
 healthy (shards on all 4 drives); failed drive4 with `umount -l`; wrote `healme.bin` while
 drive4 was offline (so drive4's `part.*` count = 0 — it missed that object); returned drive4 as
-a **fresh, unformatted disk**:
+a **fresh, unformatted disk** (`mkfs` wipes the backing loop image):
 
 ```
-mkfs.ext4 -F -q disk4.img
-mount -o loop disk4.img /mnt/drive4
+mkfs.ext4 -F -q /tmp/blitzy-repro/images/disk4.img
+mount -o loop /tmp/blitzy-repro/images/disk4.img /mnt/drive4
 ```
 
-Its contents were only `lost+found`, with no `format.json`.
+Its contents were then only `lost+found`, with no `format.json` (shown with complete output in
+§6.2 below). The granular §6.2 proof was captured on this same deployment
+(`829673bc-44fc-42c4-afb8-d5c5867216bb`, same 6-object set) by failing drive4 and returning it
+fresh, so the before/after drive4 inspection is directly observable.
 
 ### 6.1 Q3a — TRIGGER (observed)
 
@@ -408,12 +780,79 @@ Citations (grounded):
 **DIRECT ANSWER:** An object is healed onto a specific drive when that drive's shard is
 **missing/corrupt** (or the metadata is legacy/outdated, or a part file is missing/corrupt).
 
-Observed proof: after healing, drive4 physically regained `format.json` (342 B, written by the
-`HealFormat` reformat) AND every object's shard — including **`healme.bin`** (its `part.*` count
-went 0 → 1, plus `xl.meta`), proving the missing-shard criterion fired. Re-reading `healme.bin`
-gave md5 `8be8929e989fb7f5497638c2153a3bd4` (byte-exact). Verified per drive: `healme-base.bin`,
-`healme.bin`, `readtest.bin`, `healthy-obj.bin` all have `part.*`=1 + `xl.meta` on drive4 after
-heal.
+**Observed proof — complete, unedited command output.** The healthy reference drive (drive1)
+holds `healme.bin` as a data-dir shard plus `xl.meta`, and the cluster `format.json` is 342 bytes:
+
+```
+$ ls -la /mnt/drive1/.minio.sys/format.json
+-rw-r--r--+ 1 root root 342 Jul  8 05:38 /mnt/drive1/.minio.sys/format.json
+$ find /mnt/drive1/q1bucket/healme.bin -type f -printf '%s\t%p\n'
+524320	/mnt/drive1/q1bucket/healme.bin/428b25fe-de14-4c6e-9e59-885be553f911/part.1
+368	/mnt/drive1/q1bucket/healme.bin/xl.meta
+```
+
+**BEFORE heal** — fail drive4 and return it fresh; drive4 then has only `lost+found`, no
+`format.json`, and `healme.bin`'s `part.*` count is **0**:
+
+```
+$ umount -l /mnt/drive4
+$ mkfs.ext4 -F -q /tmp/blitzy-repro/images/disk4.img
+$ mount -o loop /tmp/blitzy-repro/images/disk4.img /mnt/drive4
+$ ls -la /mnt/drive4
+total 24
+drwxr-xr-x 3 root root  4096 Jul  8 06:14 .
+drwxr-xr-x 1 root root  4096 Jul  8 05:47 ..
+drwx------ 2 root root 16384 Jul  8 06:14 lost+found
+$ ls -la /mnt/drive4/.minio.sys/format.json
+ls: cannot access '/mnt/drive4/.minio.sys/format.json': No such file or directory
+$ find /mnt/drive4/q1bucket/healme.bin -name 'part.*' | wc -l
+0
+```
+
+**AFTER heal** (the background monitor healed drive4 with no restart — logs in §6.3) — drive4
+regained `format.json` (342 B, written by the `HealFormat` reformat) and `healme.bin` regained
+its `part.1` (count **0 → 1**) plus `xl.meta`, reconstructed into the **same data-dir UUID**
+`428b25fe-de14-4c6e-9e59-885be553f911` as drive1 — proving the missing-shard criterion fired:
+
+```
+$ ls -la /mnt/drive4
+total 32
+drwxr-xr-x 5 root root  4096 Jul  8 06:14 .
+drwxr-xr-x 1 root root  4096 Jul  8 05:47 ..
+drwxr-xr-x 6 root root  4096 Jul  8 06:14 .minio.sys
+drwx------ 2 root root 16384 Jul  8 06:14 lost+found
+drwxr-xr-x 8 root root  4096 Jul  8 06:14 q1bucket
+$ ls -la /mnt/drive4/.minio.sys/format.json
+-rw-r--r--+ 1 root root 342 Jul  8 06:14 /mnt/drive4/.minio.sys/format.json
+$ find /mnt/drive4/q1bucket/healme.bin -type f -printf '%s\t%p\n'
+368	/mnt/drive4/q1bucket/healme.bin/xl.meta
+524320	/mnt/drive4/q1bucket/healme.bin/428b25fe-de14-4c6e-9e59-885be553f911/part.1
+$ find /mnt/drive4/q1bucket/healme.bin -name 'part.*' | wc -l
+1
+```
+
+Every object regained its shard on drive4 (all `part.*`=1 and `xl.meta` present):
+
+```
+$ for o in healme-base.bin healme.bin healthy-obj.bin onedrive-off.bin onedrive-off-2.bin readtest.bin; do
+    echo "$o: part.*=$(find /mnt/drive4/q1bucket/$o -name 'part.*' | wc -l) xl.meta=$(find /mnt/drive4/q1bucket/$o -name 'xl.meta' | wc -l)"
+  done
+healme-base.bin: part.*=1 xl.meta=1
+healme.bin: part.*=1 xl.meta=1
+healthy-obj.bin: part.*=1 xl.meta=1
+onedrive-off.bin: part.*=1 xl.meta=1
+onedrive-off-2.bin: part.*=1 xl.meta=1
+readtest.bin: part.*=1 xl.meta=1
+```
+
+Re-reading `healme.bin` through the S3 API returns byte-exact data (md5 matches the 1 MiB source
+object `d1897826d5343e70d38ff11e37708e39`):
+
+```
+$ /tmp/mc cat myminio/q1bucket/healme.bin > /tmp/blitzy-repro/healme_reread.bin
+$ md5sum /tmp/blitzy-repro/healme_reread.bin
+d1897826d5343e70d38ff11e37708e39  /tmp/blitzy-repro/healme_reread.bin
+```
 
 Citation (all branches, not elided): `shouldHealObjectOnDisk` at
 `cmd/erasure-healing.go:L156-183` returns heal=true when:
@@ -500,29 +939,34 @@ failure) → back to **4 online / 0 offline** (after heal). Unauthenticated scra
 `public` value; default is JWT auth at `cmd/metrics-router.go:L56`, switched to `NoAuthMiddleware`
 at `cmd/metrics-router.go:L59-61`).
 
+> **Safety note (investigation/test-only):** `MINIO_PROMETHEUS_AUTH_TYPE=public` is set here **only**
+> so this read-only investigation can scrape metrics with plain `curl` reproducibly; it disables
+> authentication on the metrics endpoints and is **not recommended as a blanket production default**.
+> The canonical default is JWT auth (`cmd/metrics-router.go:L56`). This flag changes only *who may
+> scrape* the endpoint — the metric values reported below are identical regardless of auth type.
+
 ### 7.1 BEFORE (4 online)
+
+Each metric block below shows, on its first line, the exact `curl`-piped-to-`grep` command that was
+run, followed by its **complete, unedited output** — the raw endpoints emit the full Prometheus
+exposition (hundreds of series), and the `grep` narrows to exactly the drive-count series that
+answer Q4.
 
 - v3 health metrics:
 
   ```
-  curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/health
-  ```
-
-  ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
   minio_cluster_health_drives_count 4
   minio_cluster_health_drives_online_count 4
   ```
 
   Note: `minio_cluster_health_drives_offline_count` is **OMITTED** here — v3 suppresses
-  zero-valued gauges (see the nuance below).
+  zero-valued gauges (see §7.5 nuance + `cmd/metrics-v3-types.go:L239-245` citation).
 
 - v2 cluster metrics:
 
   ```
-  curl -s http://127.0.0.1:9000/minio/v2/metrics/cluster
-  ```
-
-  ```
+  $ curl -s http://127.0.0.1:9000/minio/v2/metrics/cluster | grep -E '^minio_cluster_drive_(on|off)line_total'
   minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
   minio_cluster_drive_online_total{server="127.0.0.1:9000"} 4
   ```
@@ -530,48 +974,104 @@ at `cmd/metrics-router.go:L59-61`).
 - per-set v3 metrics:
 
   ```
-  curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/erasure-set
-  ```
-
-  ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/erasure-set | grep '^minio_cluster_erasure_set_online_drives_count'
   minio_cluster_erasure_set_online_drives_count{pool_id="0",set_id="0"} 4
   ```
 
-- health endpoints: `/minio/health/cluster` → HTTP 200 with `X-Minio-Write-Quorum: 3`;
-  `/minio/health/cluster/read` → HTTP 200 with `X-Minio-Read-Quorum: 2`.
+- health endpoints (complete `curl -sI` status line + quorum header for each):
+
+  ```
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster | grep -E 'HTTP|Write-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Write-Quorum: 3
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster/read | grep -E 'HTTP|Read-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Read-Quorum: 2
+  ```
 
 ### 7.2 DURING (drive4 offline, 3 online)
 
-- v3:
+Same commands as §7.1. The cluster-aggregate v2/v3 series are served from a 1-minute TTL cache
+(§7.5), so these were scraped after the cache window rolled over so the transition is visible; the
+per-set series and `mc admin info` reflect the change live.
+
+- v3 health metrics:
 
   ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
   minio_cluster_health_drives_count 4
   minio_cluster_health_drives_offline_count 1
   minio_cluster_health_drives_online_count 3
   ```
 
-  (the offline gauge is now emitted because it is > 0)
+  (the `_offline_count` gauge is now emitted because its value is > 0)
 
-- v2:
+- v2 cluster metrics:
 
   ```
+  $ curl -s http://127.0.0.1:9000/minio/v2/metrics/cluster | grep -E '^minio_cluster_drive_(on|off)line_total'
   minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 1
   minio_cluster_drive_online_total{server="127.0.0.1:9000"} 3
   ```
 
-- per-set:
+- per-set v3 metrics:
 
   ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/erasure-set | grep '^minio_cluster_erasure_set_online_drives_count'
   minio_cluster_erasure_set_online_drives_count{pool_id="0",set_id="0"} 3
   ```
 
-- health: BOTH endpoints still HTTP 200 (1 offline still satisfies write-quorum 3 and
-  read-quorum 2). Note the quorum headers report the REQUIRED values (3/2), not the live online
-  count.
+- health endpoints (both still HTTP 200 — 1 offline still satisfies write-quorum 3 and read-quorum
+  2; the headers report the REQUIRED quorum, not the live online count):
 
-### 7.3 AFTER (post-heal)
+  ```
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster | grep -E 'HTTP|Write-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Write-Quorum: 3
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster/read | grep -E 'HTTP|Read-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Read-Quorum: 2
+  ```
 
-Identical to BEFORE: **4 online**; the offline gauge is omitted again (value back to 0).
+### 7.3 AFTER (post-heal, 4 online)
+
+After drive4 was healed (Q3), the drive-count series return to the BEFORE values — the v3
+`_offline_count` gauge is again suppressed at 0, while v2 still emits `_offline_total 0`. Complete,
+unedited outputs of the same commands:
+
+- v3 health metrics:
+
+  ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
+  minio_cluster_health_drives_count 4
+  minio_cluster_health_drives_online_count 4
+  ```
+
+- v2 cluster metrics:
+
+  ```
+  $ curl -s http://127.0.0.1:9000/minio/v2/metrics/cluster | grep -E '^minio_cluster_drive_(on|off)line_total'
+  minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+  minio_cluster_drive_online_total{server="127.0.0.1:9000"} 4
+  ```
+
+- per-set v3 metrics:
+
+  ```
+  $ curl -s http://127.0.0.1:9000/minio/metrics/v3/cluster/erasure-set | grep '^minio_cluster_erasure_set_online_drives_count'
+  minio_cluster_erasure_set_online_drives_count{pool_id="0",set_id="0"} 4
+  ```
+
+- health endpoints:
+
+  ```
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster | grep -E 'HTTP|Write-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Write-Quorum: 3
+  $ curl -sI http://127.0.0.1:9000/minio/health/cluster/read | grep -E 'HTTP|Read-Quorum'
+  HTTP/1.1 200 OK
+  X-Minio-Read-Quorum: 2
+  ```
 
 ### 7.4 Q4 citations (grounded)
 
@@ -602,16 +1102,23 @@ Identical to BEFORE: **4 online**; the offline gauge is omitted again (value bac
 
 - **v3 offline gauge suppressed at 0:** In the BEFORE and AFTER states the
   `minio_cluster_health_drives_offline_count` series is absent from the v3 output because v3
-  suppresses zero-valued gauges. Only the `_count` and `_online_count` series appear at 0 offline;
-  the `_offline_count` series reappears once its value is > 0 (DURING). Do not mistake the absent
-  series for a missing metric.
+  suppresses zero-valued gauges. The mechanism is in the v3 metric setter at
+  `cmd/metrics-v3-types.go:L239-245`, which guards the append with the comment
+  `// If valid non zero value set the metrics` and the condition `if value > 0 { m.values[name] = append(v, metricValue{Labels: labelMap, Value: value}) }` —
+  a gauge series is recorded only when its value is strictly greater than 0, so a 0-valued
+  `_offline_count` is never appended and therefore never exposed. Only the `_count` and
+  `_online_count` series appear at 0 offline; the `_offline_count` series reappears once its value
+  is > 0 (DURING). Do not mistake the absent series for a missing metric.
 - **1-minute TTL cache on cluster aggregates:** the cluster-aggregate v2/v3 drive metrics are
-  served from a **1-minute TTL cache** — `newClusterStorageInfoCache` at `cmd/metrics-v3-cache.go:L256`
-  uses `cachevalue.NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadStorageInfo)`.
-  Therefore, depending on scrape timing relative to the cache window, the online/offline transition
-  appears either immediately (cache expired) or lags by up to ~1 minute. In contrast, the
-  per-erasure-set metric and `mc admin info` reflect LIVE `StorageInfo` immediately. A reader who
-  scrapes right after inducing failure and sees stale counts is observing this cache, not a bug.
+  served from a **1-minute TTL cache**. The function `newClusterStorageInfoCache`
+  (`cmd/metrics-v3-cache.go:L256`) builds it and, at `cmd/metrics-v3-cache.go:L273-275`, returns
+  `cachevalue.NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadStorageInfo)` —
+  i.e. the `1*time.Minute` TTL (`L273`) and `ReturnLastGood: true` (`L274`) are set on that
+  `NewFromFunc` call. Therefore, depending on scrape timing relative to the cache window, the
+  online/offline transition appears either immediately (cache expired) or lags by up to ~1 minute.
+  In contrast, the per-erasure-set metric and `mc admin info` reflect LIVE `StorageInfo`
+  immediately. A reader who scrapes right after inducing failure and sees stale counts is observing
+  this cache, not a bug.
 
 ---
 
@@ -647,10 +1154,10 @@ All citations were verified against the source at commit
 
 - `cmd/erasure-metadata.go:L531` — `objectQuorumFromMeta`
 - `cmd/erasure-metadata.go:L533` — `expectedRQuorum := len(partsMetaData)/2`
-- `cmd/erasure-metadata.go:L539` — `reduceReadQuorumErrs(...)`
+- `cmd/erasure-metadata.go:L539` — `reduceReadQuorumErrs`
 - `cmd/erasure-metadata-utils.go:L150-151` — `reduceReadQuorumErrs`
 - `cmd/erasure-object.go:L487` — `return FileInfo{}, errErasureReadQuorum`
-- `cmd/erasure-object.go:L836` — `reduceReadQuorumErrs(...)` in `getObjectFileInfo`
+- `cmd/erasure-object.go:L836` — `reduceReadQuorumErrs` in `getObjectFileInfo`
 - `cmd/erasure-object.go:L691` — read-quorum case in `shouldCheckForDangling`
 - `cmd/erasure-decode.go` — Reed-Solomon reconstruction on read
 - `cmd/erasure-errors.go:L22-23` — `errErasureReadQuorum = errors.New("Read failed. Insufficient number of drives online")`
@@ -675,9 +1182,9 @@ All citations were verified against the source at commit
 - `cmd/background-newdisks-heal-ops.go:L460` — "Healing drive '%s' - 'mc admin heal alias/ --verbose' to check the current status."
 - `cmd/global-heal.go:L210` — "Healing drive '%s' - use %d parallel workers."
 - `cmd/background-newdisks-heal-ops.go:L520` — "Healing of drive '%s' is finished (healed: %d, skipped: %d)."
-- `cmd/background-newdisks-heal-ops.go:L503` — "Healing of drive '%s' is incomplete, retrying %s time ..." (sibling, not hit)
-- `cmd/background-newdisks-heal-ops.go:L517` — "Healing of drive '%s' is complete, retried %d times ..." (sibling, not hit)
-- `cmd/logging.go:L83-84` — `healingLogEvent` → `logger.Event(ctx, "healing", ...)`
+- `cmd/background-newdisks-heal-ops.go:L503` — "Healing of drive '%s' is incomplete, retrying %s time (healed: %d, skipped: %d, failed: %d)." (sibling, not hit)
+- `cmd/background-newdisks-heal-ops.go:L517` — "Healing of drive '%s' is complete, retried %d times (healed: %d, skipped: %d)." (sibling, not hit)
+- `cmd/logging.go:L83-84` — `healingLogEvent` → `logger.Event(ctx, "healing", msg, args...)`
 - `cmd/healingmetric_string.go:L16` — `const _healingMetric_name = "BucketObjectCheckAbandonedParts"`
 - `cmd/healingmetric_string.go:L11-13` — enum indices
 - `cmd/admin-heal-ops.go` — server side of `mc admin heal -r`
@@ -699,7 +1206,9 @@ All citations were verified against the source at commit
 - `cmd/metrics-v2.go:L3640` — name `erasure_set_online_drives`
 - `cmd/metrics-v2.go:L3646` — `getClusterErasureSetHealingDrivesMD`
 - `cmd/metrics-v2.go:L3650` — name `erasure_set_healing_drives`
-- `cmd/metrics-v3-cache.go:L256` — `newClusterStorageInfoCache` (1-minute TTL cache)
+- `cmd/metrics-v3-cache.go:L256` — `newClusterStorageInfoCache` (builds the cluster storage-info cache)
+- `cmd/metrics-v3-cache.go:L273-275` — `NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadStorageInfo)` (1-minute TTL, `ReturnLastGood` on the drive-count aggregate cache)
+- `cmd/metrics-v3-types.go:L239-245` — zero-gauge suppression guard: `// If valid non zero value set the metrics` + `if value > 0 { m.values[name] = append(v, metricValue{Labels: labelMap, Value: value}) }` (drops the `drives_offline_count` series while its value is 0)
 - `cmd/metrics-router.go:L41` — `EnvPrometheusAuthType = "MINIO_PROMETHEUS_AUTH_TYPE"`
 - `cmd/metrics-router.go:L49` — `prometheusPublic prometheusAuthType = "public"`
 - `cmd/metrics-router.go:L56` — default JWT auth
