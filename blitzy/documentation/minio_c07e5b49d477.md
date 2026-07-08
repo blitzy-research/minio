@@ -848,7 +848,11 @@ $ mc admin info obs
 
 and the Prometheus cluster metrics expose the offline gauges directly (the v3 metric name constants are
 `healthDrivesOfflineCount = "drives_offline_count"` at `cmd/metrics-v3-cluster-health.go:23` and the per‑drive
-`driveOfflineCount = "offline_count"` at `cmd/metrics-v3-system-drive.go:60`). Filtering the full metrics dump
+`driveOfflineCount = "offline_count"` at `cmd/metrics-v3-system-drive.go:60`). The reproduced dump below is
+taken from the **v2** cluster metrics endpoint (`/v2/metrics/cluster`, `cmd/metrics-router.go:30`), whose metric
+family names are the older `minio_cluster_*` series (for example `minio_cluster_drive_offline_total`, with HELP
+`"Total drives offline in this cluster"` at `cmd/metrics-v2.go:583`); it surfaces the same offline drive gauges
+those v3 name constants define. Filtering the full metrics dump
 to the drive gauges (each metric family printed with its `# HELP` and `# TYPE` lines):
 
 ```console
