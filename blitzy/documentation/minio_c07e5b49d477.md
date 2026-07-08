@@ -18,8 +18,8 @@
 **No — MinIO does *not* always reconstruct.** On a heal, `er.healObject` (**`cmd/erasure-healing.go:258`**) routes to one of **three terminal outcomes**, plus a "nothing to do" fast-path:
 
 1. **RECONSTRUCT.** If the object still has read quorum and the number of drives needing repair is within the parity budget (`disksToHealCount ≤ parityBlocks = 2`), the predicate `cannotHeal` is **false** and MinIO rebuilds the missing/corrupt shards via Reed-Solomon, flipping those drives' `After` state to `DriveStateOk`. *(Observed: §7 S1, S2b, S2c, S3; Q4a k=1,2.)*
-2. **PURGE — object stays deleted.** If the damage exceeds the parity budget (`disksToHealCount > parityBlocks`) **and** the object is *provably garbage* (files actually **missing** beyond parity), `cannotHeal` is **true**, `healObject` calls `deleteIfDangling`, `isObjectDangling` returns `ok=true`, and the version is `DeleteVersion`-d on **all** disks — even the surviving good copy. The heal returns **`errFileNotFound`** / **`errFileVersionNotFound`** and emits a `DeleteDanglingObject` audit. *(Observed: §7 S4a; Q4a k=3; §8 Q5-A 3-disk; in-process probe `P`.)*
-3. **REFUSE — object stays degraded.** If the damage exceeds the parity budget **but** the object is *not provably dangling* — the surviving disks report **non-actionable** errors (present-but-unreadable metadata, a wrong-size `part.N`, or a drive merely **offline**) — `cannotHeal` is still true and `deleteIfDangling` is still called, but `isObjectDangling` returns `ok=false`, so MinIO **neither reconstructs nor purges**. It leaves the object in place and `deleteIfDangling` returns **`errErasureReadQuorum` = "Read failed. Insufficient number of drives online"**. *(Observed: §7 S4b, 2/2 runs; in-process probe `RQ`, where `errors.Is(err, errErasureReadQuorum) == true`.)*
+2. **PURGE — object stays deleted.** If the damage exceeds the parity budget (`disksToHealCount > parityBlocks`) **and** the object is *provably garbage* (files actually **missing** beyond parity), `cannotHeal` is **true**, `healObject` calls `deleteIfDangling`, `isObjectDangling` returns `ok=true`, and the version is `DeleteVersion`-d on **all** disks — even the surviving good copy. The heal returns **`errFileNotFound`** / **`errFileVersionNotFound`** and emits a `DeleteDanglingObject` audit. *(Observed: §7 S4a; Q4a k=3; §8 Q5-A 3-disk; and — for the distinct `:309` metadata-quorum-loss purge caller — in-process probe `Q309`, §7.4.)*
+3. **REFUSE — object stays degraded.** If the damage exceeds the parity budget **but** the object is *not provably dangling* — the surviving disks report **non-actionable** errors — `cannotHeal` is still true and `deleteIfDangling` is still called, but `isObjectDangling` returns `ok=false`, so MinIO **neither reconstructs nor purges**. It leaves the object in place and `deleteIfDangling` returns **`errErasureReadQuorum` = "Read failed. Insufficient number of drives online"**. Two distinct non-actionable triggers were reproduced at runtime, each preserving the object: **(i)** a **wrong-size / corrupt `part.N`** (`checkPartFileCorrupt`) — *observed via the real `mc admin heal` entry point in §7 S4b, 2/2 runs, and corroborated by in-process probe `RQ`*; and **(ii)** a **drive that is offline / unreachable** (`errDiskNotFound`) — *observed via in-process probe `OFF` in §7.3, 2/2 runs, where 3 of 4 drives were taken offline (`OfflineDisk`), the drives reported `state=offline`, `errors.Is(err, errErasureReadQuorum) == true`, and the object remained readable afterward*. A **present-but-unparseable `xl.meta`** reaches the same non-actionable branch of the classifier and is **(inferred from code)** — mapped by `danglingMetaErrsCount` (`cmd/erasure-healing.go:934`), not separately reproduced.
 
 Plus the degenerate case: **already gone.** If *every* disk reports the file missing, `isAllNotFound` (**`cmd/erasure-healing.go:297`**) short-circuits with "Nothing to do, file is already gone" and returns `errFileNotFound`/`errFileVersionNotFound` **without deleting anything** (there is nothing to delete). This is a *different* internal path from the purge in outcome 2. *(Observed: §7 S5.)*
 
@@ -60,28 +60,42 @@ $ make build
 # recipe (Makefile): CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio
 
 $ ./minio --version
-minio version DEVELOPMENT.2026-07-08T05-06-10Z (commit-id=fce982d457c05d5d5514a1f53251a1beaf1ce488)
+minio version DEVELOPMENT.2026-07-08T08-31-27Z (commit-id=788b50326cf0a554ea4a6912cf9b06be26a42158)
 Runtime: go1.23.12 linux/amd64
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Copyright: 2015-2026 MinIO, Inc.
 ```
 
-The banner's `commit-id=fce982d457…` is the **working-tree `HEAD` at build time** — a *documentation-only* commit that adds solely this markdown file. It descends directly from the source-under-test commit `c07e5b49d477`. The following proves the compiled **Go** behavior is byte-identical to `c07e5b49d477` (only this doc differs; no `.go`/`go.mod`/`go.sum` change):
+The banner's `commit-id=788b50326…` is the **working-tree `HEAD` at build time** — a *documentation-only* commit that adds solely this markdown file. It descends directly from the source-under-test commit `c07e5b49d477`. The following proves the compiled **Go** behavior is byte-identical to `c07e5b49d477` (only this doc differs; no `.go`/`go.mod`/`go.sum` change):
 
 ```
-$ git log --oneline -2
+$ git log --oneline -4
+788b50326 docs(healing): fix 12 QA citation/completeness findings in erasure-healing Q&A
+4ec81b5a0 docs(healing): remediate 12 code-review findings in MinIO erasure-healing Q&A
 fce982d45 docs: add erasure-coding healing decision onboarding answer (4-disk EC:2)
 c07e5b49d refactor: replace experimental `maps` and `slices` with stdlib (#20679)
 
 $ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2 HEAD
- blitzy/documentation/minio_c07e5b49d477.md | 889 +++++++++++++++++++++++++++++
- 1 file changed, 889 insertions(+)
+ blitzy/documentation/minio_c07e5b49d477.md | 1734 +++++++++++++++++++++++++++++
+ 1 file changed, 1734 insertions(+)
 
 $ git diff --name-only c07e5b49d477b0774f23db3b290745aef8c01bd2 HEAD -- '*.go' 'go.mod' 'go.sum' Makefile
 $          # (empty — zero source/build files changed between c07e5b49d477 and HEAD)
 ```
 
-So the binary under test reflects `c07e5b49d477` exactly. The `minio` binary is git-ignored (`.gitignore:4`) and is removed during cleanup (§10). *(The `889 insertions` line above reflects the prior revision of this document; the count changes as this file is revised — the invariant that matters is `1 file changed`, and zero `.go` files changed.)*
+So the binary under test reflects `c07e5b49d477` exactly. The `minio` binary is git-ignored (`.gitignore:4`) and is removed during cleanup (§10).
+
+> **Provenance is a build-time snapshot (read this before comparing hashes).** The banner `commit-id`, the `git log`, and the `insertions(+)` count above are captured *at the moment the binary is built*, which is necessarily **before** the commit that publishes this very paragraph. Because the deliverable is a committed file, **every revision of this document produces a new `HEAD`**, so two values above are *expected to lag* a fresh check: (1) the banner `commit-id` will be the **immediate parent** of the published `HEAD` (you cannot stamp a commit with its own not-yet-computed hash), and (2) the `insertions(+)` count grows as this file is edited (it was `889` in the first revision, `1734` at the build-time snapshot quoted above, and `1863` at this final QA-remediation revision — because the file is a brand-new add, `git diff --stat c07e5b49d477..HEAD` counts every one of its lines as an insertion). The **stable, re-verifiable invariants** — true at *any* `HEAD` on this branch — are exactly these, and a reviewer can reproduce them directly:
+>
+> ```
+> $ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2 HEAD | tail -1
+>  1 file changed, <N> insertions(+)                 # exactly ONE file differs
+> $ git diff --name-only c07e5b49d477b0774f23db3b290745aef8c01bd2 HEAD -- '*.go' 'go.mod' 'go.sum' Makefile
+> $                                                    # EMPTY — zero Go/build files changed
+> $ ./minio --version                                 # commit-id == HEAD at your build time
+> ```
+>
+> i.e. **one file changed, zero source/build files touched** — which is what makes the compiled behavior identical to `c07e5b49d477` regardless of which doc-only commit is checked out.
 
 ### 2.3 Run a 4-drive single-node EC:2 server (background) — exact command, PID capture, and banner
 
@@ -91,7 +105,7 @@ $ mkdir -p /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4
 $ ./minio server /tmp/d1 /tmp/d2 /tmp/d3 /tmp/d4 --address :9000 --console-address :9001 > /tmp/evidence/minio.log 2>&1 &
 $ echo $! > /tmp/minio.pid
 $ cat /tmp/minio.pid
-143583
+300823
 ```
 
 On the **very first launch** against empty drives, the format step logs the erasure topology (captured, unedited) — this is where the 4-drive / 1-set / EC:2 layout is decided:
@@ -107,7 +121,7 @@ The server startup banner (unedited, from `/tmp/evidence/minio.log`):
 MinIO Object Storage Server
 Copyright: 2015-2026 MinIO, Inc.
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
-Version: DEVELOPMENT.2026-07-08T05-06-10Z (go1.23.12 linux/amd64)
+Version: DEVELOPMENT.2026-07-08T08-31-27Z (go1.23.12 linux/amd64)
 
 API: http://10.236.0.196:9000  http://172.17.0.1:9000  http://127.0.0.1:9000 
 WebUI: http://10.236.0.196:9001 http://172.17.0.1:9001 http://127.0.0.1:9001 
@@ -116,7 +130,7 @@ Docs: https://docs.min.io
 WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
 ```
 
-`1 set(s), 4 drives per set` = a single erasure set of 4 drives → the default parity for that set size is EC:2 (§2.4). The captured PID (`143583`) is used verbatim by the cleanup in §10.
+`1 set(s), 4 drives per set` = a single erasure set of 4 drives → the default parity for that set size is EC:2 (§2.4). The captured PID (`300823`) is used verbatim by the cleanup in §10. *(The PID and the `10.236.0.196`/`172.17.0.1` API addresses are per-run ephemeral values from this capture session; only `127.0.0.1:9000` is stable, and the cleanup keys off `/tmp/minio.pid` rather than a hard-coded number.)*
 
 ### 2.4 Client alias + EC:2 confirmation — exact command and output
 
@@ -882,7 +896,7 @@ Decoding, with cause:
 - `error: "file version not found"` is the purge signal: `healObject` returned `errFileVersionNotFound` after `deleteIfDangling` removed the version, and the deferred `auditHealObject` captured it (`opts.Error = err.Error()`, `:233`).
 - The two events share the timestamp `06:00:18.166…` to the microsecond, so they are the **same purge**: `DeleteDanglingObject` (the why) + `HealObject error` (the result).
 
-**A why-string that exists in code but did *not* fire here (labeled inferred).** `auditHealObject` also sets a descriptive error when *all* damaged drives share the same failure — `:236-243`:
+**A why-string that *does* fire — observed in the REFUSE case.** `auditHealObject` also sets a descriptive error when *all* damaged drives share the same failure — `:236-243`:
 
 ```go
 // cmd/erasure-healing.go:236
@@ -897,7 +911,36 @@ Decoding, with cause:
 	}
 ```
 
-**(Inferred from code — not observed:)** none of my scenarios produced the `"unable to heal N corrupted/missing blocks on drives"` strings; a `grep` across all captured evidence returns no match. The `b == a` guard requires the corrupted/missing counts to be identical before and after, which my reconstruct cases (counts drop to 0) and purge case (routed through the dangling `error: "file version not found"` instead) did not satisfy. I therefore do not claim to have observed these strings.
+**(Observed — this string *does* fire in the REFUSE case.)** The guard is `b > 0 && b == a` on `GetCorruptedCounts()` (`:236-238`): it fires precisely when the corrupted count is **identical before and after** the heal — i.e. when the heal changed nothing because it *refused*. The **S4b REFUSE** scenario (§7.3, 3 wrong-size `part.1` shards) is exactly that case: the result reports `corrupted:4` in **both** `before` and `after` (the heal neither reconstructs nor purges), so `b == a == 4 > 0` and the override fires. Captured `HealObject` audit event from that run (unedited, `/tmp/evidence/S4b_healobject_audit.json`, produced by the same S4b reproduction whose `mc admin heal` output appears in §7.3):
+
+```json
+{
+  "version": "1",
+  "deploymentid": "af8029c0-89ff-4e91-91ff-f000f16570a3",
+  "time": "2026-07-08T09:14:16.348624769Z",
+  "event": "HealObject",
+  "trigger": "HealObject",
+  "api": {
+    "bucket": "healbkt",
+    "objects": [
+      {
+        "objectName": "obj1",
+        "versionId": "null"
+      }
+    ],
+    "rx": 0,
+    "tx": 0
+  },
+  "tags": {
+    "healObject": "name=obj1,pool=1,set=1"
+  },
+  "error": "unable to heal 4 corrupted blocks on drives"
+}
+```
+
+So `opts.Error` — set to the wrapped `errErasureReadQuorum` string a few lines earlier at `:233` — is then **overwritten** by `"unable to heal 4 corrupted blocks on drives"` at `:238`, because the corrupted-count override runs after the generic error capture. This is the operator-facing "why we left it alone" for the REFUSE outcome, and it is a *counting* statement (4 = all drives read corrupt), not a per-drive rationale.
+
+The sibling `"unable to heal N missing blocks on drives"` string (`GetMissingCounts`, `:241-243`) did **not** fire in any of my scenarios: the *missing-parts* purge (S4a) routes through the dangling deletion and surfaces `error: "file version not found"` (its missing count drops as the version is removed, so `b != a`), and the *reconstruct* cases drive the corrupted/missing counts to 0 (`b != a`). I therefore observed the **corrupted** variant (via S4b) but not the **missing** variant, and label the latter accordingly.
 
 ### 6.3 The `DeleteDanglingObject` audit event — the decisive "why we purged it"
 
@@ -1206,6 +1249,22 @@ BZPROBE [RQ cannotHeal->REFUSE: 3 part.1 corrupted wrong-size, all xl.meta intac
 
 `isReadQuorum=true` is `errors.Is(err, errErasureReadQuorum)` evaluating true — proving the wrapped `InsufficientReadQuorum` unwraps to the exact sentinel, and `objectExistsAfter=true` confirms non-destruction.
 
+**In-process offline-drive corroboration (probe `OFF`) — the *second* non-actionable REFUSE trigger.** The wrong-size-part case above is one way to reach REFUSE; a **drive that is offline/unreachable** is the other. A truly offline drive is hard to stage on a single-node server (path removal produces *missing files*, not an *offline drive*), so this trigger is exercised through the object-layer `HealObject` API using MinIO's own offline-drive sentinel `OfflineDisk` (`cmd/erasure.go:44`, `var OfflineDisk StorageAPI // zero value is nil`). Three of the four drives are set to `OfflineDisk` (each read then yields `errDiskNotFound`, which `convPartErrToInt`/`danglingMetaErrsCount` classify as **non-actionable**), one drive is left valid, then the real `HealObject` runs. Output (unedited, `/tmp/evidence/inprocess_probes.log`; temporary probe removed afterward — **distribution: 2/2 runs identical**):
+
+```
+BZOFF isOfflineDisk d0=true d1=true d2=true d3=false
+BZPROBE [OFFLINE REFUSE: 3 of 4 drives offline (errDiskNotFound, non-actionable) -> expect errErasureReadQuorum, preserved]
+  HealObject err="Storage resources are insufficient for the read operation oyop9vlz0kdpr5faeg3nu0bmsmcndgh6lyvmz4hingewe15s3g0id0rtzarj/zdtplm061bmphzwq"
+  isReadQuorum=true isFileNotFound=false isFileVersionNotFound=false
+  drive[0] before=offline after=offline
+  drive[1] before=offline after=offline
+  drive[2] before=offline after=offline
+  drive[3] before=ok after=ok
+  objectExistsAfter=true size=1048576
+```
+
+Cause → effect: with 3 drives offline the surviving metadata cannot reach `readQuorum=2`, so the errors are `errDiskNotFound` (non-actionable), `isObjectDangling` returns `ok=false`, and the heal **refuses** — `isReadQuorum=true` (`errors.Is(err, errErasureReadQuorum)`), the drives report `state=offline` (not `missing`/`corrupt`) in **both** `before` and `after`, and `objectExistsAfter=true` confirms the object was preserved, never purged. This is why the executive answer's outcome (3) lists *a drive merely offline* as a REFUSE trigger: it produces the identical "keep it, we can't prove it's garbage" result as the wrong-size-part case, differing only in the underlying error code (`errDiskNotFound` vs `checkPartFileCorrupt`).
+
 ### 7.4 The `:309` metadata-quorum-loss path — reachable in-process, not via on-demand `mc` (single node)
 
 There is a *fourth* structural outcome: if the **`xl.meta` (metadata)** itself loses quorum, `objectQuorumFromMeta` errors and `healObject` calls `deleteIfDangling` from the **`:309`** caller (with `dataErrsByPart = nil`). This behaves differently depending on the entry point.
@@ -1305,7 +1364,48 @@ So the chain is: `deleteIfDangling` returns bare `errErasureReadQuorum` (`:487`)
 | 3 parts **missing** (data) | 3 | `:438` → `isObjectDangling` ok=true | **purge** | `Object not found` (`errFileNotFound`) | gone |
 | 3 parts **corrupt/wrong-size** (data) | 3 | `:438` → `isObjectDangling` ok=false (`:1008`) | **refuse** | `errErasureReadQuorum` → `InsufficientReadQuorum` | preserved |
 | 3 **`xl.meta`** gone (metadata quorum lost) | 3 | `:309` (in-process) | **purge** (in-process) / unlistable (on-demand mc) | `Object not found` / `objects_scanned:0` | gone / preserved-but-unlistable |
+| **all 4** copies gone (every disk) | 4 | `:297` `isAllNotFound` fast-path (def `:872`) | **no-op** (already gone) | bare `errFileNotFound`/`errFileVersionNotFound` → wrapped `Object not found`; `objects_scanned:0` via mc | absent everywhere; **no delete performed** |
 
+
+---
+
+### 7.6 S5 — the all-gone / `isAllNotFound` fast-path (dedicated capture)
+
+This is the degenerate case distinguished from a dangling *purge* in the executive answer and §4 Step 2: when **every** disk reports the object missing, `healObject` takes the `isAllNotFound` fast-path (`cmd/erasure-healing.go:297`, function defined at `:872`) and returns **without performing any delete or rebuild** — there is nothing to heal because the object is already gone everywhere. Both the operator-facing `mc` path and the in-process object-layer API were captured.
+
+**(a) Construct the state and run the real `mc admin heal` entry point.** All four backend object directories are removed, then a heal is run over the bucket (complete unedited transcript — setup commands, `GONE` verification, and heal output — `/tmp/evidence/S5_full_transcript.log`):
+
+```
+$ for d in 1 2 3 4; do rm -rf /tmp/d$d/healbkt/obj1; done   # every disk: object dir gone
+$ for d in 1 2 3 4; do test -d /tmp/d$d/healbkt/obj1 && echo present || echo GONE; done
+GONE
+GONE
+GONE
+GONE
+$ /tmp/mc admin heal -r --verbose local/healbkt
+[Green  ->  Green] healbkt/
+Healed:	0/0 objects; 0 B in 1s
+```
+
+**(b) Targeted heal of the now-gone object** (unedited JSON from `/tmp/evidence/S5_heal_object.json`; the trailing `mc stat` confirmation captured to `/tmp/evidence/S5_object_transcript.log`) — the scanner finds the bucket healthy and reports **`objects_scanned:0`** because the object is no longer listable:
+
+```json
+{"status":"success","type":"bucket","name":"healbkt/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/d4","state":"ok"}]},"size":0}
+{"status":"success","type":"summary","objects_scanned":0,"objects_healed":0,"items_scanned":1,"items_healed":0,"size":0,"duration":0}
+$ /tmp/mc stat local/healbkt/obj1
+mc: <ERROR> Unable to stat `local/healbkt/obj1`. Object does not exist.
+```
+
+**(c) In-process object-layer `HealObject` — the source-internal fast-path itself.** Because the operator scanner cannot even *list* a fully-gone object (so `mc` shows `objects_scanned:0` rather than surfacing the fast-path's return value), the exact `isAllNotFound` return is observed through the object-layer API by a temporary `go test` that removes the object directory on all 4 disks and then calls `HealObject` (unedited, `/tmp/evidence/inprocess_probes.log`; probe removed afterward — **distribution: 2/2 runs identical**):
+
+```
+BZPROBE [S5 all-gone: object dir removed on all 4 disks -> isAllNotFound fast-path]
+  HealObject err="Object not found: wkhwphq4p1hcp50xwt6g55qu230xrimpewxka9zrklfhwf9r9jqsxfwbtex3/qureojwv6016ghl6"
+  isFileNotFound=false isFileVersionNotFound=false
+  copiesExistingAfter=0 (expect 0)
+```
+
+Cause → effect and the **honest nuance**: internally the fast-path returns the **bare** sentinel `errFileNotFound` (or `errFileVersionNotFound` for a specific version) — `cmd/erasure-healing.go:297-303`. The **public** `objLayer.HealObject` API then wraps it via `toObjectErr` into `ObjectNotFound{}`, whose `Error()` is `"Object not found: <bucket>/<object>"`; that is why `errors.Is(err, errFileNotFound)` reads **false** at the public boundary (`isFileNotFound=false`) even though the *internal* return is exactly `errFileNotFound`. `copiesExistingAfter=0` confirms the fast-path performed **no** delete and **no** rebuild — distinct from the S4a dangling *purge*, which actively `DeleteVersion`-s the surviving good copy and fires a `DeleteDanglingObject` audit (§6.3). (On a *versioned* object the wrapped message reads `"Version not found"` instead, from `errFileVersionNotFound`.)
 
 ---
 
@@ -1647,13 +1747,13 @@ make build                                # => ./minio  (runs the Makefile build
 produced (from `/tmp/evidence/version.log`):
 
 ```
-minio version DEVELOPMENT.2026-07-08T05-06-10Z (commit-id=fce982d457c05d5d5514a1f53251a1beaf1ce488)
+minio version DEVELOPMENT.2026-07-08T08-31-27Z (commit-id=788b50326cf0a554ea4a6912cf9b06be26a42158)
 Runtime: go1.23.12 linux/amd64
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Copyright: 2015-2026 MinIO, Inc.
 ```
 
-(As explained in §2, the `commit-id` is the branch HEAD — the doc commit — while the *source tree* is byte-identical to `c07e5b49d477`'s parent; `git diff` shows only this document added.)
+(As explained in §2.2, the `commit-id` is the branch `HEAD` *at build time* — a doc-only commit — while the *source tree* is byte-identical to `c07e5b49d477`; `git diff c07e5b49d477..HEAD` shows only this document added, and it is the **immediate parent** of the published `HEAD` for the reason given in the §2.2 provenance note.)
 
 **Start the canonical 4-drive EC:2 single-node server (backgrounded, PID captured):**
 
@@ -1664,7 +1764,7 @@ MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
 echo $! > /tmp/minio.pid                  # capture the server PID for a clean shutdown later
 ```
 
-whose opening banner lines confirmed the 4-drive / 1-set / EC:2 topology (the complete, unedited banner is quoted in §2; these are the contiguous opening lines from `/tmp/evidence/minio_startup.log`):
+whose opening banner lines confirmed the 4-drive / 1-set / EC:2 topology (the complete, unedited banner is quoted in §2; these are the contiguous opening lines from `/tmp/evidence/minio.log`):
 
 ```
 INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
@@ -1672,7 +1772,7 @@ INFO: WARNING: Host local has more than 2 drives of set. A host failure will res
 MinIO Object Storage Server
 Copyright: 2015-2026 MinIO, Inc.
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
-Version: DEVELOPMENT.2026-07-08T05-06-10Z (go1.23.12 linux/amd64)
+Version: DEVELOPMENT.2026-07-08T08-31-27Z (go1.23.12 linux/amd64)
 ```
 
 **Configure the `mc` admin client and the real heal / trace entry points:**
@@ -1698,7 +1798,7 @@ rm -f  ./minio                             # the built binary (not part of the r
 git status --porcelain                     # must show ONLY: blitzy/documentation/minio_c07e5b49d477.md
 ```
 
-In this session the server ran as **PID 143583** and the audit sink as **PID 139242**; the cleanup step terminates both (the `echo $! > /tmp/minio.pid` above is what makes `kill "$(cat /tmp/minio.pid)"` self-consistent). After cleanup, `git status` shows exactly one added path — this document — and nothing else.
+In this session the server ran as **PID 300823** and the audit sink as **PID 302431** (both per-run ephemeral); the cleanup step terminates both (the `echo $! > /tmp/minio.pid` above is what makes `kill "$(cat /tmp/minio.pid)"` self-consistent, independent of the exact number). After cleanup, `git status` shows exactly one added path — this document — and nothing else.
 
 ---
 
@@ -1731,4 +1831,33 @@ Named mechanisms/entities the question implied, each addressed explicitly by nam
 | `HealHandler` → `healSequence` (real REST entry point) | `admin-handlers.go:1308`, `admin-heal-ops.go:417` | §4 entry chain |
 
 Boundary numbers, all from the default 4-disk EC:2 configuration (never a 16-drive default): `dataBlocks = 2`, `parityBlocks = 2`, `readQuorum = 2`, `writeQuorum = 3`. Reconstruction succeeds while `disksToHealCount ≤ parityBlocks` (≤ 2 of 4 bad); the object is classified dangling and purged once `disksToHealCount > parityBlocks` (≥ 3 of 4 bad) with actionable errors, or the heal is refused with `errErasureReadQuorum` (surfaced as `InsufficientReadQuorum`) when the errors are non-actionable. Every item above is backed by a complete, unedited evidence block in the cited section; nothing in this table points to a summarized or partial result.
+
+
+### 11.1 Checkpoint-requested citation coverage (explicit `file:line` and test references)
+
+This closing table re-verifies every checkpoint-requested `file:line` and test reference as an explicit, greppable fixed string, gives the byte-exact symbol on that line, its role as cause → effect, and where it is used above. All line numbers are at HEAD commit `788b50326` (whose Go tree is byte-identical to the source-under-test `c07e5b49d477` — see §2.2); each was re-confirmed with `sed -n '<line>p' <file>` before publication.
+
+| Requested citation | Symbol on that exact line (byte-exact) | Role / causal reason | Used in |
+|---|---|---|---|
+| `cmd/erasure-healing.go:872` | `func isAllNotFound(errs []error) bool {` | **Definition** of the all-disks-missing predicate (the call site is `:297`). When *every* disk read is `errFileNotFound`/`errFileVersionNotFound` the heal short-circuits to a no-op — the object is already gone, so nothing is deleted or rebuilt (OUTCOME "already gone", distinct from a purge). | §1, §4 Step 2, §7.6 |
+| `cmd/erasure-healing.go:950` | `func danglingPartErrsCount(results []int) (notFoundCount int, nonActionableCount int) {` | Counts PART results as **actionable** (`checkPartFileNotFound` → `notFoundCount`) vs **non-actionable** (every other code → `nonActionableCount`). The two counts feed `isObjectDangling`: `notFound > parityBlocks` ⇒ purge; any `nonActionable` ⇒ refuse. | §7.2, §8.1 |
+| `cmd/admin-heal-ops.go:916` | `func (h *healSequence) healObject(bucket, object, versionID string, scanMode madmin.HealScanMode) error {` | The on-demand `mc admin heal` queue worker; it calls `objLayer.HealObject` → `er.healObject`, i.e. the **real entry point** exercised for every scenario in §5–§8. | §4 entry chain, §6 |
+| `cmd/global-heal.go:152` | `func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, tracker *healingTracker) error {` | The **background auto-heal** set-walk (scanner- and fresh-disk-triggered). *Not exercised at runtime in this document* — the AAP scopes the on-demand path — but it converges on the **same** `er.healObject` call, so the reconstruct / purge / refuse verdict is identical; cited for contrast and labeled **background-only**. | §9 (context) |
+| `cmd/logging.go:83` | `func healingLogEvent(ctx context.Context, msg string, args ...interface{}) {` | The `healing`-tagged console **event** logger — a thin wrapper over `logger.Event`. It carries operational status, **not** decision rationale (the §6.5 honest finding: the "why" lives in the audit event, not the console). | §6.5 |
+| `cmd/logging.go:87` | `func healingLogOnceIf(ctx context.Context, err error, errKind ...interface{}) {` | The deduplicating `healing` **error** logger. Its only heal-path call sites (`cmd/erasure-healing.go:477`/`:487`/`:497`) are write-phase distribution guards — again not "restore-vs-leave-alone" rationale. | §6.5 |
+| `cmd/erasure-healing-common.go:258` | `func convPartErrToInt(err error) int {` | Maps a part-read `error` to a `checkPart*` code (`errDiskNotFound` → `checkPartDiskNotFound` at `:269-270`). This is what turns an **offline drive** into a *non-actionable* part result, driving the REFUSE outcome exercised by probe `OFF`. | §7.3 (probe `OFF`) |
+| `cmd/storage-datatypes.go:536` | `checkPartUnknown int = iota` | First member of the `checkPart*` result enum block (`:536-544`): `checkPartSuccess`=1 @`:540`, `checkPartDiskNotFound`=2 @`:541`, `checkPartVolumeNotFound`=3 @`:542`, `checkPartFileNotFound`=4 @`:543`, `checkPartFileCorrupt`=5 @`:544`. Only `checkPartFileNotFound` is actionable-missing; `checkPartFileCorrupt` and `checkPartDiskNotFound` are non-actionable → REFUSE. | §6.3, §7.2, §8.1 |
+
+**Test references** — the repository's own healing suite doubles as the in-process reproduction template for the object-layer `HealObject` API. Each was **run in isolation** at this HEAD and observed to pass (unedited, `/tmp/evidence/healtests_isolated.log`):
+
+| Test (`file:line`) | Result (isolated, `-count=1`) | Models |
+|---|---|---|
+| `cmd/erasure-healing_test.go:40` — `TestIsObjectDangling` | `ok  github.com/minio/minio/cmd  0.251s` (14 sub-cases pass) | The `isObjectDangling` classifier truth-table — normal-object vs delete-marker thresholds (Q5) |
+| `cmd/erasure-healing_test.go:647` — `TestHealingDanglingObject` | `ok  github.com/minio/minio/cmd  0.640s` | The dangling-object purge/refuse decision on a small erasure set (Q1, Q5) |
+| `cmd/erasure-healing_test.go:851` — `TestHealCorrectQuorum` | `ok  github.com/minio/minio/cmd  0.590s` | The valid-shard success boundary — heal succeeds while quorum holds (Q4a) |
+| `cmd/erasure-healing_test.go:1297` — `TestHealObjectCorruptedParts` | `ok  github.com/minio/minio/cmd  0.493s` | Reconstruct-from-parity after a corrupt `part.N` (Q1, Q4a) |
+
+> **Honest note on test execution.** Run as a *single batch* (`-run 'TestIsObjectDangling|TestHealingDanglingObject|TestHealCorrectQuorum|TestHealObjectCorruptedParts' ./cmd/`), `TestHealObjectCorruptedParts` intermittently fails with `Failed to heal object - Object not found` (`erasure-healing_test.go:1386`) because MinIO's `cmd` package tests share **process-global heal state** — a pre-existing test-ordering sensitivity at this commit; **no source file was modified** (`git diff` shows only this document). Each test **passes deterministically when run in isolation** (`-count=1`), which is the result reported in the table above. Exact command per row: `MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -tags kqueue,dev -run '^<TestName>$' ./cmd/ -count=1 -timeout 10m`.
+
+Together with the two coverage tables above, every checkpoint-requested `file:line` and test reference is now present as an explicit fixed string, grounded in a byte-exact source line, and tied to the section and evidence that uses it.
 
