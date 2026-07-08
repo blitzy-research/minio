@@ -1036,9 +1036,10 @@ answer Q4.
 
 ### 7.2 DURING (drive4 offline, 3 online)
 
-Same commands as §7.1. The cluster-aggregate v2/v3 series are served from a 1-minute TTL cache
-(§7.5), so these were scraped after the cache window rolled over so the transition is visible; the
-per-set series and `mc admin info` reflect the change live.
+Same commands as §7.1. The cluster-aggregate v2/v3 series **and** the per-erasure-set series are
+each served from a 1-minute TTL cache (§7.5), so all three were scraped after their cache window
+rolled over so the transition is visible; only `mc admin info` reflects the change immediately — it
+queries live per-node disk state, not the metrics cache (see §7.5).
 
 - v3 health metrics:
 
@@ -1161,9 +1162,39 @@ unedited outputs of the same commands:
   i.e. the `1*time.Minute` TTL (`L273`) and `ReturnLastGood: true` (`L274`) are set on that
   `NewFromFunc` call. Therefore, depending on scrape timing relative to the cache window, the
   online/offline transition appears either immediately (cache expired) or lags by up to ~1 minute.
-  In contrast, the per-erasure-set metric and `mc admin info` reflect LIVE `StorageInfo`
-  immediately. A reader who scrapes right after inducing failure and sees stale counts is observing
-  this cache, not a bug.
+- **The per-erasure-set metric is ALSO 1-minute-TTL cached — it is NOT live.** The per-set loader
+  `loadClusterErasureSetMetrics` reads the drive count from a cache, not from a live call:
+  `result, _ := c.esetHealthResult.Get()` (`cmd/metrics-v3-cluster-erasure-set.go:L84`), and the
+  online count is set from `h.HealthyDrives` of that cached result at
+  `cmd/metrics-v3-cluster-erasure-set.go:L95`. The `esetHealthResult` cache is built by
+  `newESetHealthResultCache` (`cmd/metrics-v3-cache.go:L103-116`) as
+  `cachevalue.NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadHealth)`
+  (`L113-115`), whose `loadHealth` calls `objLayer.Health(GlobalContext, HealthOptions{})` (`L110`)
+  — i.e. it reads `Health()`, **not** `StorageInfo`. So this metric lags a drive-state change by up
+  to ~1 minute, exactly like the v2/v3 aggregates above. Observed on this cluster (drive4 induced
+  offline at t=0, then later restored; `mc admin info` scraped in parallel with the per-set metric
+  `minio_cluster_erasure_set_online_drives_count` at each timestamp):
+
+  ```
+  # DEGRADE  (drive4 -> offline at t=0)
+  t+3s    mc admin info: 3 drives online, 1 drive offline    per-set online_drives_count = 4  (stale)
+  t+35s   mc admin info: 3 drives online, 1 drive offline    per-set online_drives_count = 4  (stale)
+  t+45s   mc admin info: 3 drives online, 1 drive offline    per-set online_drives_count = 3  (updated)
+  # RESTORE (drive4 -> back online at t=0)
+  t+5s    mc admin info: 4 drives online, 0 drives offline   per-set online_drives_count = 3  (stale)
+  t+55s   mc admin info: 4 drives online, 0 drives offline   per-set online_drives_count = 3  (stale)
+  t+65s   mc admin info: 4 drives online, 0 drives offline   per-set online_drives_count = 4  (updated)
+  ```
+
+  In both transitions `mc admin info` reports the new count within a few seconds while the per-set
+  gauge holds its stale value until the cache window rolls over (~1 minute).
+- **Only `mc admin info` reflects the change immediately.** It is served by `getServerInfo`
+  (`cmd/admin-handlers.go:L2369`), which builds the drive counts from a live per-node query —
+  `globalNotificationSys.ServerInfo(...)` plus the local server's properties, reduced by
+  `getOnlineOfflineDisksStats(allDisks)` (`cmd/admin-handlers.go:L2434`) — and therefore does
+  **not** go through any of the 1-minute metrics caches. A reader who scrapes any of the drive-count
+  metrics right after inducing failure and sees a stale count is observing these caches, not a bug;
+  corroborate the live state with `mc admin info` (or the health endpoints).
 
 ---
 
@@ -1253,6 +1284,10 @@ All citations were verified against the source at commit
 - `cmd/metrics-v2.go:L3650` — name `erasure_set_healing_drives`
 - `cmd/metrics-v3-cache.go:L256` — `newClusterStorageInfoCache` (builds the cluster storage-info cache)
 - `cmd/metrics-v3-cache.go:L273-275` — `NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadStorageInfo)` (1-minute TTL, `ReturnLastGood` on the drive-count aggregate cache)
+- `cmd/metrics-v3-cluster-erasure-set.go:L84` — `result, _ := c.esetHealthResult.Get()` (the per-erasure-set loader reads the drive count from the 1-minute cached health result, NOT a live call)
+- `cmd/metrics-v3-cache.go:L103-116` — `newESetHealthResultCache` builds the per-erasure-set health cache as `NewFromFunc(1*time.Minute, cachevalue.Opts{ReturnLastGood: true}, loadHealth)` (`L113-115`); `loadHealth` reads `objLayer.Health(GlobalContext, HealthOptions{})` (`L110`) — `Health()`, not `StorageInfo` — so the per-set drive-count metric is 1-minute-TTL cached exactly like the aggregates
+- `cmd/admin-handlers.go:L2369` — `getServerInfo` builds `mc admin info` drive counts from a live per-node query (`globalNotificationSys.ServerInfo(...)` + local server properties), bypassing the metrics caches
+- `cmd/admin-handlers.go:L2434` — `onlineDisks, offlineDisks := getOnlineOfflineDisksStats(allDisks)` reduces the live disks to the online/offline counts `mc admin info` reports immediately
 - `cmd/metrics-v3-types.go:L239-245` — zero-gauge suppression guard: `// If valid non zero value set the metrics` + `if value > 0 { m.values[name] = append(v, metricValue{Labels: labelMap, Value: value}) }` (drops the `drives_offline_count` series while its value is 0)
 - `cmd/metrics-router.go:L41` — `EnvPrometheusAuthType = "MINIO_PROMETHEUS_AUTH_TYPE"`
 - `cmd/metrics-router.go:L49` — `prometheusPublic prometheusAuthType = "public"`
