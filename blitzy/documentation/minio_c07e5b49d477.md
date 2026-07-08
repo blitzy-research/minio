@@ -1852,7 +1852,7 @@ This closing table re-verifies every checkpoint-requested `file:line` and test r
 
 | Test (`file:line`) | Result (isolated, `-count=1`) | Models |
 |---|---|---|
-| `cmd/erasure-healing_test.go:40` — `TestIsObjectDangling` | `ok  github.com/minio/minio/cmd  0.251s` (14 sub-cases pass) | The `isObjectDangling` classifier truth-table — normal-object vs delete-marker thresholds (Q5) |
+| `cmd/erasure-healing_test.go:40` — `TestIsObjectDangling` | `ok  github.com/minio/minio/cmd  0.251s` (13 sub-cases pass) | The `isObjectDangling` classifier truth-table — normal-object vs delete-marker thresholds (Q5) |
 | `cmd/erasure-healing_test.go:647` — `TestHealingDanglingObject` | `ok  github.com/minio/minio/cmd  0.640s` | The dangling-object purge/refuse decision on a small erasure set (Q1, Q5) |
 | `cmd/erasure-healing_test.go:851` — `TestHealCorrectQuorum` | `ok  github.com/minio/minio/cmd  0.590s` | The valid-shard success boundary — heal succeeds while quorum holds (Q4a) |
 | `cmd/erasure-healing_test.go:1297` — `TestHealObjectCorruptedParts` | `ok  github.com/minio/minio/cmd  0.493s` | Reconstruct-from-parity after a corrupt `part.N` (Q1, Q4a) |
