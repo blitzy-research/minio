@@ -81,17 +81,18 @@ these stamps are:
 ```
 
 > **Build note (canonical vs. current HEAD — labeled per reproducibility).** Because `gen-ldflags`
-> reads the *current* `HEAD`, a bare `make build` on the branch tip stamps the tip commit, not the
-> investigated commit. On this branch `HEAD` is the commit that merely *adds this document*
-> (`d2090ccb7452dea5fb6b0028e9533036d7ae33e2`, committed `2026-07-08T04:55:29Z`, subject
-> `docs: add single-node MinIO "first bucket" lifecycle investigation runbook`), whose parent
-> (`HEAD^`) is exactly the investigated commit `c07e5b49d477` (committed `2024-11-25T17:10:22Z`). A
-> bare build therefore reports `DEVELOPMENT.2026-07-08T04-55-29Z (commit-id=d2090ccb7452dea5fb6b0028e9533036d7ae33e2)`. Since the
-> doc-adding commit changes **only** this markdown file and **no** server code
-> (`git diff --name-only c07e5b49d477 d2090ccb7452` → `blitzy/documentation/minio_c07e5b49d477.md`),
-> runtime behavior is byte-for-byte identical. To attribute every value below to the investigated
-> commit as the AAP requires, the binary was built with the `c07e5b49d477` stamps pinned explicitly
-> (the exact `-ldflags` shown above), which reproduces the canonical `--version` output that follows.
+> reads the *current* `HEAD`, a bare `make build` on the branch tip stamps whatever commit is at the
+> tip **at build time**, not the investigated commit. On this branch the investigated commit
+> `c07e5b49d477` (committed `2024-11-25T17:10:22Z`) is the ancestor of one or more *documentation
+> commits* that add and refine this markdown file; the branch tip is therefore always a documentation
+> commit whose hash and commit-time shift as further doc/review commits are layered on top. A bare
+> build consequently reports a `DEVELOPMENT.<tip-commit-time> (commit-id=<current-tip>)` string that
+> tracks the current tip rather than `c07e5b49d477`. Since every documentation commit changes **only**
+> this markdown file and **no** server code (`git diff --name-only c07e5b49d477 HEAD` →
+> `blitzy/documentation/minio_c07e5b49d477.md`), runtime behavior is byte-for-byte identical to the
+> investigated commit. To attribute every value below to the investigated commit as the AAP requires,
+> the binary was built with the `c07e5b49d477` stamps pinned explicitly (the exact `-ldflags` shown
+> above), which reproduces the canonical `--version` output that follows.
 
 **Version banner (attributes all later evidence to this exact build).** Produced by `versionBanner`
 ([`cmd/main.go:185-193`]), which prints the ldflag-stamped `CommitID` and `CopyrightYear`:
@@ -203,7 +204,7 @@ WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that yo
   ([`cmd/server-startup-msg.go:114`]), invoked via `printStartupMessage` from `serverMain`
   ([`cmd/server-main.go:1118`]). The credential lines are gated by
   `color.IsTerminal() && (!Anonymous && !JSON && permitRootAccess())`
-  ([`cmd/server-startup-msg.go:123`]); this is the observed cause of their absence in form (a).
+  ([`cmd/server-startup-msg.go:124`]); this is the observed cause of their absence in form (a).
 - Banner text is emitted through `logger.Startup` ([`internal/logger/console.go:246`]).
 - The default‑credentials `WARN` line is the **security indicator** for Q6: the default deployment
   ships with well‑known credentials and says so, verbatim, at every startup.
@@ -614,6 +615,21 @@ Summary of the flow (verbatim `[REQUEST]`/`[RESPONSE]` lines from `trace.run1.lo
 - **(c) data written/read** = the `↑ rx / ↓ tx` counters. PutObject shows `↑ 215 B ↓ 0 B` (the 14‑byte
   body plus request headers uploaded; empty response body); **GetObject shows `↑ 82 B ↓ 14 B`** — the
   `↓ 14 B` is exactly the object read back. ListObjectsV2 shows `↓ 675 B` (the XML body).
+
+> **What `↑ rx` counts — and why its exact value is client‑header dependent.** The trace's `↑ rx` is
+> not the object payload; it is `reqRecorder.Size()` (the request *body* bytes) plus, for every request
+> header, `len(name) + len(values)` — the header *name* length plus the *number* of values in that
+> header (not the value's byte length) — after the tracer re‑adds `Host` and `Content-Length` to the
+> cloned header set ([`cmd/http-tracer.go:110-113`], with `Host`/`Content-Length` re‑added at `:104`/`:106`).
+> Because it sums header‑*name* lengths and value *counts*, `↑ rx` scales with the **number** of request
+> headers the client sends, so its exact value is client‑header‑composition dependent. The `↑ 82 B` here
+> is the minimal **six‑header** signed GET shown in the verbose block below (`Host`, `Accept-Encoding`,
+> `Authorization`, `Content-Length`, `X-Amz-Content-Sha256`, `X-Amz-Date`): name lengths
+> `4+15+13+14+20+10 = 76`, plus one per header `= 82`. A **default boto3** client sends four additional
+> headers (`User-Agent`, `X-Amz-Checksum-Mode`, `Amz-Sdk-Invocation-Id`, `Amz-Sdk-Request`) — ten headers
+> total — yielding an observed `↑ 151 B` on the *identical* 14‑byte object (`mc admin trace -v`, same
+> `hello.txt`). The data‑read quantity Q7 asks about is `↓ tx` — the response‑body bytes, `↓ 14 B` here —
+> which equals the object size exactly and is **stable** across both header compositions.
 
 Full verbose block for **PutObject `hello.txt`** (request received → operation completed), showing the
 request body as `<BLOB>` and the empty response body:
@@ -1265,10 +1281,11 @@ The default `git status --porcelain` collapses the freshly‑created `blitzy/` d
 and `blitzy/screen_recordings/` are not shown because Git does not track empty directories. This
 confirms the repository is left unchanged apart from `blitzy/documentation/minio_c07e5b49d477.md`.
 
-This snapshot is taken against the **investigated baseline commit** `c07e5b49d477` — which is `HEAD^`
-on this branch (see the build note in [Environment & canonical build](#environment--canonical-build)) —
-for which the document is a brand‑new *untracked* addition, exactly matching the AAP's "one new file,
-everything else read‑only" contract. The branch's own tip `d2090ccb7452` is simply the commit that
-records this one file; measured against it the working tree is clean. Either way, no pre‑existing
-source, config, build, or test file is touched.
+This snapshot is taken against the **investigated baseline commit** `c07e5b49d477`, the commit that
+precedes the documentation commit(s) on this branch (see the build note in
+[Environment & canonical build](#environment--canonical-build)); measured from that commit the
+document is a brand‑new *untracked* addition, exactly matching the AAP's "one new file, everything
+else read‑only" contract. On the branch itself the same single file is instead recorded by one or
+more documentation commits layered on top of `c07e5b49d477`, so measured against the branch tip the
+working tree is clean. Either way, no pre‑existing source, config, build, or test file is touched.
 
