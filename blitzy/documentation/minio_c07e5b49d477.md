@@ -433,7 +433,7 @@ Every attempt to delete a locked version is refused with the S3 error **`Invalid
 
 ### 3.2 Enforcement and error rendering (grounded)
 
-All delete-of-locked-version enforcement is in `enforceRetentionBypassForDelete` (`cmd/bucket-object-lock.go:84`). **Verbatim (no elision), `cmd/bucket-object-lock.go:99-155`:**
+All delete-of-locked-version enforcement is in `enforceRetentionBypassForDelete` (`cmd/bucket-object-lock.go:84`). **Verbatim (no elision), `cmd/bucket-object-lock.go:99-159`:**
 
 ```go
 	lhold := objectlock.GetObjectLegalHoldMeta(oi.UserDefined)
@@ -681,7 +681,7 @@ Corrupting an on-disk data shard is detected via a **HighwayHash256** checksum m
 
 Two facts about the **runtime log surface at GET time** were observed directly and must be stated plainly:
 
-- **No "file is corrupted" line is emitted during a plain GET** — neither on the server stdout nor in the admin trace stream. This is *not* an accident of log level; it is structural. The `storage.ReadFileStream` trace is published by the `defer done(length, &err)` in the disk wrapper (`cmd/xl-storage-disk-id-check.go:451`) at the moment the stream is **opened** — which *succeeds*, because a corrupt-but-present shard file opens without error. The HighwayHash mismatch (`errFileCorrupt`) only arises later, while `erasure.Decode` **consumes** the returned `io.ReadCloser` block-by-block (`cmd/bitrot-streaming.go:185`), long after that storage trace has already been published with an empty `Error` field. On the GET code path the sentinel is then **intentionally swallowed** (`cmd/erasure-object.go:414` sets `err = nil`) after an asynchronous MRF heal is queued (`BitrotScan: true`). So there is no code point on the GET path at which the sentinel is logged.
+- **No "file is corrupted" line is emitted during a plain GET** — neither on the server stdout nor in the admin trace stream. This is *not* an accident of log level; it is structural. The `storage.ReadFileStream` trace is published by the `defer done(length, &err)` in the disk wrapper (`cmd/xl-storage-disk-id-check.go:452`) at the moment the stream is **opened** — which *succeeds*, because a corrupt-but-present shard file opens without error. The HighwayHash mismatch (`errFileCorrupt`) only arises later, while `erasure.Decode` **consumes** the returned `io.ReadCloser` block-by-block (`cmd/bitrot-streaming.go:185`), long after that storage trace has already been published with an empty `Error` field. On the GET code path the sentinel is then **intentionally swallowed** (`cmd/erasure-object.go:414` sets `err = nil`) after an asynchronous MRF heal is queued (`BitrotScan: true`). So there is no code point on the GET path at which the sentinel is logged.
 - **The runtime detection signature that *is* observable at GET time is the extra parity read.** A healthy GET of this object reads exactly the two data shards (disk1 + disk2); the GET issued while disk1 was corrupt read **three** shards — the two data shards *plus* one parity shard (disk3) — which is the decoder pulling parity to reconstruct the block that failed its checksum. Both were captured with the real admin trace stream (§4.5).
 
 The **explicit** detection surface is the deep-scan heal (`madmin.Heal` with `HealDeepScan`, the same call `mc admin heal --scan deep` wraps), where `VerifyFile`→`bitrotVerify` re-checks every shard's HighwayHash and the corrupt shard is reported with drive `state:"missing"`; the heal then reconstructs and atomically reinstalls it (§4.6). Every surface below — the shard map, the before/during/after disk hashes, the GET reconstruction trace, and the heal — was observed at runtime through the real S3 and admin entry points; nothing here is `mc`-sourced (the `mc` client is not available in this environment) or reconstructed from reading alone.
@@ -720,7 +720,7 @@ The streaming reader's per-block verification (verbatim, `cmd/bitrot-streaming.g
 	return len(buf), nil
 ```
 
-The erasure decoder reacting to corruption (verbatim, `cmd/erasure-decode.go:193-229`):
+The erasure decoder reacting to corruption (verbatim, `cmd/erasure-decode.go:192-229`):
 
 ```go
 			n, err := rr.ReadAt(p.buf[bufIdx], p.offset)
@@ -763,7 +763,7 @@ The erasure decoder reacting to corruption (verbatim, `cmd/erasure-decode.go:193
 		}
 ```
 
-The GET path that swallows `errFileCorrupt` and queues an async bit-rot heal (verbatim, `cmd/erasure-object.go:397-415`):
+The GET path that swallows `errFileCorrupt` and queues an async bit-rot heal (verbatim, `cmd/erasure-object.go:397-416`):
 
 ```go
 			if written == partLength {
@@ -806,7 +806,7 @@ PUT ok: key=original.bin size=5242880 etag=be7921ff42acf745a7d7f0b5565ce72e vers
 STAT: size=5242880 etag=be7921ff42acf745a7d7f0b5565ce72e versionId= sse="aws:kms" kmsKey="arn:aws:kms:my-minio-key"
 ```
 
-The `xl-meta` debug tool (`docs/debugging/xl-meta`, an in-repo nested module) was built to `/tmp/minio-build/xl-meta` and used to decode the object's `xl.meta`. The erasure fields (verbatim, extracted from `Versions[0].Metadata.V2Obj`):
+The `xl-meta` debug tool (`docs/debugging/xl-meta`, a `package main` debug command in the main module) was built to `/tmp/minio-build/xl-meta` and used to decode the object's `xl.meta`. The erasure fields (verbatim, extracted from `Versions[0].Metadata.V2Obj`):
 
 ```
 $ /tmp/minio-build/xl-meta /tmp/minio-data/disk1/q3-bitrot/original.bin/xl.meta
@@ -896,7 +896,7 @@ The two data shards were opened first (disk2 + disk1 at `06:50:39.929997`/`.9300
 
 **F6 — the GET-time "file is corrupted" log, stated honestly.** A plain GET emits **no** "file is corrupted" line — this was verified directly: `grep -in "corrupt\|ERROR" trace_corrupt_get.log` returned nothing but `tracecap`'s own shutdown message (`# trace stream error: context canceled`), and `grep -in "file is corrupted\|bitrot" server.stdout.log` returned nothing (the server stdout is only its 10-line startup banner). This is *observed*, and the *reason* is grounded in code, not inferred loosely:
 
-- The `storage.ReadFileStream` trace is published by `defer done(length, &err)` in the disk wrapper (`cmd/xl-storage-disk-id-check.go:451`) when the stream is **opened**. Opening a corrupt-but-present file succeeds, so `err` is nil and the three `ReadFileStream` lines above all show a full `2622912 B` read with **no** `Error` field.
+- The `storage.ReadFileStream` trace is published by `defer done(length, &err)` in the disk wrapper (`cmd/xl-storage-disk-id-check.go:452`) when the stream is **opened**. Opening a corrupt-but-present file succeeds, so `err` is nil and the three `ReadFileStream` lines above all show a full `2622912 B` read with **no** `Error` field.
 - `errFileCorrupt` only arises later, while `erasure.Decode` reads the returned `io.ReadCloser` block-by-block (`cmd/bitrot-streaming.go:185`) — after that storage trace has already published.
 - On the GET path the sentinel is then swallowed at `cmd/erasure-object.go:414` (`err = nil`) after queuing an async MRF heal (`BitrotScan: true`, `cmd/mrf.go` `healRoutine` sets `HealDeepScan` when `BitrotScan` is true). There is therefore **no** GET-path code point that logs the sentinel.
 
