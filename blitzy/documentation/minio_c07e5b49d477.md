@@ -52,6 +52,46 @@ removed afterward, so the source tree is left unchanged.
   Runtime: go1.23.2 linux/amd64
   ```
 
+- **Source commit under investigation vs. destination-branch HEAD (build provenance).** The version
+  banner above is the *authentic* output of a canonical build **at the source commit under
+  investigation**, `c07e5b49d477b0774f23db3b290745aef8c01bd2`. Its Git committer date
+  `2024-11-25T09:10:22 -0800` = `2024-11-25T17:10:22Z` (UTC) is exactly the date `gen-ldflags`
+  stamps as the version, so `DEVELOPMENT.2024-11-25T17-10-22Z` is reproducible from that commit.
+  That commit is the code whose behavior every answer below documents, which is why this banner is
+  retained verbatim. This document is *delivered* on a destination branch whose HEAD is that same
+  source commit **plus additive, documentation-only commits** (this file). Two consequences follow,
+  and neither changes the code under test:
+  - **`buildscripts/gen-ldflags.go` derives the version string from the current Git HEAD**, not from
+    a fixed commit: the commit-id comes from `git log --format=%H -n1`
+    (`buildscripts/gen-ldflags.go:L74-88`, consumed at `L39-40`) and the version date from
+    `git log --format=%cI -n1`, converted to UTC (`buildscripts/gen-ldflags.go:L90-110` — note the
+    `t.UTC()` at `L109` — consumed as the default version at `L112-118`). A canonical rebuild from
+    the destination checkout therefore stamps the **destination HEAD** into the banner, not
+    `c07e5b49d477`. For example, at destination HEAD `947d4c17210a68e3b09c9c15572605f464c884ad`
+    (committer date `2026-07-08T06:58:50Z`) the same build recipe prints:
+
+    ```
+    minio version DEVELOPMENT.2026-07-08T06-58-50Z (commit-id=947d4c17210a68e3b09c9c15572605f464c884ad)
+    Runtime: go1.23.2 linux/amd64
+    ```
+
+    This hash is *illustrative, not fixed*: it advances with every subsequent documentation commit
+    (including the one that finalizes this file), so the exact value a reader's own rebuild prints
+    will generally be a still-later documentation descendant of `c07e5b49d477`. Consequently
+    `git rev-parse HEAD` is *expected* NOT to equal `c07e5b49d477`.
+  - **The MinIO source tree is byte-identical between `c07e5b49d477` and the destination HEAD** — the
+    only difference is the addition of this one document:
+
+    ```
+    $ git diff --name-status c07e5b49d477b0774f23db3b290745aef8c01bd2..HEAD
+    A	blitzy/documentation/minio_c07e5b49d477.md
+    ```
+
+    Zero `.go`, `go.mod`, or `go.sum` files differ, so the compiled server behavior is *provably
+    identical* and **every runtime observation in this document remains attributable to the code at
+    `c07e5b49d477`**. The invariant that endures is this byte-identical source tree, not the HEAD
+    hash a given build happens to stamp.
+
 - **Topology:** single node, 4 loop-mounted ext4 drives `/mnt/drive1..4` (real mounts → avoids
   root-disk refusal, no `MINIO_CI_CD` hack), one erasure set, **default EC:2 (data=2, parity=2)**.
   Confirmed by startup log `Formatting 1st pool, 1 set(s), 4 drives per set.` and by
@@ -284,9 +324,14 @@ port 9010):**
 $ MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123 MINIO_PROMETHEUS_AUTH_TYPE=public \
     MINIO_CI_CD=1 ./minio --config-dir /tmp/minio-config-ec server \
     /tmp/blitzy-repro/ec-data/disk{1..12} --address :9010 --console-address :9011
-[MinIO startup banner elided — the relevant confirmation is the erasure-set formatting line:]
-INFO: Formatting 1st pool, 1 set(s), 12 drives per set.
 ```
+
+The full MinIO startup banner for this non-canonical supplementary cluster is standard server
+boilerplate (a `Version:` line, the `API:`/`WebUI:` endpoint list, and the docs link) and is not
+reproduced here, as it bears on none of the parity-upgrade behavior under study. The 12-drive
+**EC:4** topology this command forms is confirmed independently, without relying on the banner, by
+the `xl.meta` header of the healthy PUT below (`"EcM": 8` / `"EcN": 4`) and by `mc admin info` in
+the degraded step below (`11 drives online, 1 drive offline, EC:4`).
 
 Alias for this cluster: `MC_HOST_ec=http://minio:minio123@127.0.0.1:9010`.
 
