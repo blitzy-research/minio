@@ -815,7 +815,7 @@ The server **console log does *not* carry a "restore vs. leave-alone" rationale 
 
 ### 6.1 `mc admin trace --call heal` — operational context
 
-Complete captured trace line (from `/tmp/evidence/trace_final.log`), produced while a heal ran in another terminal:
+Complete captured trace line (from `/tmp/evidence/trace_final.log`), produced with `mc admin trace --call heal --verbose` while a heal ran in another terminal. The `--verbose` flag is what surfaces the `Custom` fields decoded below (`disks`/`dry`/`mode`/`remove`); without it the line collapses to the compact form `<time> [HEALING] heal.Object <endpoint> <object> <duration> <size>` with none of those fields:
 
 ```
 127.0.0.1:9000  [HEALING heal.Object] [2026-07-08T05:48:34.048] healbkt/obj1 disks=4 dry=false mode=1 remove=false version-id=null 13.302636ms 1.0 MiB
@@ -1023,7 +1023,7 @@ The purge is also visible in the heal result itself. Complete `--json` object re
 {"status":"success","error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0","detail":"Object not found: healbkt/obj1","type":"object","name":"/","before":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"after":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"size":0}
 ```
 
-- `error: "Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0"` is the Reed-Solomon layer reporting it had **0 usable shards beyond what it needed** — the reconstruction genuinely could not proceed.
+- `error: "Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0"` is **not** a Reed-Solomon reconstruction message and does **not** originate in the MinIO server at all — it is a **client-side heal-color artifact produced by the `mc` client**. (Proof: `grep -rn 'Invalid parity shard count' cmd/` → **0 hits**; the string exists only in `github.com/minio/mc`, the client, pinned as an indirect dependency at `v0.0.0-20241113163349-308a8ea9d072` in `go.mod:205`.) When `mc` computes the before/after heal color for an object it calls `getObjectHCCChange` (`github.com/minio/mc@v0.0.0-20241113163349-308a8ea9d072/cmd/admin-heal-result-item.go:37`), which derives `surplusShardsBeforeHeal := onlineBefore - dataShards` (`:42`) and calls `getHColCode(surplusShardsBeforeHeal, parityShards)` (`:45`). For a **purged** object the returned `HealResultItem` carries `ParityBlocks = 0` and `DataBlocks = 0` — observable directly in this very record, where the wrapped message prints `parityShards: 0` and `surplusShardsBeforeHeal: 0` (= `online 0 − dataShards 0`). `getHColCode` therefore trips its first guard `if parityShards < 1 || parityShards > 8 || surplusShards > parityShards` (`cmd/admin-heal-ui.go:54`) and returns `fmt.Errorf("Invalid parity shard count/surplus shard count given")` (`:55`); `getObjectHCCChange` then wraps that base error with the `": surplusShardsBeforeHeal: %d, parityShards: %d"` suffix (`:47-48`), yielding the full string above. Reed-Solomon is **never invoked in this scenario**: at k=3 the object was already classified dangling and deleted by policy (`cannotHeal` true → `deleteIfDangling` → `isObjectDangling` ok=true; §6.3, §7.1), so no reconstruction is attempted — and the genuine `reedsolomon` errors read differently anyway (e.g. `ErrTooFewShards` = "too few shards given", `reedsolomon.go:609`). The **authoritative server verdict** for this object is therefore the `detail` field below plus the `DeleteDanglingObject` audit (`caller … cmd/erasure-healing.go:438`, §6.3) — **not** this client-computed `error` field. *(Observed: this exact `--json` record — with `objects_healed:0` and the object purged from all four disks including the one good copy — was re-reproduced from a fresh 4-drive EC:2 k=3 run.)*
 - `detail: "Object not found: healbkt/obj1"` is the **post-purge** state: after `deleteIfDangling` removed the version, the object is gone. `before`/`after` drives are `null` because the object no longer resolves.
 
 ### 6.5 The server console log — honest finding: no decision rationale here
@@ -1780,7 +1780,7 @@ Version: DEVELOPMENT.2026-07-08T08-31-27Z (go1.23.12 linux/amd64)
 ```bash
 /tmp/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin     # => "Added `local` successfully."
 /tmp/mc admin heal -r --verbose --json local/<bucket>                   # on-demand heal (HealNormalScan / mode=1)
-/tmp/mc admin trace --call heal local                                   # live heal trace (§6.1)
+/tmp/mc admin trace --call heal --verbose local                        # live heal trace; --verbose surfaces the Custom fields (§6.1)
 ```
 
 `mc` was `RELEASE.2025-08-13T08-35-41Z` — postdating the `RELEASE.2024-11-17` color-key change (§5.5). The audit log used in §6 was captured by pointing MinIO's audit webhook at a tiny local sink (`python3 /tmp/audit_sink.py`).
