@@ -519,7 +519,7 @@ type ObjectLocked GenericError
 ```
 
 ```go
-// cmd/api-errors.go:1059-1062
+// cmd/api-errors.go:1059-1063
 	ErrObjectLocked: {
 		Code:           "InvalidRequest",
 		Description:    "Object is WORM protected and cannot be overwritten",
@@ -982,7 +982,7 @@ Effective permissions of STS temporary credentials are the **intersection** of t
 
 ### 5.2 Grounding (verbatim)
 
-The session policy is parsed at AssumeRole and embedded in the token claim. `maxSTSSessionPolicySize = 2048` (`cmd/sts-handlers.go:89`); the handler is `AssumeRole` (`cmd/sts-handlers.go:256`). Verbatim (`cmd/sts-handlers.go:123-127`):
+The session policy is parsed at AssumeRole and embedded in the token claim. `maxSTSSessionPolicySize = 2048` (`cmd/sts-handlers.go:89`); the handler is `AssumeRole` (`cmd/sts-handlers.go:256`). Verbatim (`cmd/sts-handlers.go:123-128`):
 
 ```go
 	if len(policyBuf) > maxSTSSessionPolicySize {
@@ -993,7 +993,7 @@ The session policy is parsed at AssumeRole and embedded in the token claim. `max
 	return nil
 ```
 
-Enforcement is the intersection computed in `IsAllowedSTS` (`cmd/iam.go:2242`). Verbatim (`cmd/iam.go:2308-2312`):
+Enforcement is the intersection computed in `IsAllowedSTS` (`cmd/iam.go:2242`). Verbatim (`cmd/iam.go:2309-2313`):
 
 ```go
 	// Now check if we have a sessionPolicy.
@@ -1021,12 +1021,16 @@ Full result (`/tmp/minio-investigation/q4/gotest_inrepo_sts.txt`), captured by r
 === RUN   TestIAMInternalIDPSTSServerSuite
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_1,_ServerType:_ErasureSD
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_2,_ServerType:_ErasureSD_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_3,_ServerType:_ErasureSD
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_4,_ServerType:_ErasureSD_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_5,_ServerType:_Erasure
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_6,_ServerType:_Erasure_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_7,_ServerType:_ErasureSet
 === RUN   TestIAMInternalIDPSTSServerSuite/Test:_8,_ServerType:_ErasureSet_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 --- PASS: TestIAMInternalIDPSTSServerSuite (13.91s)
     --- PASS: TestIAMInternalIDPSTSServerSuite/Test:_1,_ServerType:_ErasureSD (3.32s)
     --- SKIP: TestIAMInternalIDPSTSServerSuite/Test:_2,_ServerType:_ErasureSD_(with_etcd_backend) (0.00s)
@@ -1135,7 +1139,7 @@ func (a adminAPIHandlers) SetPolicyForUserOrGroup(w http.ResponseWriter, r *http
 ```
 
 ```go
-// cmd/admin-handlers-users.go:1908-1911
+// cmd/admin-handlers-users.go:1908-1912
 func (a adminAPIHandlers) AttachDetachPolicyBuiltin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1143,7 +1147,7 @@ func (a adminAPIHandlers) AttachDetachPolicyBuiltin(w http.ResponseWriter, r *ht
 		policy.AttachPolicyAdminAction)
 ```
 
-The guard itself (verbatim, `cmd/admin-handler-utils.go:45-61`):
+The guard itself (verbatim, `cmd/admin-handler-utils.go:45-60`):
 
 ```go
 	for _, action := range actions {
@@ -1193,12 +1197,16 @@ Full unedited result (`/tmp/minio-investigation/q5/gotest_inrepo_admin.txt`):
 === RUN   TestIAMInternalIDPServerSuite
 === RUN   TestIAMInternalIDPServerSuite/Test:_1,_ServerType:_ErasureSD
 === RUN   TestIAMInternalIDPServerSuite/Test:_2,_ServerType:_ErasureSD_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPServerSuite/Test:_3,_ServerType:_ErasureSD
 === RUN   TestIAMInternalIDPServerSuite/Test:_4,_ServerType:_ErasureSD_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPServerSuite/Test:_5,_ServerType:_Erasure
 === RUN   TestIAMInternalIDPServerSuite/Test:_6,_ServerType:_Erasure_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 === RUN   TestIAMInternalIDPServerSuite/Test:_7,_ServerType:_ErasureSet
 === RUN   TestIAMInternalIDPServerSuite/Test:_8,_ServerType:_ErasureSet_(with_etcd_backend)
+    admin-handlers-users_test.go:150: Skipping etcd backend IAM test as no etcd server is configured.
 --- PASS: TestIAMInternalIDPServerSuite (14.05s)
     --- PASS: TestIAMInternalIDPServerSuite/Test:_1,_ServerType:_ErasureSD (3.50s)
     --- SKIP: TestIAMInternalIDPServerSuite/Test:_2,_ServerType:_ErasureSD_(with_etcd_backend) (0.00s)
