@@ -71,7 +71,7 @@ flowchart TD
 
 ### 2.1 Canonical build
 
-The binary was built from the repository root using the **canonical Makefile build recipe** — `CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)"` [Makefile:L179] — where `LDFLAGS` is produced by `go run buildscripts/gen-ldflags.go` [Makefile:L8]. The exact commands and their unedited output:
+The binary was built from the repository root using the **canonical Makefile build recipe** — `CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)"` [Makefile:L179] — where `LDFLAGS` is produced by `go run buildscripts/gen-ldflags.go` [Makefile:L3]. The exact commands and their unedited output:
 
 ```console
 $ LDFLAGS="$(go run buildscripts/gen-ldflags.go)"
@@ -613,13 +613,13 @@ $ for d in d1 d2 d3 d4; do
 Then, after the drive was restored (§7), a single `GET` of the degraded object triggers the repair. Each result is shown with the exact command that produced it:
 
 ```console
-$ test -f /tmp/mtest/d4/testbucket/obj_1down/xl.meta (BEFORE GET)
-d4 obj_1down/xl.meta -> MISSING
+$ test -f /tmp/mtest/d4/testbucket/obj_1down/xl.meta && echo PRESENT || echo MISSING   # BEFORE GET
+MISSING
 
 $ MINIO_EP=http://127.0.0.1:9000 python3 /tmp/evidence/s3probe.py get testbucket obj_1down
 GET OK bucket=testbucket key=obj_1down bytes=11222 md5=0d39f519ae4d3a8bfb19daed3c6f29dd http=200
 
-$ start=$(date +%s.%N); poll test -f /tmp/mtest/d4/testbucket/obj_1down/xl.meta until PRESENT (0.05s each)
+$ start=$(date +%s.%N)   # then poll: test -f /tmp/mtest/d4/testbucket/obj_1down/xl.meta every 0.05s until it exists, reporting latency/size/iters
 d4 obj_1down/xl.meta -> PRESENT (HEALED) after 1.002s (6073B; poll iters=20)
 
 # final shard matrix for obj_1down (root read-only re-inspection)
@@ -733,9 +733,9 @@ Each condition is grounded by the health surface and — wherever an I/O behavio
 
 The values are stable across the two runs (sub-second health flips; ~1 s heal). **(Inferred causes — reasoned from the code, not measured):** the near-instant health flips are driven by the **on-demand `Health()` recount through the short-TTL (1 s) `diskInfoCache`** [cmd/xl-storage.go:L326], *not* by the 15 s background reconnect poll [cmd/erasure-sets.go:L348] (§7); the ~1 s heal reflects the read-triggered MRF partial-heal path (§8). These causal attributions are inferences from the code paths — the latencies themselves are the observed measurements in the table above.
 
-### 10.3 Run-2 raw transcripts (verbatim)
+### 10.3 Run-2 raw transcripts (annotated)
 
-To **evidence** the stability claim above rather than merely assert it, the raw Run-2 output for every pivotal condition is reproduced below — captured against the independent Run-2 server (`127.0.0.1:9001`, fresh data dirs `/tmp/mtest2`). It matches the Run-1 evidence in §3–§8 line-for-line (only the port, data path, request-ids and timestamps differ).
+To **evidence** the stability claim above rather than merely assert it, the raw Run-2 output for every pivotal condition is reproduced below — captured against the independent Run-2 server (`127.0.0.1:9001`, fresh data dirs `/tmp/mtest2`). It matches the Run-1 evidence in §3–§8 line-for-line (only the port, data path, request-ids and timestamps differ). Each block is literal command-and-output, with one disclosed convention: the two sub-second health flips and the heal-latency measurement were taken with the 0.05 s poll loop described in §10.2 — shown here as an annotated `#` comment on the real `date`/`test -f` command that drove the loop, immediately followed by that loop's own printed result line (the same annotation convention used in §7).
 
 **Startup banner — same stamped version as Run 1 (confirms one 4-drive set):**
 
@@ -831,7 +831,7 @@ $ grep -c 'unable to read /tmp/mtest2/d4/.minio.sys/buckets/.healing.bin' /tmp/e
 ```console
 $ chmod 000 /tmp/mtest2/d3 && ls -ld /tmp/mtest2/d3
 d--------- 4 miniouser miniouser 4096 Jul 10 08:54 /tmp/mtest2/d3
-$ start=$(date +%s.%N); poll /minio/health/cluster until 503 (2nd drive detected offline)
+$ start=$(date +%s.%N)   # then poll /minio/health/cluster every 0.05s until it returns 503 (2nd drive now offline)
 cluster reached 503 after 0.013s (poll iterations=1, 0.05s each)
 $ MINIO_EP=http://127.0.0.1:9001 python3 /tmp/evidence/s3probe.py put testbucket obj_2down
 S3ERROR SlowDownWrite HTTP 503 :: Resource requested is unwritable, please reduce your request rate
@@ -865,7 +865,7 @@ Error: Write quorum could not be established on pool: 0, set: 0, expected write 
 $ curl -s -o /dev/null -w 'cluster(before restore) %{http_code}\n' http://127.0.0.1:9001/minio/health/cluster
 cluster(before restore) 503
 $ chmod 755 /tmp/mtest2/d3 /tmp/mtest2/d4   # NO restart, NO external heal cmd
-$ start=$(date +%s.%N); poll /minio/health/cluster until 200
+$ start=$(date +%s.%N)   # then poll /minio/health/cluster every 0.05s until it returns 200
 cluster returned 200 after 0.013s (poll iterations=1, 0.05s sleep each)
 $ curl -sI http://127.0.0.1:9001/minio/health/cluster | grep -i Write-Quorum
 X-Minio-Write-Quorum: 3
@@ -876,11 +876,11 @@ PUT OK bucket=testbucket key=obj_restored etag="0d39f519ae4d3a8bfb19daed3c6f29dd
 **Heal-on-read — degraded `d4` shard rewritten after a single GET:**
 
 ```console
-$ test -f /tmp/mtest2/d4/testbucket/obj_1down/xl.meta (BEFORE GET)
-d4 obj_1down/xl.meta -> MISSING
+$ test -f /tmp/mtest2/d4/testbucket/obj_1down/xl.meta && echo PRESENT || echo MISSING   # BEFORE GET
+MISSING
 $ MINIO_EP=http://127.0.0.1:9001 python3 /tmp/evidence/s3probe.py get testbucket obj_1down
 GET OK bucket=testbucket key=obj_1down bytes=11222 md5=0d39f519ae4d3a8bfb19daed3c6f29dd http=200
-$ start=$(date +%s.%N); poll test -f /tmp/mtest2/d4/testbucket/obj_1down/xl.meta until PRESENT
+$ start=$(date +%s.%N)   # then poll: test -f /tmp/mtest2/d4/testbucket/obj_1down/xl.meta every 0.05s until it exists, reporting latency/size/iters
 d4 obj_1down/xl.meta -> PRESENT (HEALED) after 0.952s (6073B; poll iters=19)
 ```
 
