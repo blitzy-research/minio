@@ -36,14 +36,16 @@ go version go1.23.12 linux/amd64
 
 ### Git context (honest HEAD-vs-base relationship)
 
-This investigation branch adds exactly one file — this document — as a commit on top of the source under study:
+This investigation branch (`blitzy-b32cbb93-585c-46c3-bafd-7f6152c90649`) adds exactly one file — this document — layered directly on top of the source under study. The immutable anchor for everything below is the **investigated base commit**, which never moves:
 
 ```
-HEAD (this doc commit):  d45d9240c0b3dd0ea243bbcaa4f6d3cb2f3da94f  "docs: add runtime-evidenced MinIO security investigation"
-HEAD~1 (investigated):   c07e5b49d477b0774f23db3b290745aef8c01bd2  "refactor: replace experimental maps and slices with stdlib (#20679)"
+investigated base commit:  c07e5b49d477b0774f23db3b290745aef8c01bd2  "refactor: replace experimental maps and slices with stdlib (#20679)"
+branch tip (HEAD):         the documentation commit(s) that add only this file, on top of that base
 ```
 
-`buildscripts/gen-ldflags.go` derives the version string from the **current HEAD** commit's date and id. Run at this branch's HEAD it would stamp the *documentation* commit (`DEVELOPMENT.2026-07-13T...`, commit-id `d45d9240…`), which is **not** the code under investigation. To study the actual source the questions concern, the server binary is built **at the base commit `c07e5b49d477`**, whose `gen-ldflags.go` output is authoritative for this investigation:
+The exact hash of the documentation commit is deliberately **not** pinned here: committing (or amending) this file necessarily changes the branch-tip hash, whereas the base `c07e5b49d477` is stable. Every `file:line` anchor and the version stamp below refer to that base.
+
+`buildscripts/gen-ldflags.go` derives the version string from the **current HEAD** commit's date and id. Run at the branch tip it would stamp the *documentation* commit (a `DEVELOPMENT.2026-07-13T...` tag whose commit-id is the volatile documentation-commit hash), which is **not** the code under investigation. To study the actual source the questions concern, the server binary is built **at the base commit `c07e5b49d477`**, whose `gen-ldflags.go` output is authoritative for this investigation:
 
 ```
 $ git -C <worktree@c07e5b49d477> ... go run buildscripts/gen-ldflags.go
@@ -157,7 +159,7 @@ This document is a **complete, self-contained, from-scratch runtime investigatio
 
 | # | Enforcing mechanism | Principal | SSE header sent | Runtime outcome |
 |---|---------------------|-----------|-----------------|-----------------|
-| A2 | Bucket **default encryption** | `q1user` (`s3:*`) | none | **200** — object stored, server **auto-injected `AES256`** |
+| A | Bucket **default encryption** | `q1user` (`s3:*`) | none | **200** — object stored, server **auto-injected `AES256`** |
 | B | **Bucket policy** `DenyUnEncryptedObjectUploads` | `q1user` (`s3:*`, authenticated) | none | **200** — stored **unencrypted** (bucket policy **not consulted** for an authenticated identity) |
 | C1 | **Bucket policy** `DenyUnEncryptedObjectUploads` | **anonymous** | none | **403 AccessDenied** |
 | C2 | **Bucket policy** `DenyUnEncryptedObjectUploads` | **anonymous** | `AES256` | **200** — SSE-S3 |
@@ -167,7 +169,7 @@ This document is a **complete, self-contained, from-scratch runtime investigatio
 The key corrections this investigation establishes at runtime:
 
 1. A **bucket policy** `DenyUnEncryptedObjectUploads` does **not** override an *authenticated* user's broad write — MinIO evaluates only the **identity** policy for authenticated requests and never consults the bucket policy for them (TEST B, 200 unencrypted). It overrides only **anonymous** requests (TEST C1, 403).
-2. To override an *authenticated* broad-write user, the deny must live in the **identity** policy (TEST D1, 403) — where `Deny` beats `Allow` — or the bucket must use **default encryption**, which does not deny at all but transparently **auto-encrypts** (TEST A2, 200 + `AES256`).
+2. To override an *authenticated* broad-write user, the deny must live in the **identity** policy (TEST D1, 403) — where `Deny` beats `Allow` — or the bucket must use **default encryption**, which does not deny at all but transparently **auto-encrypts** (TEST A, 200 + `AES256`).
 3. The `mc admin trace` stream does **not** expose the handler's internal stages; it shows the request headers **after** the handler has run and the response. The internal ordering is therefore `[INFERRED]` from source (below).
 
 ### Root cause — why a bucket policy does not gate an authenticated identity (`[INFERRED]` from source, `[OBSERVED]` at runtime)
@@ -219,7 +221,7 @@ $ mc admin policy create inv q1-identity-deny-pol q1deny-identity-policy.json
 $ mc admin user add inv q1deny ***REDACTED*** ; mc admin policy attach inv q1-identity-deny-pol --user q1deny
 ```
 
-### TEST A2 — bucket **default encryption** auto-encrypts (server-side), `[OBSERVED]`
+### TEST A — bucket **default encryption** auto-encrypts (server-side), `[OBSERVED]`
 
 A **raw minio-go PutObject with NO server-side-encryption option** (User-Agent `minio-go/v7.0.80`, no `mc`), so the client sends no SSE header:
 
@@ -245,7 +247,7 @@ STAT: size=29 sse-header="AES256"
 127.0.0.1:9000 X-Amz-Server-Side-Encryption: AES256
 ```
 
-**Trace-timing note (`[INFERRED]` from source).** The `X-Amz-Server-Side-Encryption: AES256` header that appears in the *request* section, despite the client never sending it, is explained by the tracer implementation: `httpTracerMiddleware` calls `h.ServeHTTP(respRecorder, r)` (`cmd/http-tracer.go:88`) and only **afterwards** clones the request headers with `reqHeaders := r.Header.Clone()` (`cmd/http-tracer.go:103`). Because `PutObjectHandler` mutates `r.Header` when it applies bucket default encryption — `sseConfig.Apply(r.Header, ...)` at `cmd/object-handlers.go:1894-1896` — the **server-injected** header is present by the time the tracer snapshots the request. This is the concrete runtime signature of the "encryption requirement transparently taking precedence": the write is honored **and** the object is encrypted, with no denial.
+**Trace-timing note (`[INFERRED]` from source).** The `X-Amz-Server-Side-Encryption: AES256` header that appears in the *request* section, despite the client never sending it, is explained by the tracer implementation: `httpTracerMiddleware` calls `h.ServeHTTP(respRecorder, r)` (`cmd/http-tracer.go:89`) and only **afterwards** clones the request headers with `reqHeaders := r.Header.Clone()` (`cmd/http-tracer.go:103`). Because `PutObjectHandler` mutates `r.Header` when it applies bucket default encryption — `sseConfig.Apply(r.Header, ...)` at `cmd/object-handlers.go:1894-1896` — the **server-injected** header is present by the time the tracer snapshots the request. This is the concrete runtime signature of the "encryption requirement transparently taking precedence": the write is honored **and** the object is encrypted, with no denial.
 
 ### TEST B — `DenyUnEncryptedObjectUploads` **bucket** policy does **not** deny the authenticated broad-write user, `[OBSERVED]`
 
@@ -355,7 +357,7 @@ Therefore the frequently-stated ordering "SigV4 → IAM → SSE" is imprecise fo
 
 ### Stability
 
-Each case was run twice with fresh object keys; verdicts were identical: A2 `200/AES256`, B `200`/unencrypted, C1 `403`, C2 `200`, D1 `403`, D2 `200`.
+Each case was run twice with fresh object keys; verdicts were identical: A `200/AES256`, B `200`/unencrypted, C1 `403`, C2 `200`, D1 `403`, D2 `200`.
 
 ---
 
@@ -479,14 +481,7 @@ Trace — the bypass header **is** present and signed, and the response is 403:
 <Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>obj-governance</Key><BucketName>q2-lock</BucketName><Resource>/q2-lock/obj-governance</Resource><RequestId>18C1F0AF0148134E</RequestId>...</Error>
 ```
 
-**Isolation that this 403 is at the `BypassGovernanceRetention` check, not `DeleteObject` (`[OBSERVED]`).** The same `q2user` deletes an **unlocked** version successfully — proving `s3:DeleteObject` is granted, so the only thing missing in variant 3 is the bypass permission:
-
-```
-$ AK=q2user SK=*** ./delete_single q2-lock obj-q2ctrl c5a480bf-187a-4899-b4bc-88e6cab079f3
-DELETE RESULT: SUCCESS (version c5a480bf-187a-4899-b4bc-88e6cab079f3 removed)
-```
-
-(An unrelated `GET /q2-lock/?location=` preflight from the SDK also returns 403 because `q2user` lacks `s3:GetBucketLocation`; the SDK ignores it and proceeds to the DELETE shown above.)
+**Isolation that this 403 is at the `BypassGovernanceRetention` check, not `DeleteObject` (`[OBSERVED]`).** The same `q2user` deletes an **unlocked** version successfully — proving `s3:DeleteObject` is granted, so the only thing missing in variant 3 is the bypass permission. That control is presented as **Variant 5** below.
 
 ### Variant 4 — Compliance, bypass header set, caller is ROOT → still 400, `[OBSERVED]`
 
@@ -500,6 +495,17 @@ DELETE RESULT: ERROR
   Message:        Object is WORM protected and cannot be overwritten
 ```
 Trace `[REQUEST s3.DeleteObject] DELETE /q2-lock/obj-compliance?versionId=5c3503e9-...` → `400 Bad Request` (RequestId `18C1F0AF01CDDEEE`).
+
+### Variant 5 — Control: unlocked version, specific-version delete by `q2user` → 200, `[OBSERVED]`
+
+This control isolates Variant 3's `403` to the missing bypass permission: the **same** `q2user` deletes an **unlocked** version successfully, proving `s3:DeleteObject` itself is granted — so the only thing absent in Variant 3 is `s3:BypassGovernanceRetention`.
+
+```
+$ AK=q2user SK=*** ./delete_single q2-lock obj-q2ctrl c5a480bf-187a-4899-b4bc-88e6cab079f3
+DELETE RESULT: SUCCESS (version c5a480bf-187a-4899-b4bc-88e6cab079f3 removed)
+```
+
+(An unrelated `GET /q2-lock/?location=` preflight from the SDK also returns 403 because `q2user` lacks `s3:GetBucketLocation`; the SDK ignores it and proceeds to the DELETE shown above.)
 
 ### Variant 6 — Governance, bypass with permission (root) → 200, `[OBSERVED]`
 
@@ -548,7 +554,7 @@ The four blocked variants were re-run; verdicts were identical: 1 = `400 Invalid
 
 **Question.** How does the system handle unauthorized manual data corruption in the storage backend? Trigger a bit-rot detection event and identify the specific runtime logs generated during a subsequent GET.
 
-**Short answer (`[OBSERVED]`).** After one on-disk erasure shard is corrupted, a subsequent GET **succeeds and returns byte-for-byte-correct data** (reconstructed from parity). The GET produces **no console/audit log line**; the observable runtime signal is in the `mc admin trace --all` **STORAGE** stream, which shows the read fanning out to a **parity** drive to reconstruct after the corrupt data shard fails its checksum. The corrupt shard is **not** repaired on disk by the GET itself — on-disk repair is deferred (queued to the background MRF healer, `[INFERRED]`) and is performed deterministically by an explicit deep-scan heal, whose `storage.VerifyFile` + `RenameData` write-back **is** observable.
+**Short answer (`[OBSERVED]`).** After one on-disk erasure shard is corrupted, a subsequent GET **succeeds and returns byte-for-byte-correct data** (reconstructed from parity). The GET produces **no console/audit log line**; the observable runtime signal is in the `mc admin trace --all -v` **STORAGE** stream, which shows the read fanning out to a **parity** drive to reconstruct after the corrupt data shard fails its checksum. The corrupt shard is **not** repaired on disk by the GET itself — on-disk repair is deferred (queued to the background MRF healer, `[INFERRED]`) and is performed deterministically by an explicit deep-scan heal, whose `storage.VerifyFile` + `RenameData` write-back **is** observable.
 
 ### Setup — 8 MiB object in erasure mode, single set EC:2
 
@@ -681,7 +687,7 @@ and `cmd/erasure-decode.go` records the failure only as an in-memory atomic flag
 
 The flag is consumed later at `cmd/erasure-decode.go:227-228` (`} else if bitrotHeal == 1 { return newBuf, errFileCorrupt }`), propagating `errFileCorrupt` up to the heal-on-read enqueue — still with no log emitted.
 
-The observable runtime signal is therefore the **`mc admin trace --all` STORAGE stream**, captured concurrently with the GET (`trace_get.log`, 206 lines). The relevant `storage.ReadFileStream` lines (verbatim; drives referenced by their data-dir root) show the read fanning out across drives — critically, a **parity** drive (`data/4`) is read to reconstruct the missing data shard, and no error surfaces (`total-errs-availability=0`):
+The observable runtime signal is therefore the **`mc admin trace --all -v` STORAGE stream**, captured concurrently with the GET (`trace_get.log`, 206 lines). The relevant `storage.ReadFileStream` lines (verbatim; drives referenced by their data-dir root) show the read fanning out across drives — critically, a **parity** drive (`data/4`) is read to reconstruct the missing data shard, and no error surfaces (`total-errs-availability=0`):
 
 ```
 127.0.0.1:9000  [STORAGE storage.ReadFileStream] [2026-07-13T19:45:48.561] /tmp/minio-investigation/data/2 q3-bitrot object.bin/8d9468b9-b967-4518-b082-53a134dbd0d4/part.1 total-errs-availability=0 total-errs-timeout=0 39.562µs 4.0 MiB
@@ -740,7 +746,7 @@ $ od -An -tx1 -j 2000000 -N 16 "$TARGET"
 ```
 The hash equals the pre-corruption baseline `0dacecd6...` and the bytes at offset 2000000 are the original `e5 96 d6 b6 ...` — the shard is fully restored on disk.
 
-The `mc admin trace --all` STORAGE stream during the heal (`trace_heal.log`, 218 lines) shows the actual detection-and-repair signature: **`storage.VerifyFile` on every one of the four drives** (this is where the corrupt shard is detected on `data/2`), followed by a fresh shard write (`storage.CreateFile`) and atomic rename (`storage.RenameData`) **only on `data/2`**. Verbatim:
+The `mc admin trace --all -v` STORAGE stream during the heal (`trace_heal.log`, 218 lines) shows the actual detection-and-repair signature: **`storage.VerifyFile` on every one of the four drives** (this is where the corrupt shard is detected on `data/2`), followed by a fresh shard write (`storage.CreateFile`) and atomic rename (`storage.RenameData`) **only on `data/2`**. Verbatim:
 
 ```
 127.0.0.1:9000  [STORAGE storage.VerifyFile] [2026-07-13T19:46:57.293] /tmp/minio-investigation/data/1 q3-bitrot object.bin total-errs-availability=0 total-errs-timeout=0 1.448673ms
