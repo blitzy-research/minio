@@ -91,7 +91,7 @@ directly on the host.
   signed headers; signing every request this way exercises the real authenticated path and captures the
   exact wire bytes and headers with **no** client-side XML parsing in between. An unsigned `curl` cannot
   exercise the authenticated path, so a signing client is mandatory.
-- **Per-request logs [observed]:** captured two independent ways -- (1) `mc admin trace --verbose local`
+- **Per-request logs [observed]:** captured two independent ways -- (1) `mc admin trace local`
   (MinIO client `RELEASE.2025-08-13`), started as a subscriber **before** the flow, with its alias set by
   `MC_CONFIG_DIR=/tmp/mccfg mc alias set local http://127.0.0.1:9000 minioadmin minioadmin`; and (2) an
   audit-webhook JSON stream -- the server was launched with `MINIO_AUDIT_WEBHOOK_ENABLE_primary=on` and
@@ -737,7 +737,7 @@ is **not** an access log, so no per-request entry appears.
 
 ### 2) `mc admin trace` -- the per-request positive **[observed]**
 
-Running `mc admin trace --verbose local` in one terminal (making it a trace subscriber) **before** driving
+Running `mc admin trace local` in one terminal (making it a trace subscriber) **before** driving
 the S3 operations in another produced these **real, timestamped** lines, verbatim (all nine events of the
 flow, including the two R4 auth checks):
 
