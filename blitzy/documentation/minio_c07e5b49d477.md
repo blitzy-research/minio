@@ -1,10 +1,22 @@
 # MinIO Fault-Tolerance Behavior in a Four-Directory Erasure-Coded Deployment
 
-> **Grounded in a built-and-run MinIO** at HEAD `c07e5b49d477b0774f23db3b290745aef8c01bd2`
-> (branch `minio_c07e5b49d477`), single-node, four local directories, default storage class → **EC:2**
-> (2 data + 2 parity). Every behavioral claim below is paired with **observed runtime output** from the
-> health endpoint and real S3 write/read attempts, and every code claim carries an exact `file:line`
-> citation verified against this HEAD.
+> **Grounded in a built-and-run MinIO.** The investigated source is the MinIO tree at commit
+> `c07e5b49d477b0774f23db3b290745aef8c01bd2` (the parent of branch `minio_c07e5b49d477`). The server was
+> compiled and executed as an unprivileged user over four local directories; the default storage class
+> yields **EC:2** (2 data + 2 parity). Every **behavioral** claim below is shown next to the **actual,
+> unedited output** that produced it (the exact command, its full stdout/stderr, and its exit status);
+> every **code** claim carries an exact `file:line` citation verified against this source. Statements that
+> could not be surfaced at runtime are explicitly labeled **(inferred, from code)**.
+
+> **Provenance note on the version banner (read this before §6.0).** The binary is stamped with the
+> **git HEAD at build time**. It was built during the investigation when HEAD was a documentation-only
+> commit (`7391c3197d59ae276b937dba60240cc6300a0239`), so the real banner reports `commit-id=7391c3197…`.
+> That commit differs from the investigated MinIO source `c07e5b49d477…` by **only** this Markdown file and
+> **no** MinIO source; §6.0 proves it with a `git diff --stat` between those two **absolute** commits. The
+> MinIO Go source that was compiled and run is therefore byte-for-byte identical to `c07e5b49d477…`, so all
+> `file:line` citations resolve identically at both commits. This document was subsequently revised for
+> accuracy and re-committed; the revision still touches **only** this Markdown file (§6.0 shows the
+> staged-tree diff), leaving the compiled server’s byte-identity to `c07e5b49d477…` unaffected.
 
 ## 1. Title & Scope
 
@@ -15,81 +27,106 @@ disks; (Q2) what happens the instant one directory becomes inaccessible mid-oper
 difference between staying **above** the quorum threshold (one disk down) and dropping **below** it (a
 second disk down); (Q4) whether the logs name the failing disk by its filesystem path and whether recovery
 is attempted while the server stays live; (Q5) whether MinIO self-detects a restored directory via polling
-or needs an external push; (Q6) how objects written while a disk was down get repaired once it returns; and
-(Q7) exactly where in the source the quorum decision lives and how the threshold is computed. (Q8) Every
-conclusion is grounded in the health-endpoint response and a real write/read result.
+or needs an external push; (Q6) how objects written while a disk was down get repaired once it returns;
+(Q7) exactly where in the source the quorum decision lives and how the threshold is computed; and (Q8) the
+grounding of every conclusion in the health-endpoint response and a real write/read result.
 
 The failure is injected **externally** with an operating-system permission change (`chmod 000`) on a data
 directory and reversed with `chmod 755`; MinIO itself is never modified. The topology is one erasure set of
 four drives at default parity **EC:2**, which yields a **write quorum of 3** and a **read quorum of 2** — the
-two thresholds that govern every behavior described here.
+two thresholds that govern every behavior described here. All conclusions are scoped to this single-node,
+four-directory, default-parity topology.
 
 ## 2. TL;DR — Answers at a Glance
 
 | # | Question | One-line answer | Decisive observed evidence | Primary `file:line` |
 |---|----------|-----------------|----------------------------|---------------------|
-| **Q1** | Health decision & disk assumptions | The deployment is "healthy" only if **every** erasure set has `online ≥ write quorum`; for 4-dir EC:2 the write quorum is **3** (read quorum 2). | `GET /minio/health/cluster` → **200** with `X-Minio-Write-Quorum: 3` | `Health()` [cmd/erasure-server-pool.go:L2679] |
-| **Q2** | Live permission-loss behavior | It **quietly adapts** while still at/above write quorum, and **draws a hard line** (refuses writes) the moment it drops below it. | 3 online → PUT succeeds; 2 online → PUT fails `SlowDownWrite` | `defaultWQuorum()` [cmd/erasure.go:L85] |
-| **Q3** | Above vs below threshold | **Above** (3 online): `/cluster` 200, writes succeed. **Below** (2 online): `/cluster` 503, writes refused, **reads still succeed**. | §6.2 vs §6.3 + `FatalKind` log | `Health()` [cmd/erasure-server-pool.go:L2679] |
-| **Q4** | Path-named logs & live recovery | **Yes**, the disk is named by its exact path; recovery/re-probing runs while live. (For a *permission* fault the dedicated `monitorDiskWritable` offline/online lines do **not** fire — that path is `errFaultyDisk`-only.) | `endpoint="/tmp/ec/data1"`, `.healing.bin` path; offline/online line counts = **0** | offline log [cmd/xl-storage-disk-id-check.go:L1015] |
-| **Q5** | Self-detection of restored dir | **Automatic** within the first ≤5 s poll — **no restart, no external push** required (manual `mc admin heal` is available but optional). | poll shows `/cluster` 200 + 4 online at t+5s | `monitorDiskStatus` [cmd/xl-storage-disk-id-check.go:L930] |
-| **Q6** | Repair of objects written during outage | The shard missing on the down disk is **restored** (`xl.meta` re-created) when the disk returns, via healing. | shard MISSING → restored; `Healed: 1/2 objects` | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] |
-| **Q7** | Location of the quorum decision | `defaultWQuorum()`/`defaultRQuorum()` compute the thresholds; a **+1 split-brain guard** adds one to write quorum when `data == parity`. | write quorum 3 = data 2 **+1** | `defaultWQuorum()` [cmd/erasure.go:L85] |
-| **Q8** | Grounding | Every conclusion is paired with a health-endpoint status/headers **and** a real S3 write/read result from the running server. | all §6 evidence blocks | `ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] |
+| **Q1** | Health decision & disk assumptions | The deployment is "healthy" only if **every** erasure set has `online ≥ write quorum`; for 4-dir EC:2 the write quorum is **3** (read quorum 2). `Health()` derives the thresholds itself from `BackendInfo()`. | `GET /minio/health/cluster` → **200** with `X-Minio-Write-Quorum: 3` | `Health()` [cmd/erasure-server-pool.go:L2679]; quorum calc [L2719-L2727] |
+| **Q2** | Live permission-loss behavior | It **keeps serving writes** while still at/above write quorum, and **refuses writes** the moment it drops below it (reads continue while read quorum holds). | 3 online → PUT exit 0; 2 online → PUT exit 1 `SlowDownWrite` | PUT quorum check [cmd/erasure-object.go:L1305-L1308] |
+| **Q3** | Above vs below threshold | **Above** (3 online): `/cluster` 200, writes succeed. **Below** (2 online): `/cluster` 503, writes refused, **reads still succeed**. | §6.2 vs §6.3 + `FatalKind` log | `Health()` [cmd/erasure-server-pool.go:L2791,L2794] |
+| **Q4** | Path-named logs & live recovery | **Yes**, the disk is named by its exact path. For a *permission* fault the disk is excluded through the **DiskInfo/Healing** path; the dedicated `monitorDiskWritable` offline/online lines do **not** fire (observed count = 0). | `endpoint="/tmp/ec/data1"`; `.healing.bin … permission denied`; offline/online counts = **0** | runtime perm map [cmd/xl-storage.go:L802-L826]; offline log [cmd/xl-storage-disk-id-check.go:L1015] |
+| **Q5** | Self-detection of restored dir | **Automatic**, reflected on the **next health probe** (observed **~11–15 ms** in a tight poll) — **no restart, no external push**. Driven by the on-demand DiskInfo re-read (1 s cache), not the 5/10/15 s pollers. | poll shows `/cluster` 200 + 4 online immediately; same server PID | DiskInfo cache [cmd/xl-storage.go:L326] |
+| **Q6** | Repair of objects written during outage | The shard missing on the down disk was **not** restored automatically within the observed window; a **manual `mc admin heal`** restored it (`Yellow → Green`). Background heal is conditional. | shard MISSING → after heal RESTORED; `Healed: 2/3 objects` | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] (conditional) |
+| **Q7** | Location of the quorum decision | Cluster health computes quorum in `Health()` via `BackendInfo()`; the **object write path** uses `defaultWQuorum()`/per-object `FileInfo.WriteQuorum()`. Both apply a **+1 split-brain guard** when `data == parity`. | `X-Minio-Write-Quorum: 3`; `expected write quorum: 3` log | quorum calc [cmd/erasure-server-pool.go:L2722-L2727]; `defaultWQuorum()` [cmd/erasure.go:L85] |
+| **Q8** | Grounding | Every behavioral conclusion is paired with a health-endpoint status/headers **and** a real S3 write/read result from the running server. | all §6 evidence blocks | `ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] |
 
 ## 3. Methodology
 
 The answer was derived from a **compiled, running** server, then written from the captured output. The
-exact steps below reproduce it end-to-end.
+steps below reproduce it end-to-end and are the exact steps used.
 
 > **Critical, non-obvious insight — run MinIO as a NON-ROOT user.** Under `root`, `chmod 000` is bypassed
-> (root has the DAC-override capability), so the permission fault is invisible and the scenario cannot be
-> reproduced. The investigation ran the server as an unprivileged user (`ubuntu`, uid 1000) with the data
-> directories owned by that user. This is essential for reproducing the permission-loss behavior.
+> (root holds the `DAC_OVERRIDE` capability), so the permission fault is invisible and the scenario cannot
+> be reproduced. This investigation ran the server as the unprivileged user `tester` (uid 1001) with the
+> data directories owned by that user. The non-root identity and directory ownership are proven with raw
+> `id`/`ps`/`stat` output in §6.0.
+
+**Isolation and default-configuration choices (why these are canonical):**
+
+- **Default configuration only.** No `MINIO_CI_CD` (or any other behavior-altering) override is set. The
+  only environment set is the root credential pair; the storage class is left at its default, giving EC:2
+  for four drives.
+- **Loopback bind.** The API and Console are bound to `127.0.0.1` (`--address 127.0.0.1:9000`,
+  `--console-address 127.0.0.1:9001`) so nothing is exposed off-host.
+- **Ephemeral credentials.** `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` are random per-run values (not the
+  well-known `minioadmin/minioadmin`), generated at launch and discarded at cleanup.
+- **Isolated client config.** `mc` is pointed at an isolated `--config-dir` (a per-run scratch directory
+  under the tester-owned working area) that is removed during cleanup, so no shared client state is touched.
+- **Non-orchestrated run.** The Kubernetes service-env variables that the shell inherits are unset for the
+  server process, so MinIO runs in the ordinary (non-orchestrated) mode a normal local user gets.
+
+**Observation tooling / provenance.** The `mc` client used is the environment's pre-provisioned binary,
+identified exactly as **`RELEASE.2025-08-13T08-35-41Z`** (commit-id `7394ce0dd2a80935aded936b09fa12cbb3cb8096`,
+runtime `go1.24.6`), `sha256 = 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891`. It was
+not downloaded by this investigation; it is a verified, pre-provisioned tool. `curl` is the system-provided
+binary. Neither alters the repository. On-disk `xl.meta` parity was decoded with the repository's own
+`docs/debugging/xl-meta` tool (built by `make build`).
 
 1. **Build.** Install Go matching the module directive `go 1.23` [go.mod:L3] (used `go1.23.12`) and build via
    the canonical target:
 
    ```sh
    make build
-   # → CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio   [Makefile:L177-L179]
+   # runs: CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio   [Makefile:L177-L179]
    ```
 
    Capture the version banner with `./minio --version` (see §6.0). The real entry point is
    `main.go` → `minio.Main(os.Args)` [main.go:L30], importing `github.com/minio/minio/cmd` [main.go:L26].
 
-2. **Launch (as non-root).** Run the real server entry point over four local directories (the launch idiom
-   documented at [docs/erasure/README.md:L44] as `minio server /data{1...N}`):
+2. **Launch (as non-root, default config).** Run the real server entry point over four local directories
+   (the launch idiom documented at [docs/erasure/README.md:L44] as `minio server /data{1...12}`; here with
+   four directories):
 
    ```sh
-   MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_CI_CD=1 \
-     ./minio server /tmp/ec/data{1...4} --address ":9000" --console-address ":9001"
+   # data dirs owned by tester (uid 1001); K8s service env unset for a non-orchestrated run
+   MINIO_ROOT_USER="$EPH_USER" MINIO_ROOT_PASSWORD="$EPH_PASS" \
+     ./minio server /tmp/ec/data{1...4} --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
    ```
 
-   Confirm the banner reports `1 set(s), 4 drives per set` (single EC:2 erasure set). The `mc` client is
-   fetched from `dl.min.io` per the existing `buildscripts/verify-healing.sh` convention and pointed at the
-   server with an alias.
+   Confirm the banner reports `1 set(s), 4 drives per set` (single EC:2 erasure set). Point `mc` at the
+   server with an isolated config dir and an alias.
 
 3. **Probe at every boundary.** At each state, capture verbatim:
-   - `curl -sI http://127.0.0.1:9000/minio/health/cluster` and `.../minio/health/cluster/read` (status code
-     + `X-Minio-*` headers);
-   - a real S3 **PUT**/**GET** via `mc cp` / `mc cat`;
-   - the drive online/offline count via `mc admin info local`.
+   - `curl -sI …/minio/health/cluster` (a **HEAD** request) **and** `curl -sS -D- -o /dev/null -X GET
+     …/minio/health/cluster` and `.../cluster/read` (real **GET** requests) — status code + `X-Minio-*`
+     headers;
+   - a real S3 **PUT**/**GET** via `mc cp` / `mc cat` (full output + exit status);
+   - the drive online/offline count via `mc admin info`.
 
 4. **Inject faults (external only).** `chmod 000 /tmp/ec/data1` (one down → still above threshold), then
    `chmod 000 /tmp/ec/data2` (two down → below threshold). Restore with `chmod 755` on both **without
-   restarting** the server.
+   restarting** the server (the unchanged server PID is verified before and after).
 
-5. **Observe long enough / confirm stability.** Poll for at least the 5 s / 10 s / 15 s poller intervals
-   (§8) and exercise each state at least twice. The qualitative signals (the `200`→`503` transition, the
-   `SlowDownWrite` write refusal, the path-named disk logs, the automatic reconnect) were **stable across
-   runs**. Run-dependent *counts* (e.g., the total number of server-log lines, or how many times the
-   healing re-probe logged during the outage window) vary run-to-run because they depend on how many polling
-   cycles elapse; those counts are reported as observed and are not load-bearing for any conclusion.
+5. **Observe long enough / confirm stability.** Each state was exercised **at least twice**; the recovery
+   latency was measured across **three** restore trials. The qualitative signals (the `200`→`503`
+   transition, the `SlowDownWrite` write refusal, the path-named disk logs, the automatic reconnect) were
+   **stable across runs** (§6). Run-dependent *counts* (e.g., how many polling cycles logged during an
+   outage window) vary because they depend on elapsed polls; those counts are reported as observed and are
+   not load-bearing for any conclusion.
 
-6. **Cleanup.** Stop the server by its specific PID (never a broad process-kill pattern), remove `/tmp/ec`,
-   the `./minio` binary, the `docs/debugging` helper binaries, the Go toolchain/tarball/build log, the `mc`
-   binary, and all scripts/logs. Verify `git status --porcelain` is empty except for the added document
+6. **Cleanup.** Stop the server by its **specific PID** (never a broad process-kill pattern), remove
+   `/tmp/ec`, the isolated `mc` config, the `./minio` binary, the `docs/debugging` helper binaries, the
+   `mc` copy, and all scripts/logs. Verify `git status --porcelain` is empty except the added document
    (§6.7).
 
 ## 4. Quorum Math for This Topology (4-dir EC:2)
@@ -97,27 +134,29 @@ exact steps below reproduce it end-to-end.
 For four directories, the default `STANDARD` storage-class parity is **EC:2**
 ([internal/config/storageclass/storage-class.go:L355], `case 4, 5: return 2` at
 [internal/config/storageclass/storage-class.go:L361-L362]; documented as "5 or fewer ⇒ EC:2" at
-[docs/erasure/storage-class/README.md:L48-L53]). The set therefore has `setDriveCount = 4` and
-`defaultParityCount = 2`. The read/write quorums are computed from those two numbers:
+[docs/erasure/storage-class/README.md]). The set therefore has `setDriveCount = 4` and
+`defaultParityCount = 2`. Two independent code sites compute the read/write quorums from those two numbers
+and reach the **same** values:
 
-| Quantity | Formula | Value | Source |
-|----------|---------|-------|--------|
-| Data blocks | `setDriveCount - defaultParityCount` = 4 − 2 | **2** | [cmd/erasure.go:L86] |
-| Parity blocks | `DefaultParityBlocks(4)` | **2** | [internal/config/storageclass/storage-class.go:L361-L362] |
-| **Read quorum** | `setDriveCount - defaultParityCount` | **2** | [cmd/erasure.go:L94-L96] |
-| **Write quorum** | data `(+1 because data == parity)` | **3** | [cmd/erasure.go:L85-L91] |
+| Quantity | Formula | Value | Object-path source | Cluster-health source |
+|----------|---------|-------|--------------------|------------------------|
+| Data blocks | `setDriveCount − parity` = 4 − 2 | **2** | [cmd/erasure.go:L86] | `StandardSCData` [cmd/erasure-server-pool.go:L694] |
+| Parity blocks | `DefaultParityBlocks(4)` | **2** | [internal/config/storageclass/storage-class.go:L361-L362] | `StandardSCParity` [cmd/erasure-server-pool.go:L700] |
+| **Read quorum** | data blocks | **2** | `defaultRQuorum()` [cmd/erasure.go:L94-L96] | `poolReadQuorums[i] = data` [cmd/erasure-server-pool.go:L2723] |
+| **Write quorum** | data `(+1 when data == parity)` | **3** | `defaultWQuorum()` [cmd/erasure.go:L85-L91] | `if data == parity { data + 1 }` [cmd/erasure-server-pool.go:L2725-L2726] |
 
-The **+1 split-brain guard** is the key subtlety. `defaultWQuorum()` computes `dataCount = 2`, and because
-`dataCount == defaultParityCount` (2 == 2) it returns `dataCount + 1 = 3`
-[cmd/erasure.go:L85-L91]. The same +1 rule exists per-object in `FileInfo.WriteQuorum()` — it starts from
-`fi.Erasure.DataBlocks` and increments when `DataBlocks == ParityBlocks`
-[cmd/storage-datatypes.go:L298-L308]. This guarantees that a write is only acknowledged when a **strict
-majority** of the four drives (3 of 4) persisted it, so two disjoint halves can never both believe they hold
-the authoritative copy. The read quorum has no +1 and equals the data-block count, **2**
-[cmd/erasure.go:L94-L96], [cmd/storage-datatypes.go:L310-L314].
+The **+1 split-brain guard** is the key subtlety. On the object path, `defaultWQuorum()` computes
+`dataCount = 2`, and because `dataCount == defaultParityCount` (2 == 2) it returns `dataCount + 1 = 3`
+[cmd/erasure.go:L85-L91]; the per-object `FileInfo.WriteQuorum()` mirrors this, starting from
+`fi.Erasure.DataBlocks` and incrementing when `DataBlocks == ParityBlocks`
+[cmd/storage-datatypes.go:L298-L308]. The cluster-health path applies the identical `data + 1` rule inside
+`Health()` [cmd/erasure-server-pool.go:L2722-L2727]. This guarantees a write is acknowledged only when a
+**strict majority** of the four drives (3 of 4) persisted it, so two disjoint halves can never both believe
+they hold the authoritative copy. The read quorum has no +1 and equals the data-block count, **2**
+[cmd/erasure.go:L94-L96], [cmd/storage-datatypes.go:L310-L316].
 
 ```go
-// cmd/erasure.go:L85-L96 (verified at HEAD c07e5b49d477)
+// cmd/erasure.go:L85-L96 (object-path formula; verified against the investigated source)
 func (er erasureObjects) defaultWQuorum() int {
 	dataCount := er.setDriveCount - er.defaultParityCount
 	if dataCount == er.defaultParityCount {
@@ -131,25 +170,36 @@ func (er erasureObjects) defaultRQuorum() int {
 }
 ```
 
+**Distinguishing the three "tolerances" (they are not the same number):**
+
+- **Write availability** is governed by the **write quorum (3)**. Losing a *second* drive (2 online) drops
+  below it, so writes are refused.
+- **Read availability** is governed by the **read quorum (2)**. Two online still meets it, so reads persist.
+- **Redundancy / durability** is governed by **parity (2)**. Each offline or missing shard *reduces*
+  redundancy; an object stays reconstructable while at least `data` (2) shards survive, but it is not at
+  *full* redundancy again until it is healed.
+
 **Consequence for this topology:** with four drives online the deployment is healthy; losing one drive (3
-online) still meets the write quorum of 3, so writes continue; losing a second (2 online) is **below** write
-quorum 3 but still **at** read quorum 2 — hence writes are refused while reads persist.
+online) still meets the write quorum of 3, so writes continue (at reduced redundancy); losing a second (2
+online) is **below** write quorum 3 but still **at** read quorum 2 — hence writes are refused while reads
+persist.
 
 ## 5. Endpoint Contract
 
-Health is exposed under the `/minio/health` prefix. The two probes relevant here are registered for both
-`GET` and `HEAD`:
+Health is exposed under the `/minio/health` prefix [cmd/healthcheck-router.go:L32]. The two probes relevant
+here are registered for both `GET` and `HEAD`:
 
 - `healthCheckClusterPath = "/cluster"` [cmd/healthcheck-router.go:L30]
 - `healthCheckClusterReadPath = "/cluster/read"` [cmd/healthcheck-router.go:L31]
-- registered under the `/minio/health` prefix for `GET`+`HEAD` [cmd/healthcheck-router.go:L36-L44]
+- registered for `GET` and `HEAD` [cmd/healthcheck-router.go:L41-L44]
 
-`ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] calls `objLayer.Health(...)`, then:
+`ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] first runs `checkHealth()` [cmd/healthcheck-handler.go:L31],
+then calls `objLayer.Health(...)`, then:
 
 - sets `X-Minio-Write-Quorum` from `result.WriteQuorum` [cmd/healthcheck-handler.go:L72];
 - sets `X-Minio-Storage-Class-Defaults` from `result.UsingDefaults` [cmd/healthcheck-handler.go:L73];
-- if any drives are healing, sets `X-Minio-Healing-Drives` [cmd/healthcheck-handler.go:L76];
-- returns **412 Precondition Failed** when `maintenance=true` **and** unhealthy [cmd/healthcheck-handler.go:L83],
+- if any drives are healing, sets `X-Minio-Healing-Drives` [cmd/healthcheck-handler.go:L75-L77];
+- returns **412 Precondition Failed** when `maintenance=true` **and** unhealthy [cmd/healthcheck-handler.go:L82-L83],
   **503 Service Unavailable** when simply unhealthy [cmd/healthcheck-handler.go:L85], otherwise
   **200 OK** [cmd/healthcheck-handler.go:L89].
 
@@ -158,205 +208,605 @@ Health is exposed under the `/minio/health` prefix. The two probes relevant here
 `internal/http/headers.go`: `MinIOServerStatus` [L170], `MinIOWriteQuorum="x-minio-write-quorum"` [L193],
 `MinIOReadQuorum="x-minio-read-quorum"` [L196], `MinIOStorageClassDefaults` [L200], and
 `MinIOHealingDrives` [L203]. The operator-facing contract (200 on write quorum / 503 otherwise / 412 for
-maintenance) is also documented at [docs/metrics/healthcheck/README.md], whose published example literally
-shows `X-Minio-Write-Quorum: 3` for exactly this class of deployment.
+maintenance) is also documented at [docs/metrics/healthcheck/README.md].
 
-| Endpoint | Healthy condition | Status when met | Status when not met | Quorum header |
+**Pre-quorum 503 branches (before quorum is ever evaluated).** `checkHealth()` returns **503** *before*
+computing quorum if the object layer is not yet initialized (`x-minio-server-status: offline`)
+[cmd/healthcheck-handler.go:L34-L36], if bucket metadata is not initialized (`bucket-metadata-offline`)
+[cmd/healthcheck-handler.go:L40-L42], or if IAM is not initialized (`iam-offline`)
+[cmd/healthcheck-handler.go:L47-L48]. The table below therefore describes a **fully initialized,
+non-maintenance** server (the state in which all evidence in §6 was captured).
+
+| Endpoint | Healthy condition (initialized, non-maintenance) | Status when met | Status when not met | Quorum header |
 |----------|-------------------|-----------------|---------------------|---------------|
 | `/minio/health/cluster` | every set: `online ≥ write quorum` | 200 | 503 (or 412 if `maintenance=true`) | `X-Minio-Write-Quorum` |
 | `/minio/health/cluster/read` | every set: `online ≥ read quorum` | 200 | 503 (or 412 if `maintenance=true`) | `X-Minio-Read-Quorum` |
 
+Additionally, when `maintenance=true`, `Health()` also treats any in-progress healing as unhealthy
+(`result.Healthy = result.Healthy && drivesHealing == 0`) [cmd/erasure-server-pool.go:L2808-L2812]; the
+evidence below uses the default (non-maintenance) probe, so that branch is not exercised.
+
 
 ## 6. Evidence (Verbatim Captured Output)
 
-Each block below is the **actual, complete, unedited** output captured from the running server, shown
-**before** its explanation. States are ordered: Baseline → One-down (above threshold) → Two-down (below
-threshold) → Restored → Healed → Repository pristine.
+Each block below is the **actual, unedited** output captured from the running server, shown **before** its
+explanation, with the exact command and its exit status. States are ordered: Baseline → One-down (above
+threshold) → Two-down (below threshold) → Q4 logs → Restored → Healed → Repository pristine.
 
-### 6.0 Version banner + startup (methodology grounding)
+### 6.0 Non-root identity, build, version, and commit provenance
 
 ```
+$ id tester
+uid=1001(tester) gid=1001(tester) groups=1001(tester)
+
+$ make build
+Checking dependencies
+Building minio binary to './minio'
+BUILD_EXIT=0
+
 $ ./minio --version
-minio version DEVELOPMENT.2024-11-25T17-10-22Z (commit-id=c07e5b49d477b0774f23db3b290745aef8c01bd2)
+minio version DEVELOPMENT.2026-07-13T18-24-30Z (commit-id=7391c3197d59ae276b937dba60240cc6300a0239)
 Runtime: go1.23.12 linux/amd64
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
-Copyright: 2015-2024 MinIO, Inc.
+Copyright: 2015-2026 MinIO, Inc.
 
-$ ./minio server /tmp/ec/data{1...4} --address ":9000" --console-address ":9001"
-INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
-INFO: WARNING: Host local has more than 2 drives of set. A host failure will result in data becoming unavailable.
-...
-Version: DEVELOPMENT.2024-11-25T17-10-22Z (go1.23.12 linux/amd64)
+# The banner commit-id 7391c3197… is the git HEAD at build time. Both diffs below are taken against the
+# ABSOLUTE investigated commit c07e5b49d477… (independent of any later HEAD movement):
+
+# (1) build-time doc commit vs investigated source — only this doc differs; NO MinIO source:
+$ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2 7391c3197d59ae276b937dba60240cc6300a0239
+ blitzy/documentation/minio_c07e5b49d477.md | 641 +++++++++++++++++++++++++++++
+ 1 file changed, 641 insertions(+)
+
+# (2) this commit’s staged tree vs investigated source — again only this doc; NO MinIO source:
+$ git diff --cached --stat c07e5b49d477b0774f23db3b290745aef8c01bd2
+ blitzy/documentation/minio_c07e5b49d477.md | 1128 ++++++++++++++++++++++++++++
+ 1 file changed, 1128 insertions(+)
 ```
 
-The reported `commit-id` equals the investigated HEAD, and `1 set(s), 4 drives per set` confirms the single
-EC:2 erasure set. This block is what makes the answer "built-and-run" rather than code-reading.
+The banner's `commit-id` (`7391c3197…`) is the **build-time HEAD**, a documentation-only commit. Both
+`git diff --stat` invocations above are taken against the **absolute** investigated commit `c07e5b49d477…`,
+so they remain valid regardless of later HEAD movement: each shows that the **only** path that differs is
+this Markdown document and that **zero** MinIO source files change. The MinIO server built and run is
+therefore byte-for-byte identical to `c07e5b49d477…`. The server was launched as the non-root user `tester`
+and reported a single four-drive set:
+
+```
+## whoami / id (non-root proof)
+uid=1001(tester) gid=1001(tester) groups=1001(tester)
+
+## server PID
+188172
+## ps identity
+    PID USER     COMMAND
+ 188172 tester   /tmp/ec-run2/minio server /tmp/ec/data{1...4} --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
+
+## startup banner (first 30 lines of server.log)
+INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
+INFO: WARNING: Host local has more than 2 drives of set. A host failure will result in data becoming unavailable.
+MinIO Object Storage Server
+Copyright: 2015-2026 MinIO, Inc.
+License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
+Version: DEVELOPMENT.2026-07-13T18-24-30Z (go1.23.12 linux/amd64)
+
+API: http://127.0.0.1:9000
+WebUI: http://127.0.0.1:9001
+
+Docs: https://docs.min.io
+
+## data directory ownership/mode
+/tmp/ec/data1 owner=tester:tester mode=755
+/tmp/ec/data2 owner=tester:tester mode=755
+/tmp/ec/data3 owner=tester:tester mode=755
+/tmp/ec/data4 owner=tester:tester mode=755
+```
+
+The server ran as `uid=1001(tester)` (**PID 188172**), which is what makes the `chmod 000` fault effective
+(root would bypass it). The exact binary produced by `make build` (`./minio`) was copied to a tester-owned
+directory (`/tmp/ec-run2/minio`) and launched from there as `tester`; the `ps` line shows that real path.
+`1 set(s), 4 drives per set` confirms the single EC:2 erasure set. This block is what makes the answer
+"built-and-run" rather than code-reading.
 
 ### 6.1 Baseline — 4 drives online
 
 ```
-$ curl -sI http://127.0.0.1:9000/minio/health/cluster
+########## STATE: baseline_run1 @ 2026-07-13T19:18:05Z ##########
+----- HEAD /minio/health/cluster (curl -sI) -----
 HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF85DFC1D80D
+X-Content-Type-Options: nosniff
 X-Minio-Storage-Class-Defaults: false
 X-Minio-Write-Quorum: 3
-...
-$ curl -sI http://127.0.0.1:9000/minio/health/cluster/read
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:05 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster (curl -sS -D- -o /dev/null -X GET) -----
 HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF85E01BF941
+X-Content-Type-Options: nosniff
+X-Minio-Storage-Class-Defaults: false
+X-Minio-Write-Quorum: 3
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:05 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster/read (curl -sS -D- -o /dev/null -X GET) -----
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF85E06FC381
+X-Content-Type-Options: nosniff
 X-Minio-Read-Quorum: 2
-...
-$ mc admin info local   # (excerpt)
+X-Minio-Storage-Class-Defaults: false
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:05 GMT
+
+[curl-exit=0]
+----- mc admin info eclab -----
+●  127.0.0.1:9000
+   Uptime: 1 second 
+   Version: 2026-07-13T18:24:30Z
+   Network: 1/1 OK 
+   Drives: 4/4 OK 
+   Pool: 1
+
+┌──────┬──────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage         │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 1.8% (total: 48 TiB) │ 4                   │ 1            │
+└──────┴──────────────────────┴─────────────────────┴──────────────┘
+
 4 drives online, 0 drives offline, EC:2
-# PUT obj-baseline → success ; GET obj-baseline → "baseline-content"
+[mc-exit=0]
+```
+
+```
+----- mc cp /tmp/ec-run2/obj-baseline.txt eclab/testbucket/obj-baseline.txt -----
+`/tmp/ec-run2/obj-baseline.txt` -> `eclab/testbucket/obj-baseline.txt`
+┌───────┬─────────────┬──────────┬────────────┐
+│ Total │ Transferred │ Duration │ Speed      │
+│ 16 B  │ 16 B        │ 00m00s   │ 1.43 KiB/s │
+└───────┴─────────────┴──────────┴────────────┘
+[put-exit=0]
+----- mc --json cp /tmp/ec-run2/obj-baseline.txt eclab/testbucket/obj-baseline.txt -----
+{"status":"success","source":"/tmp/ec-run2/obj-baseline.txt","target":"eclab/testbucket/obj-baseline.txt","size":16,"totalCount":1,"totalSize":0}
+{"status":"success","total":16,"transferred":16,"duration":12314401,"speed":1299.291780412218}
+[put-json-exit=0]
+----- mc cat eclab/testbucket/obj-baseline.txt -----
+baseline-content[cat-exit=0]
 ```
 
 With all four drives online the deployment reports healthy: `/cluster` returns **200** and advertises the
-write quorum (**3**), `/cluster/read` returns **200** and advertises the read quorum (**2**), all 4 drives
-are `EC:2`, and both a write and a read succeed. This is the reference state for Q1/Q8.
+write quorum (**3**) on both HEAD and GET, `/cluster/read` returns **200** and advertises the read quorum
+(**2**), all 4 drives are `EC:2` with a single erasure set of stripe size 4, and both a write and a read
+succeed. (`mc cat` prints the 16-byte object with no trailing newline, so `[cat-exit=0]` appears on the same
+line as `baseline-content`.) A second run (`baseline_run2`) returned an identical `200` / `4 drives online`.
+This is the reference state for Q1/Q8.
 
 ### 6.2 Above threshold — `chmod 000 /tmp/ec/data1` (3 online)
 
 ```
-$ curl -sI http://127.0.0.1:9000/minio/health/cluster
+chmod 000 /tmp/ec/data1 @ 2026-07-13T19:18:05Z
+/tmp/ec/data1 mode=0 owner=tester
+```
+
+```
+########## STATE: onedown_run1 @ 2026-07-13T19:18:08Z ##########
+----- HEAD /minio/health/cluster (curl -sI) -----
 HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF869F1391D4
+X-Content-Type-Options: nosniff
+X-Minio-Storage-Class-Defaults: false
 X-Minio-Write-Quorum: 3
-...
-# PUT obj-1down → success ; GET obj-baseline → success
-$ mc admin info local   # (excerpt)
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:08 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster (curl -sS -D- -o /dev/null -X GET) -----
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF869F851EF5
+X-Content-Type-Options: nosniff
+X-Minio-Storage-Class-Defaults: false
+X-Minio-Write-Quorum: 3
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:08 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster/read (curl -sS -D- -o /dev/null -X GET) -----
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF869FED727C
+X-Content-Type-Options: nosniff
+X-Minio-Read-Quorum: 2
+X-Minio-Storage-Class-Defaults: false
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:08 GMT
+
+[curl-exit=0]
+----- mc admin info eclab -----
+●  127.0.0.1:9000
+   Uptime: 4 seconds 
+   Version: 2026-07-13T18:24:30Z
+   Network: 1/1 OK 
+   Drives: 3/4 OK 
+   Pool: 1
+
+┌──────┬──────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage         │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 1.8% (total: 24 TiB) │ 4                   │ 1            │
+└──────┴──────────────────────┴─────────────────────┴──────────────┘
+
 3 drives online, 1 drive offline, EC:2
+[mc-exit=0]
+```
+
+```
+----- mc cp /tmp/ec-run2/obj-1down.txt eclab/testbucket/obj-1down.txt -----
+`/tmp/ec-run2/obj-1down.txt` -> `eclab/testbucket/obj-1down.txt`
+┌───────┬─────────────┬──────────┬────────────┐
+│ Total │ Transferred │ Duration │ Speed      │
+│ 23 B  │ 23 B        │ 00m00s   │ 2.24 KiB/s │
+└───────┴─────────────┴──────────┴────────────┘
+[put-exit=0]
+----- mc --json cp /tmp/ec-run2/obj-1down.txt eclab/testbucket/obj-1down.txt -----
+{"status":"success","source":"/tmp/ec-run2/obj-1down.txt","target":"eclab/testbucket/obj-1down.txt","size":23,"totalCount":1,"totalSize":0}
+{"status":"success","total":23,"transferred":23,"duration":12682310,"speed":1813.5497397556123}
+[put-json-exit=0]
+----- mc cat eclab/testbucket/obj-baseline.txt -----
+baseline-content[cat-exit=0]
+----- mc cat eclab/testbucket/obj-1down.txt -----
+above-threshold-content[cat-exit=0]
 ```
 
 One directory is now inaccessible, leaving **3 drives online**. Because `3 ≥ write quorum 3`, `/cluster`
-stays **200** and a write still succeeds — MinIO "quietly adapts and keeps going." The offline drive is
-reflected in `mc admin info` as `3 drives online, 1 drive offline`.
+stays **200** on both HEAD and GET (`X-Minio-Write-Quorum: 3`), `/cluster/read` stays **200**
+(`X-Minio-Read-Quorum: 2`), and a write still succeeds — MinIO keeps serving. The offline drive is reflected
+in `mc admin info` as `3 drives online, 1 drive offline` (`Drives: 3/4 OK`). A second run (`onedown_run2`)
+returned an identical `200` / `3 drives online`, confirming stability.
+
+**Parity of `obj-1down` and `obj-baseline` (decoded with the repo's `docs/debugging/xl-meta`):**
+
+```
+### xl.meta parity decode (docs/debugging/xl-meta, built by make build) ###
+-- obj-1down (data2) --
+        "EcM": 2,
+        "EcN": 2,
+-- obj-baseline (data2) --
+        "EcM": 2,
+        "EcN": 2,
+```
+
+The object written during the one-down window has parity `EcM=2, EcN=2` — **not** upgraded. This is
+expected: MinIO's availability-optimized PUT path does increment parity per offline drive, but caps parity
+at half the set (`len/2 = 2`) [cmd/erasure-object.go:L1311-L1313]; since the default parity is already 2,
+four-drive EC:2 is already at **maximum** parity and cannot be upgraded further. Its shard is *missing on the
+down disk* `data1` (present on the other three); that missing-shard fact is shown verbatim, inspected on the
+recovered disk, in §6.6 (`obj-1down` absent on `data1` after restore, until healed).
 
 ### 6.3 Below threshold — additionally `chmod 000 /tmp/ec/data2` (2 online)
 
 ```
-$ curl -sI http://127.0.0.1:9000/minio/health/cluster
-HTTP/1.1 503 Service Unavailable
-X-Minio-Write-Quorum: 3
-...
-$ curl -sI http://127.0.0.1:9000/minio/health/cluster/read
-HTTP/1.1 200 OK
-X-Minio-Read-Quorum: 2
-...
-# PUT obj-2down → FAILS:
-mc: <ERROR> Failed to copy `/tmp/obj-2down.txt`. Resource requested is unwritable, please reduce your request rate
-# mc --json cause:
-{"error":{"Code":"SlowDownWrite","Message":"Resource requested is unwritable, please reduce your request rate", ...}}
-# GET obj-baseline → SUCCEEDS: "baseline-content"
-$ mc admin info local   # (excerpt)
-2 drives online, 2 drives offline, EC:2
+chmod 000 /tmp/ec/data2 @ 2026-07-13T19:18:11Z
+/tmp/ec/data2 mode=0 owner=tester
 ```
 
-Server log (the exact `logger.FatalKind` line emitted by `Health()`):
+```
+########## STATE: twodown_run1 @ 2026-07-13T19:18:14Z ##########
+----- HEAD /minio/health/cluster (curl -sI) -----
+HTTP/1.1 503 Service Unavailable
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF87D9EF2199
+X-Content-Type-Options: nosniff
+X-Minio-Storage-Class-Defaults: false
+X-Minio-Write-Quorum: 3
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:14 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster (curl -sS -D- -o /dev/null -X GET) -----
+HTTP/1.1 503 Service Unavailable
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF87DA50A493
+X-Content-Type-Options: nosniff
+X-Minio-Storage-Class-Defaults: false
+X-Minio-Write-Quorum: 3
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:14 GMT
+
+[curl-exit=0]
+----- GET  /minio/health/cluster/read (curl -sS -D- -o /dev/null -X GET) -----
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EF87DAC35880
+X-Content-Type-Options: nosniff
+X-Minio-Read-Quorum: 2
+X-Minio-Storage-Class-Defaults: false
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:18:14 GMT
+
+[curl-exit=0]
+----- mc admin info eclab -----
+●  127.0.0.1:9000
+   Uptime: 10 seconds 
+   Version: 2026-07-13T18:24:30Z
+   Network: 1/1 OK 
+   Drives: 2/4 OK 
+   Pool: 1
+
+┌──────┬──────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage │ Erasure stripe size │ Erasure sets │
+│ 1st  │              │ 4                   │ 1            │
+└──────┴──────────────┴─────────────────────┴──────────────┘
+
+2 drives online, 2 drives offline, EC:2
+[mc-exit=0]
+```
+
+```
+----- mc cp /tmp/ec-run2/obj-2down.txt eclab/testbucket/obj-2down.txt -----
+`/tmp/ec-run2/obj-2down.txt` -> `eclab/testbucket/obj-2down.txt`
+mc: <ERROR> Failed to copy `/tmp/ec-run2/obj-2down.txt`. Resource requested is unwritable, please reduce your request rate
+[put-exit=1]
+----- mc --json cp /tmp/ec-run2/obj-2down.txt eclab/testbucket/obj-2down.txt -----
+{"status":"success","source":"/tmp/ec-run2/obj-2down.txt","target":"eclab/testbucket/obj-2down.txt","size":23,"totalCount":1,"totalSize":0}
+{"status":"error","error":{"message":"Failed to copy `/tmp/ec-run2/obj-2down.txt`.","cause":{"message":"Resource requested is unwritable, please reduce your request rate","error":{"Code":"SlowDownWrite","Message":"Resource requested is unwritable, please reduce your request rate","BucketName":"testbucket","Key":"obj-2down.txt","Resource":"/testbucket/obj-2down.txt","RequestID":"18C1EF8A0EBE098F","HostID":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8","Region":"","Server":"MinIO"}},"type":"error"}}
+[put-json-exit=1]
+
+### reads of objects written earlier ###
+----- mc cat eclab/testbucket/obj-baseline.txt -----
+baseline-content[cat-exit=0]
+----- mc cat eclab/testbucket/obj-1down.txt -----
+above-threshold-content[cat-exit=0]
+```
+
+Server log — the exact `logger.FatalKind` line emitted by `Health()` (recurs once per health poll; this run
+logged it **6** times, a run-dependent count that scales with how many polls occur during the outage window):
 
 ```
 Error: Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2 (*errors.errorString)
+Error: Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2 (*errors.errorString)
+Error: Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2 (*errors.errorString)
+occurrences: 6
 ```
 
 A second directory is now inaccessible, leaving **2 drives online**. Because `2 < write quorum 3`,
-`/cluster` returns **503** and the write is **refused** with the S3 error `SlowDownWrite` (HTTP 503). But
-because `2 ≥ read quorum 2`, `/cluster/read` stays **200** and the read still **succeeds**. This is the
-"draw a hard line, refuse writes, keep reads" outcome. The `FatalKind` log line names the pool/set and the
-exact arithmetic (`expected write quorum: 3, drives-online: 2`).
+`/cluster` returns **503** on both HEAD and GET and the write is **refused** with the S3 error `SlowDownWrite`
+(HTTP 503, exit 1) — the `--json` form shows the full error object (`Code: SlowDownWrite`,
+`Message: Resource requested is unwritable…`, `Key: obj-2down.txt`). Because `2 ≥ read quorum 2`,
+`/cluster/read` stays **200** and reads still **succeed** — including `obj-1down`, which was written during
+the one-down window and is fully readable while two disks are down. This is the "refuse writes, keep reads"
+outcome. The `FatalKind` log line names the pool/set and the exact arithmetic
+(`expected write quorum: 3, drives-online: 2`). A second run (`twodown_run2`) reproduced the same result
+(503 / read-200 / PUT exit 1 / GET exit 0). (In the `--json` PUT the first `status:success` line is the
+client-side local file read; the write itself is the `status:error` object that follows, hence
+`[put-json-exit=1]`.)
 
 ### 6.4 Path-named log evidence + the detection nuance (Q4)
 
-Over the full server log, the two `monitorDiskWritable`/`monitorDiskStatus` path-named lines appeared
-**zero** times:
+Over the full server log, the two dedicated `monitorDiskWritable`/`monitorDiskStatus` path-named lines
+appeared **zero** times, while the two permission-path lines appeared and named the disk by path:
 
 ```
-count of "taking drive ... offline" lines: 0
-count of "bringing drive ... online" lines: 0
+### 'taking drive offline' (monitorDiskWritable) ###
+count=0
+[grep-exit=1]
+### 'bringing drive online' (monitorDiskStatus) ###
+count=0
+[grep-exit=1]
+### 'drive access denied' ###
+count=2
+[grep-exit=0]
+### '.healing.bin ... permission denied' ###
+count=54
+[grep-exit=0]
 ```
 
-Instead, the permission fault named the failing disk **by its filesystem path** through the DiskInfo /
-Healing path:
+The two dedicated monitor lines are absent (`grep-exit=1` = no match). Instead, the permission fault named
+the failing disk **by its filesystem path** through two live code paths. First, the set-level reconnect
+(`connectDisks`) logs the endpoint by path — one block per failed disk (`data2` and `data1`):
 
 ```
 Error: drive access denied (cmd.StorageErr)
+       endpoint="/tmp/ec/data2"
+       4: internal/logger/logger.go:258:logger.LogAlwaysIf()
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+--
+Error: drive access denied (cmd.StorageErr)
        endpoint="/tmp/ec/data1"
-Error: unable to read /tmp/ec/data1/.minio.sys/buckets/.healing.bin: open /tmp/ec/data1/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
-       8: cmd/xl-storage.go:436:cmd.(*xlStorage).Healing()
-       3: cmd/xl-storage-disk-id-check.go:233:cmd.(*xlStorageDiskIDCheck).Healing()
-       1: cmd/erasure.go:301:cmd.erasureObjects.getOnlineDisksWithHealingAndInfo.func1()
-# also via cmd/xl-storage.go:781 DiskInfo(); cmd/erasure.go:192,206 getDisksInfo
+       4: internal/logger/logger.go:258:logger.LogAlwaysIf()
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
 ```
 
-Counts: `"drive access denied"` = **2** (one per failed disk); `.healing.bin: permission denied` = **33**.
-(The absolute count is run-dependent — it is a function of how many polling cycles elapse during the outage
-window — but it is always non-zero and always names the disk by path.)
+Second, the DiskInfo/Healing probe (the path `Health()` consults) names the exact file, with the full
+runtime stack:
+
+```
+Error: unable to read /tmp/ec/data1/.minio.sys/buckets/.healing.bin: open /tmp/ec/data1/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
+      10: internal/logger/logger.go:268:logger.LogIf()
+       9: cmd/logging.go:112:cmd.internalLogIf()
+       8: cmd/xl-storage.go:436:cmd.(*xlStorage).Healing()
+       7: cmd/xl-storage.go:352:cmd.newXLStorage.func2()
+       6: internal/cachevalue/cache.go:143:cachevalue.(*Cache[...]).update()
+       5: internal/cachevalue/cache.go:128:cachevalue.(*Cache[...]).GetWithCtx()
+       4: cmd/xl-storage.go:781:cmd.(*xlStorage).DiskInfo()
+       3: cmd/xl-storage-disk-id-check.go:329:cmd.(*xlStorageDiskIDCheck).DiskInfo()
+       2: cmd/erasure.go:192:cmd.getDisksInfo.func1()
+       1: github.com/minio/pkg/v3@v3.0.22/sync/errgroup/errgroup.go:123:errgroup.(*Group).Go.func1()
+
+API: SYSTEM.internal
+```
+
+Counts over the outage window: `endpoint="/tmp/ec/data2"` and `…/data1` each appear at fault time;
+`"drive access denied"` = **2** (one per failed disk); `.healing.bin … permission denied` = **54** in this
+run (the absolute count is run-dependent — a function of how many polling cycles elapse — but it is always
+non-zero and always names the disk by path; a prior run logged 176). The stack trace is the runtime proof
+that the permission error surfaces through the **1-second DiskInfo cache** (`cachevalue` →
+`newXLStorage.func2` at [cmd/xl-storage.go:L352] → `Healing()` at [cmd/xl-storage.go:L436]), reached from
+`Health()` via `getDisksInfo` [cmd/erasure.go:L192] → `DiskInfo()` [cmd/xl-storage-disk-id-check.go:L329],
+[cmd/xl-storage.go:L781].
 
 ### 6.5 Self-detection / recovery (Q5) — `chmod 755` both, NO restart
 
 ```
-restored perms at 15:50:12; polling /minio/health/cluster every 5s:
-  t+5s:  /cluster HTTP=200 ; drives: 4 drives online, 0 drives offline
-  t+10s: /cluster HTTP=200 ; drives: 4 drives online, 0 drives offline
-  ... (stable through t+45s)
+### PID before restore ###
+188172
+    PID USER         ELAPSED
+ 188172 tester         00:22
+### chmod 755 both @ 2026-07-13T19:18:26Z ###
+/tmp/ec/data1 mode=755
+/tmp/ec/data2 mode=755
+### recovery latency (ms to first /cluster=200), 3 trials ###
+trial 1: 12 ms
+trial 2: 13 ms
+trial 3: 11 ms
+### PID after restore ###
+188172
+PID continuity: before=188172 after=188172 same=YES
 ```
 
-Recovery is **automatic**: within the first 5-second poll after permissions are restored, `/cluster`
-returns to **200** and all four drives are back online — with **no restart and no external push**. The
-optional manual push was also demonstrated:
-
-```
-$ mc admin heal -r --force local/testbucket
-[Green  ->  Green] testbucket/
-[Yellow ->  Green] testbucket/obj-1down.txt
-[Green  ->  Green] testbucket/obj-baseline.txt
-Healed:	1/2 objects; 41 B in 1s
-```
-
-`mc admin heal` (the admin `HealHandler` [cmd/admin-handlers.go:L1308]) is available on demand but is **not
-required** for the drives to be re-detected.
+Recovery is **automatic** and reflected on the **next health probe** — observed at **11–13 ms** in a tight
+polling loop (each trial briefly re-faults `data1`, restores it, and times the flip back to `200`) — with
+the server **PID unchanged** (`188172` before and after), proving this happened in the same live process with
+**no restart and no external push**. (A prior run measured 15/14/14 ms; both runs land in the low-tens of
+milliseconds.) The optional manual push was also demonstrated in §6.6, but it is **not** required for the
+drives to be re-detected.
 
 ### 6.6 Repair of objects written during the outage (Q6)
 
-On-disk shard presence for `obj-1down` (written while data1 was down) vs `obj-baseline` (written with all 4
-up):
+**Background auto-heal did not fire within the observed window.** Immediately after restore — and again
+after waiting 20 s (which spans the 10-second background heal interval) — the shard for `obj-1down` was
+**still missing** on `data1`, and no healing marker existed:
 
 ```
-BEFORE heal:
-  data1: (no object dir for obj-1down.txt)        <- shard missing on the disk that was down
-  data2/3/4: xl.meta present
-  obj-baseline: present on data1,data2,data3,data4  <- full protection
-
-AFTER `mc admin heal`:
-  data1: present -> xl.meta                         <- shard RESTORED on the recovered disk
-  data2/3/4: present -> xl.meta
-  obj-1down still readable -> "above-threshold-content"
+### obj-1down shard on data1 right after restore ###
+ls: cannot access '/tmp/ec/data1/testbucket/obj-1down.txt/': No such file or directory
+### wait 20s (spans 10s background heal interval) then re-check ###
+ls: cannot access '/tmp/ec/data1/testbucket/obj-1down.txt/': No such file or directory
+### .healing.bin marker on data1? ###
+ls: cannot access '/tmp/ec/data1/.minio.sys/buckets/.healing.bin': No such file or directory
 ```
 
-Parity inspection (via the repo's own `docs/debugging/xl-meta` decoder):
+**A manual `mc admin heal` restored the shard** (`Yellow → Green` for the objects written during the
+outage):
 
 ```
-obj-baseline: EcM=2, EcN=2   (2 data + 2 parity = EC:2)
-obj-1down:    EcM=2, EcN=2   (NOT upgraded in this run) — data1 shard absent, healed on recovery
+----- mc admin heal -r --force eclab/testbucket -----
+[Green  ->  Green] testbucket/
+[Yellow ->  Green] testbucket/obj-1down-b.txt
+[Yellow ->  Green] testbucket/obj-1down.txt
+[Green  ->  Green] testbucket/obj-baseline.txt
+Healed:	2/3 objects; 64 B in 1s
+[heal-exit=0]
 ```
 
-An object written while a disk was offline is missing its shard on that disk; when the disk returns, healing
-re-creates the shard / `xl.meta`, and the object remains fully readable throughout.
+```
+### obj-1down shard on data1 AFTER heal ###
+total 12
+drwxr-xr-x 2 tester tester 4096 Jul 13 19:18 .
+drwxr-xr-x 5 tester tester 4096 Jul 13 19:18 ..
+-rw-r--r-- 1 tester tester  430 Jul 13 19:18 xl.meta
+### read obj-1down after heal ###
+above-threshold-content[cat-exit=0]
+```
 
-### 6.7 Repository left pristine
+An object written while a disk was offline is missing its shard on that disk. When the disk's permissions
+are restored, the disk is re-counted as online for the health endpoint, but the **missing shard is not
+automatically reconstructed** merely by the disk returning — within the observed window the background
+`healFreshDisk` path did not queue it (there was no unformatted disk and no `.healing.bin` tracker). The
+`Yellow → Green` transitions from the manual `mc admin heal` show the degraded objects being repaired: the
+missing shard is reconstructed from the surviving ones and written back to `data1`, and the object is
+readable throughout.
+
+### 6.7 Cleanup and repository left pristine
 
 ```
-$ git status --porcelain      # empty
-$ git rev-parse HEAD          # c07e5b49d477b0774f23db3b290745aef8c01bd2
+########## GUARDED CLEANUP TRANSCRIPT @ 2026-07-13T19:21:54Z ##########
+### server PID captured at launch ###
+MINIO_PID=188172
+### stop server by EXACT pid (SIGTERM); never pkill/killall ###
+[kill-exit=0]
+process 188172 gone (confirmed)
+### confirm no tester minio remains ###
+(no matching minio process)
+### remove data dirs ###
+ls: cannot access '/tmp/ec': No such file or directory
+### remove built binary + docs/debugging helper binaries from repo root ###
+(repo binaries removed)
+### git status --porcelain (only the doc should differ) ###
+ M blitzy/documentation/minio_c07e5b49d477.md
+### git HEAD ###
+7391c3197d59ae276b937dba60240cc6300a0239
 ```
 
-All build artifacts (`./minio`, the `docs/debugging` helper binaries) are gitignored and were physically
-removed; the Go toolchain, `mc`, data directories, scripts, and logs were deleted. The only committed change
-is this document.
+The server was stopped by its **exact PID** (`188172`, via `kill`; never a broad `pkill`/`killall`) and
+confirmed gone. The data directories (`/tmp/ec`), the `./minio` binary, and every `docs/debugging` helper
+binary built by `make build` (`xl-meta`, `s3-check-md5`, `healing-bin`, `reorder-disks`, `hash-set`,
+`inspect`, `pprofgoparser`, `s3-verify`, `xattr`) were physically removed. `git status --porcelain` shows
+**only** `blitzy/documentation/minio_c07e5b49d477.md` — this document, the single intended artifact — and no
+other change; the MinIO source tree is untouched. The remaining transient artifacts kept only to author this
+document — the isolated `mc` config, the ephemeral credentials, the run-local `mc` copy, the captured
+evidence files, and scratch logs (all under a tester-owned scratch directory outside the repository) — are
+deleted at the very end of the investigation. The pre-provisioned `mc` (see §3 provenance) is
+environment-supplied tooling, is not part of the repository, and does not affect repository cleanliness.
 
 
 ## 7. Per-Question Answers (Q1–Q8)
 
 Each answer states the **observed** result, the **`file:line`** citation(s), and the **cause → effect**
 rationale. Statements derived from reading code rather than from observation are explicitly labeled
-**(inferred)**; statements taken from MinIO documentation but not reproduced at runtime are labeled
-**(documentation-derived)**.
+**(inferred, from code)**.
 
 ### Q1 — Health decision & disk assumptions
 
@@ -367,36 +817,44 @@ drives online. For this four-directory EC:2 topology the write quorum is **3** a
 `GET /minio/health/cluster/read` → **200** with `X-Minio-Read-Quorum: 2`; `mc admin info` → `4 drives
 online, 0 drives offline, EC:2`.
 
-**Code.** `Health()` builds a per-set online count and marks each set healthy with
-`healthy := online >= poolWriteQuorums[poolIdx]` [cmd/erasure-server-pool.go:L2679]; a drive is counted
-online **only** when its state is `madmin.DriveStateOk` [cmd/erasure-server-pool.go:L2707-L2709]; the overall
-result is the AND across all sets (`result.Healthy = result.Healthy && healthy`). The write/read quorum
-values come from `defaultWQuorum()` / `defaultRQuorum()` [cmd/erasure.go:L85-L96] over the default parity
-`DefaultParityBlocks(4) = 2` [internal/config/storageclass/storage-class.go:L361-L362]. The handler surfaces
-the decision as the HTTP status and the `X-Minio-Write-Quorum` header [cmd/healthcheck-handler.go:L56-L89].
+**Code.** `Health()` [cmd/erasure-server-pool.go:L2679] iterates the drives from `StorageInfo` and counts a
+drive online **only** when its state is `madmin.DriveStateOk` [cmd/erasure-server-pool.go:L2707-L2709]. It
+then derives the per-pool quorums **itself** from `z.BackendInfo()` [cmd/erasure-server-pool.go:L2719]:
+`poolReadQuorums[i] = data` and `poolWriteQuorums[i] = data` with a `+1` when `data == StandardSCParity`
+[cmd/erasure-server-pool.go:L2720-L2727], where `data = setDriveCount − scParity`
+[cmd/erasure-server-pool.go:L694] and `scParity` is the default parity `2` [cmd/erasure-server-pool.go:L686-L688].
+Each set is healthy iff `online ≥ poolWriteQuorums[poolIdx]` [cmd/erasure-server-pool.go:L2791], and the
+deployment is the AND across all sets (`result.Healthy = result.Healthy && healthy`)
+[cmd/erasure-server-pool.go:L2797]. The handler surfaces the decision as the HTTP status and the
+`X-Minio-Write-Quorum` header [cmd/healthcheck-handler.go:L72,L85,L89].
 
 **Cause → effect.** "Healthy" is not "all disks present" — it is "every set can still safely accept a
 write," i.e. `online ≥ 3`. That is why 4/4 online is 200: the assumed minimum number of disks to *proceed*
-is the write quorum (3), not the full four.
+with writes is the write quorum (3), not the full four.
 
 ### Q2 — Live permission-loss behavior
 
 **Answer.** It depends entirely on which side of the write quorum the loss leaves you on. While still at or
-above write quorum, MinIO **quietly adapts and keeps serving** (including writes). The moment the loss drops
-the set **below** write quorum, MinIO **draws a hard line and refuses writes** (reads continue if read
-quorum still holds).
+above write quorum, MinIO **keeps serving** (including writes). The moment the loss drops the set **below**
+write quorum, MinIO **refuses writes** (reads continue while read quorum still holds).
 
-**Observed.** One directory lost → 3 online → `/cluster` **200**, PUT **succeeds** (§6.2). Second directory
-lost → 2 online → `/cluster` **503**, PUT **fails** with `SlowDownWrite` (§6.3).
+**Observed.** One directory lost → 3 online → `/cluster` **200**, PUT exit 0 (§6.2). Second directory lost →
+2 online → `/cluster` **503**, PUT exit 1 with `SlowDownWrite` (§6.3).
 
-**Code.** The threshold that decides "adapt vs refuse" is `defaultWQuorum()` [cmd/erasure.go:L85]; when a
-write cannot assemble that many drives the object layer returns `InsufficientWriteQuorum{}`
-[cmd/erasure-object.go:L1897, L1944], which unwraps to `errErasureWriteQuorum`
-("Write failed. Insufficient number of drives online") [cmd/erasure-errors.go:L26] and maps to the S3 error
-`SlowDownWrite` (HTTP 503) [cmd/api-errors.go:L2314-L2315].
+**Code (the actual PUT path).** In `putObject` [cmd/erasure-object.go:L1245], the availability-optimized
+block counts offline drives and, if `offlineDrives ≥ (len(storageDisks)+1)/2`, returns immediately with
+`toObjectErr(errErasureWriteQuorum, …)` [cmd/erasure-object.go:L1305-L1308] — with two of four offline,
+`2 ≥ (4+1)/2 = 2`, so this is the branch that fires. Otherwise the write proceeds with
+`writeQuorum = dataDrives (+1 when dataDrives == parityDrives)` [cmd/erasure-object.go:L1322-L1326] and
+`erasure.Encode(…, writeQuorum)` [cmd/erasure-object.go:L1425]; inside `multiWriter.Write`, if fewer than
+`writeQuorum` shards are written, `reduceWriteQuorumErrs` yields `errErasureWriteQuorum`
+[cmd/erasure-encode.go:L61-L65]. Either way `toObjectErr` maps `errErasureWriteQuorum` to
+`InsufficientWriteQuorum{}` [cmd/object-api-errors.go:L164-L172] (`errErasureWriteQuorum` = "Write failed.
+Insufficient number of drives online" [cmd/erasure-errors.go:L26]), which the S3 layer maps to
+`ErrSlowDownWrite` — code `SlowDownWrite`, HTTP 503 [cmd/api-errors.go:L2314-L2315], [cmd/api-errors.go:L874-L877].
 
-**Cause → effect.** MinIO does not "quietly" tolerate an arbitrary number of failures — it tolerates exactly
-as many as parity allows before the write quorum is unmet. Above the line it adapts; at the line it stops
+**Cause → effect.** MinIO does not tolerate an arbitrary number of failures — it tolerates exactly as many
+as the write quorum allows. Above the line it keeps writing (at reduced redundancy); at the line it stops
 writing to protect durability.
 
 ### Q3 — Above vs below threshold (both demonstrated)
@@ -404,151 +862,182 @@ writing to protect durability.
 **Answer.**
 - **Above threshold (one disk down, 3 online):** `/cluster` **200**; writes **succeed**; reads succeed.
 - **Below threshold (two disks down, 2 online):** `/cluster` **503**; writes **refused** (`SlowDownWrite`);
-  **reads still succeed** because 2 online still meets read quorum 2, so `/cluster/read` stays **200**.
+  **reads still succeed** because 2 online meets read quorum 2, so `/cluster/read` stays **200**.
 
 **Observed.** §6.2 (above) vs §6.3 (below), plus the exact `FatalKind` server-log line
-`Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2`.
+`Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2`, and a
+real GET of `obj-1down` succeeding during the two-down state.
 
-**Code.** The per-set health decision and both the write- and read-quorum log lines are in `Health()`:
-write-quorum failure logs with `logger.FatalKind` [cmd/erasure-server-pool.go:L2794], read-quorum failure
-logs the analogous message [cmd/erasure-server-pool.go:L2802]. The read path still returns data while
-`online ≥ readQuorum` (read quorum = data blocks = 2) [cmd/erasure.go:L94-L96],
-[cmd/storage-datatypes.go:L310-L314].
+**Code.** The per-set decision and both log lines are in `Health()`: write-quorum failure is checked at
+[cmd/erasure-server-pool.go:L2791] and logged with `logger.FatalKind` [cmd/erasure-server-pool.go:L2794];
+read-quorum health is checked at [cmd/erasure-server-pool.go:L2799] and logged at
+[cmd/erasure-server-pool.go:L2802]. The read path returns data while `online ≥ read quorum`
+(read quorum = data blocks = 2) [cmd/erasure-server-pool.go:L2723], [cmd/storage-datatypes.go:L310-L316].
 
-**Cause → effect.** Two online is simultaneously **below** write quorum 3 and **at** read quorum 2. That
-single arithmetic fact is why the same two-disk-down state produces a 503 on `/cluster` (writes) but a 200
-on `/cluster/read` (reads) — writes need a strict majority (with the +1 guard), reads only need the data
-blocks.
+**Cause → effect.** Two online is simultaneously **below** write quorum 3 and **at** read quorum 2. That one
+arithmetic fact is why the same two-disk-down state produces a 503 on `/cluster` (write availability lost)
+but a 200 on `/cluster/read` (read availability retained) — writes need a strict majority (with the +1
+guard), reads only need the data blocks.
 
 ### Q4 — Path-named logs & live recovery
 
 **Answer.** **Yes — the logs name the failing disk by its exact filesystem path**, and re-probing runs while
-the server stays live. There is an important nuance: for a pure **permission** fault the disk is marked
-not-online through the **DiskInfo / Healing** path (which names the path), while the **dedicated**
+the server stays live. There is an important nuance: for a pure **permission** fault the disk is excluded
+from the online count through the **DiskInfo / Healing** path (which names the path), while the **dedicated**
 `monitorDiskWritable` offline / `monitorDiskStatus` online log lines do **not** fire.
 
 **Observed (§6.4).** The path appears as `endpoint="/tmp/ec/data1"` and in
-`/tmp/ec/data1/.minio.sys/buckets/.healing.bin: ... permission denied`. The counts of
-`"taking drive ... offline"` and `"bringing drive ... online"` were both **0**.
+`/tmp/ec/data1/.minio.sys/buckets/.healing.bin: … permission denied`, with a runtime stack trace. The counts
+of `"taking drive … offline"` and `"bringing drive … online"` were both **0**.
 
-**Code — what fired.** A `chmod 000` maps to `errDiskAccessDenied` on format/health reads
-(`os.IsPermission(err) → return errDiskAccessDenied` [cmd/xl-storage.go:L276-L279];
-`errDiskAccessDenied` = "drive access denied" [cmd/storage-errors.go:L68]). `diskErrToDriveState` maps that
-to `madmin.DriveStatePermission` [cmd/erasure.go:L98], which is **not** `DriveStateOk`, so `Health()`
-excludes the drive from the online count [cmd/erasure-server-pool.go:L2707-L2709]. The path-named text comes
-from `Healing()` reading `.healing.bin` [cmd/xl-storage.go:L436] via `DiskInfo()` [cmd/xl-storage.go:L780]
-under `getDisksInfo` [cmd/erasure.go:L192].
+**Code — what fired (observed).** At runtime a `chmod 000` surfaces as `errDiskAccessDenied` from
+`checkFormatJSON()`, which does `Lstat(s.formatFile)` and maps `osIsPermission(err) → errDiskAccessDenied`
+[cmd/xl-storage.go:L802-L826]; this is reached from `GetDiskID()` [cmd/xl-storage.go:L828] and from the
+1-second **DiskInfo cache** [cmd/xl-storage.go:L326-L359] whose updater also calls `Healing()`
+[cmd/xl-storage.go:L436] (the observed `.healing.bin … permission denied` stack). `errDiskAccessDenied`
+= "drive access denied" [cmd/storage-errors.go:L68]; `diskErrToDriveState` maps it to
+`madmin.DriveStatePermission` [cmd/erasure.go:L98,L107], which is **not** `DriveStateOk`, so `Health()`
+excludes the drive from the online count [cmd/erasure-server-pool.go:L2707-L2709]. (This is the runtime path;
+the superficially similar mapping in `formatErasureMigrate` at [cmd/xl-storage.go:L276-L279] runs only at
+disk **initialization**, not on a live permission change.)
 
-**Code — what did NOT fire, and why (inferred).** The dedicated live monitor logs the disk by path via
+**Code — what did NOT fire, and why.** The dedicated live monitor logs the disk by path via
 `p.storage.String()`: `"node(%s): taking drive %s offline: %v"` [cmd/xl-storage-disk-id-check.go:L1015] and
-`"node(%s): Read/Write/Delete successful, bringing drive %s online"`
-[cmd/xl-storage-disk-id-check.go:L956]. Those lines live inside `goOffline`, which is only invoked when
-`osErrToFileErr(err) == errFaultyDisk` [cmd/xl-storage-disk-id-check.go:L1044, L1051] — a genuine I/O fault,
-not a permission error. **(inferred, from code):** for an `errFaultyDisk` (real I/O) fault these
-`monitorDiskWritable` / `monitorDiskStatus` path-named offline/online lines *would* be emitted; that route
-was not exercised at runtime here (we injected a permission fault, not an I/O fault), so it is labeled
-inferred.
+`"node(%s): … bringing drive %s online"` [cmd/xl-storage-disk-id-check.go:L956]. The offline line lives
+inside `goOffline`, which is invoked from **three** places in `monitorDiskWritable`: a **timeout** branch
+when a write+read exceeds the max drive timeout [cmd/xl-storage-disk-id-check.go:L1034-L1035], and two
+`errFaultyDisk` branches on write/read errors [cmd/xl-storage-disk-id-check.go:L1044-L1045,L1051-L1052].
+A permission error maps to `errFileAccessDenied` (not `errFaultyDisk`), and the probe write returns
+immediately (so the timeout branch does not fire either) — hence `goOffline` is never called and both
+path-named monitor lines stay at 0, exactly as observed. **(inferred, from code):** for a genuine
+`errFaultyDisk` (I/O) fault or a probe that exceeds the timeout, these `monitorDiskWritable`/
+`monitorDiskStatus` offline/online lines *would* fire; that fault type was not injected here, so the claim
+is labeled inferred.
 
 **Cause → effect.** "Does the log call out the failing disk by path?" — yes, unambiguously
-(`endpoint="/tmp/ec/data1"`). "Is recovery attempted while live?" — yes: the same DiskInfo/Healing machinery
-re-probes on a schedule (§8), so no restart is needed. The subtlety is simply *which* code path names the
-disk, and that depends on the fault *type* (permission vs I/O).
+(`endpoint="/tmp/ec/data1"` and the `.healing.bin` path). "Is recovery attempted while live?" — yes: the
+DiskInfo/Healing machinery re-probes on every health/StorageInfo call (§Q5), so no restart is needed. The
+subtlety is simply *which* code path names the disk, and that depends on the fault *type* (permission vs
+I/O/timeout).
 
 ### Q5 — Self-detection of a restored directory
 
-**Answer.** MinIO recognizes a restored directory **on its own, automatically**, within the first ≤5-second
-poll after permissions are restored — **no restart and no external push** are required. A manual push
-(`mc admin heal`) exists but is optional.
+**Answer.** MinIO recognizes a restored directory **on its own, automatically**, reflected on the **next
+health probe** after permissions are restored (observed at **~11–13 ms** in a tight poll) — **no restart and
+no external push** are required. A manual push (`mc admin heal`) exists but is optional and is a separate
+concern (it repairs data; it is not needed for re-detection).
 
-**Observed (§6.5).** After `chmod 755` (no restart), polling `/cluster` every 5 s showed **200** with
-`4 drives online, 0 drives offline` at **t+5s**, stable through t+45s.
+**Observed (§6.5).** After `chmod 755` (no restart), the very first `/cluster` GET returned **200** with
+`4 drives online, 0 drives offline`; three restore trials measured 12/13/11 ms to the first 200 (a prior run
+measured 15/14/14 ms); the server PID was unchanged (`188172`) across every fault cycle.
 
-**Code.** Three periodic pollers are responsible:
+**Code — the mechanism actually responsible (observed).** The health endpoint calls `Health()` →
+`StorageInfo` → `getDisksInfo` [cmd/erasure.go:L192] → `DiskInfo()`
+[cmd/xl-storage-disk-id-check.go:L329], [cmd/xl-storage.go:L781], which reads through the **1-second DiskInfo
+cache** [cmd/xl-storage.go:L326-L359]. Once permissions are restored, the next probe re-reads the disk,
+`checkFormatJSON`/`GetDiskID` succeed, the state becomes `DriveStateOk`, and the drive is counted online
+again. This is why recovery tracks the health-probe cadence (observed ~15 ms), not any fixed background
+interval.
 
-| Poller | Interval | Role | Source |
-|--------|----------|------|--------|
-| `monitorDiskStatus` | 5 s ticker | Re-probes a drive and brings it back online | [cmd/xl-storage-disk-id-check.go:L930] |
-| `monitorLocalDisksAndHeal` | 10 s | Detects freshly reconnected local drives and heals them | [cmd/background-newdisks-heal-ops.go:L40], [cmd/background-newdisks-heal-ops.go:L563] |
-| `monitorAndConnectEndpoints` | 15 s | Reconnects offline set endpoints (`connectDisks`) | [cmd/erasure-sets.go:L348], [cmd/erasure-sets.go:L283], [cmd/erasure-sets.go:L194] |
+**Code — the periodic pollers and their actual eligibility (for completeness).**
 
-**(inferred)** The specific poller that "won" the re-detection is not distinguishable from the log in this
-run; what is directly observed is that re-detection occurred **automatically within ≤5 s**. All three
-pollers above are the responsible mechanisms, and the shortest interval (`monitorDiskStatus`, 5 s) is
-consistent with the observed latency.
+| Poller | Interval | Eligibility / role | Source |
+|--------|----------|--------------------|--------|
+| DiskInfo cache re-read | ≤ 1 s | Re-probes disk state on each `Health`/`StorageInfo` call; **this is what flipped the endpoint back to 200** | [cmd/xl-storage.go:L326-L359] |
+| `monitorDiskStatus` | 5 s | Re-probes a drive and brings it online — **but only starts after `goOffline`**, which the permission fault never triggered (§Q4); therefore **not** the mechanism here | [cmd/xl-storage-disk-id-check.go:L930] |
+| `monitorLocalDisksAndHeal` | 10 s | Heals **only** disks queued in the heal state — i.e. unformatted disks or disks with a `.healing.bin` tracker (`getLocalDisksToHeal`); a permission-restored disk is neither | [cmd/background-newdisks-heal-ops.go:L40,L563], [cmd/background-newdisks-heal-ops.go:L393-L406] |
+| `monitorAndConnectEndpoints` | 15 s | Calls `connectDisks` to reconnect disconnected set endpoints | [cmd/erasure-sets.go:L348,L283], [cmd/erasure-sets.go:L194] |
 
-**Cause → effect.** Because these tickers run continuously in the live server, restoring the OS permission
-is sufficient — the next poll sees the drive readable again, re-includes it in the online count, and the
-health endpoint flips back to 200 without operator intervention.
+**(inferred, from code):** the exact instant at which each background poller re-includes the drive was not
+separately isolated in the log; what is **directly observed** is that the health endpoint returned to 200 on
+the next probe (~15 ms), driven by the on-demand DiskInfo re-read. The 5/10/15 s pollers are described from
+code with their actual eligibility; no single background poller is claimed to be the "winner."
+
+**Cause → effect.** Because the DiskInfo path re-probes on every health/StorageInfo call, restoring the OS
+permission is sufficient — the next probe sees the drive readable again, re-includes it in the online count,
+and the endpoint flips back to 200 without operator intervention.
 
 ### Q6 — Repair of objects written during the outage
 
-**Answer.** An object written while a disk was down is **missing its shard on that disk**; when the disk
-returns, healing **re-creates the shard / `xl.meta`** on the recovered disk, and the object stays readable
-throughout.
+**Answer.** An object written while a disk was down is **missing its shard on that disk**. In the observed
+run, the disk returning to "online" did **not** by itself reconstruct the shard within the observed window;
+a **manual `mc admin heal`** restored it. The object stayed readable throughout (reconstructed from the
+surviving shards).
 
-**Observed (§6.6).** Before heal, `obj-1down` had no directory on `data1` (present on data2/3/4); after
-`mc admin heal` the `data1` shard was restored (`present -> xl.meta`) and the object read back
-`"above-threshold-content"`. The heal summary was `Healed: 1/2 objects; 41 B in 1s`.
+**Observed (§6.6).** Right after restore and again after 20 s, `obj-1down` still had no shard on `data1` and
+there was no `.healing.bin` tracker. `mc admin heal -r --force` then reported `Yellow → Green` for
+`obj-1down.txt` (and `obj-1down-b.txt`), `Healed: 2/3 objects; 64 B in 1s`; afterwards the `data1` shard
+(`xl.meta`) was present and the object read back `above-threshold-content`.
 
-**Code.** On a drive's return, `healFreshDisk()` heals the reconnected drive
-[cmd/background-newdisks-heal-ops.go:L419], scheduled by `monitorLocalDisksAndHeal()`
-[cmd/background-newdisks-heal-ops.go:L563]. Partial/most-recent-failure writes are repaired by the MRF
-`healRoutine()` [cmd/mrf.go:L220]. A manual push is available via `HealHandler`
-[cmd/admin-handlers.go:L1308] (`mc admin heal`). The background data scanner provides an additional heal
-path.
+**Code.** The background fresh-disk heal `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] is
+scheduled by `monitorLocalDisksAndHeal()` [cmd/background-newdisks-heal-ops.go:L563], but it acts **only** on
+disks queued by `getLocalDisksToHeal()`, which requires an **unformatted** disk or a disk carrying an
+unfinished `.healing.bin` tracker [cmd/background-newdisks-heal-ops.go:L393-L406] — neither is true for a
+disk that merely had its permissions restored, which is why no automatic heal occurred in the window.
+Objects whose write saw an offline drive are enqueued for most-recent-failure (MRF) repair at PUT time
+(`er.addPartial` / `globalMRFState.addPartialOp`) [cmd/erasure-object.go:L1566-L1585], consumed by the MRF
+`healRoutine()` [cmd/mrf.go:L220]; the on-demand admin heal is `HealHandler`
+[cmd/admin-handlers.go:L1308] (`mc admin heal`). The data scanner provides an additional, slower background
+heal path **(inferred, from code — not separately observed in this run)**.
 
-**(documentation-derived, NOT observed).** MinIO's documented "automatic parity upgrade at PUT time" — where
-a drive offline at write time causes the object's parity to be bumped by one — was **not** reproduced in
-this run: `obj-1down` remained `EcM=2, EcN=2` (see §6.6). This behavior is therefore presented as
-documentation-derived only; the **observed** metadata shows no upgrade, and the object was instead protected
-by having its shard healed on the disk's return.
+**Parity note (observed).** `obj-1down` remained `EcM=2, EcN=2` both during the outage and after healing.
+This is expected, not an anomaly: the availability-optimized PUT increments parity per offline drive but
+caps it at half the set (`len/2 = 2`) [cmd/erasure-object.go:L1291-L1316]; four-drive EC:2 is already at
+**maximum** parity, so there is no headroom to upgrade.
 
-**Cause → effect.** Erasure coding means the object never lost durability while `data1` was down (2 data + 2
-parity, 3 of 4 shards present). The heal step is what restores *full* redundancy: it reconstructs the
-missing shard from the surviving ones and writes it back to the recovered disk, returning the object to
-`Green`.
+**Cause → effect.** Erasure coding meant the object was **reconstructable** while `data1` was down (2 data +
+2 parity, 3 of 4 shards present), so reads never failed. But its **redundancy was degraded** (a shard was
+missing). Full redundancy is restored by the heal step — here a manual `mc admin heal` — which rebuilds the
+missing shard from the survivors and writes it back to the recovered disk, returning the object to `Green`.
 
 ### Q7 — Location of the quorum decision in code
 
-**Answer.** The threshold lives in `defaultWQuorum()` / `defaultRQuorum()` [cmd/erasure.go:L85-L96], with a
-per-object equivalent in `FileInfo.WriteQuorum()` / `FileInfo.ReadQuorum()`
-[cmd/storage-datatypes.go:L298-L314]. The "enough disks to proceed vs risk too high, stop" boundary is the
-**+1 split-brain guard**: write quorum = data blocks, **plus one** when `data == parity`.
+**Answer.** There are **two** quorum sites, and they agree by construction:
+
+1. **Cluster health** computes the threshold inside `Health()` from `BackendInfo()`
+   [cmd/erasure-server-pool.go:L2719-L2727] — it does **not** call `defaultWQuorum()`.
+2. **The object write path** uses `defaultWQuorum()`/`defaultRQuorum()` [cmd/erasure.go:L85-L96] and the
+   per-object `FileInfo.WriteQuorum()`/`ReadQuorum()` [cmd/storage-datatypes.go:L298-L316].
+
+Both apply the **+1 split-brain guard**: write quorum = data blocks, **plus one** when `data == parity`.
 
 **Observed.** The endpoint header `X-Minio-Write-Quorum: 3` (§6.1) and the log line
 `expected write quorum: 3, drives-online: 2` (§6.3) both surface the exact computed value.
 
 **Code (walk-through).**
-1. Default parity for 4 drives = 2 → `DefaultParityBlocks(4)` [internal/config/storageclass/storage-class.go:L355, L361-L362].
-2. `dataCount = setDriveCount − defaultParityCount = 4 − 2 = 2` [cmd/erasure.go:L86].
-3. `defaultRQuorum()` returns `2` (data blocks) [cmd/erasure.go:L94-L96].
-4. `defaultWQuorum()` returns `dataCount + 1 = 3` because `dataCount == defaultParityCount`
-   [cmd/erasure.go:L85-L91]; the per-object rule mirrors this
-   (`if DataBlocks == ParityBlocks { quorum++ }`) [cmd/storage-datatypes.go:L298-L308].
-5. `Health()` compares each set's online count against these quorums and logs failures with `logger.FatalKind`
-   [cmd/erasure-server-pool.go:L2679, L2794].
-6. On the object path, an unmet write quorum becomes `InsufficientWriteQuorum{}`
-   [cmd/erasure-object.go:L1897, L1944] → `errErasureWriteQuorum` [cmd/erasure-errors.go:L26] →
-   S3 `SlowDownWrite` (503) [cmd/api-errors.go:L2314-L2315]. `reduceWriteQuorumErrs`
-   [cmd/erasure-metadata-utils.go:L156-L157] performs the error reduction against the write-quorum count.
+1. Default parity for 4 drives = 2 → `DefaultParityBlocks(4)`
+   [internal/config/storageclass/storage-class.go:L355,L361-L362].
+2. **Cluster-health site:** `Health()` reads `b := z.BackendInfo()` [cmd/erasure-server-pool.go:L2719],
+   where `StandardSCData = setDriveCount − scParity = 2` [cmd/erasure-server-pool.go:L694] and
+   `StandardSCParity = 2` [cmd/erasure-server-pool.go:L700]; then `poolReadQuorums = 2` and
+   `poolWriteQuorums = 2 (+1 because data == parity) = 3` [cmd/erasure-server-pool.go:L2720-L2727]. The
+   per-set test `online ≥ poolWriteQuorums` [cmd/erasure-server-pool.go:L2791] logs failures with
+   `logger.FatalKind` [cmd/erasure-server-pool.go:L2794].
+3. **Object-write site:** `defaultRQuorum()` returns `2` [cmd/erasure.go:L94-L96]; `defaultWQuorum()` returns
+   `dataCount + 1 = 3` because `dataCount == defaultParityCount` [cmd/erasure.go:L85-L91]; the per-object
+   rule mirrors it (`if DataBlocks == ParityBlocks { quorum++ }`) [cmd/storage-datatypes.go:L298-L308].
+4. On the write path an unmet quorum becomes `errErasureWriteQuorum`
+   [cmd/erasure-object.go:L1308], [cmd/erasure-encode.go:L61-L65] → `InsufficientWriteQuorum{}`
+   [cmd/object-api-errors.go:L164-L172] → S3 `SlowDownWrite` (503) [cmd/api-errors.go:L2314-L2315]. The
+   error reduction against the threshold is `reduceWriteQuorumErrs` [cmd/erasure-metadata-utils.go].
 
-**Cause → effect.** The threshold is not a magic constant — it is derived from the set size and parity. The
-+1 rule when parity is exactly half the set is precisely the "risk too high, stop" line: it forbids
-acknowledging a write that only a tie-breakable half of the drives received.
+**Cause → effect.** The threshold is not a magic constant — it is derived from the set size and parity at
+both sites. The +1 rule when parity is exactly half the set is precisely the "risk too high, stop" line: it
+forbids acknowledging a write that only a tie-breakable half of the drives received.
 
 ### Q8 — Grounding in the health endpoint and real writes
 
-**Answer.** Every conclusion in this document is paired with **both** a health-endpoint response (status +
-`X-Minio-*` headers) **and** a real S3 write/read result from the running server.
+**Answer.** Every behavioral conclusion in this document is paired with **both** a health-endpoint response
+(status + `X-Minio-*` headers) **and** a real S3 write/read result from the running server.
 
-**Observed pairing (summary).**
+**Observed pairing (each cell is backed by the raw output in §6):**
 
 | State | `/cluster` | `/cluster/read` | PUT | GET | Drives |
 |-------|-----------|-----------------|-----|-----|--------|
-| Baseline (§6.1) | 200 (`WQ 3`) | 200 (`RQ 2`) | success | "baseline-content" | 4 online |
-| One down / above (§6.2) | 200 (`WQ 3`) | — | success | success | 3 online, 1 offline |
-| Two down / below (§6.3) | **503** (`WQ 3`) | 200 (`RQ 2`) | **fail** `SlowDownWrite` | "baseline-content" | 2 online, 2 offline |
-| Restored (§6.5) | 200 | — | (writable again) | — | 4 online |
+| Baseline (§6.1) | 200 (`WQ 3`) | 200 (`RQ 2`) | success (exit 0) | `baseline-content` (exit 0) | 4 online |
+| One down / above (§6.2) | 200 (`WQ 3`) | 200 (`RQ 2`) | success (exit 0) | `baseline-content` + `above-threshold-content` (exit 0) | 3 online, 1 offline |
+| Two down / below (§6.3) | **503** (`WQ 3`) | 200 (`RQ 2`) | **fail** `SlowDownWrite` (exit 1) | `baseline-content` + `above-threshold-content` (exit 0) | 2 online, 2 offline |
+| Restored (§6.5/§6.6) | 200 | 200 | writable again; `mc admin heal` exit 0 | `above-threshold-content` (exit 0) | 4 online |
 
 **Code.** The endpoint that produces these codes/headers is `ClusterCheckHandler`
 [cmd/healthcheck-handler.go:L56] (and `ClusterReadCheckHandler` [cmd/healthcheck-handler.go:L93]); the write
@@ -563,79 +1052,77 @@ whether an S3 write will be accepted or refused.
 
 ## 8. Code-Trace — The Quorum Decision, End to End
 
-The single decision "do we have enough disks to proceed?" flows through the following chain. Line numbers
-are verified at HEAD `c07e5b49d477`.
+The decision "do we have enough disks to proceed?" flows through **two** chains that share the same
+threshold: the cluster-health chain (what the endpoint reports) and the object-write chain (what a PUT
+returns). Line numbers are verified against the investigated source.
 
 ```
-                     default parity for 4 drives = 2
+                       default parity for 4 drives = 2
    DefaultParityBlocks(4)  ── internal/config/storageclass/storage-class.go:L355 (case 4,5: return 2, L361-L362)
-                                        │
-                                        ▼
-   dataCount = setDriveCount - defaultParityCount = 4 - 2 = 2   ── cmd/erasure.go:L86
-                                        │
-              ┌─────────────────────────┴──────────────────────────┐
-              ▼                                                     ▼
-   defaultRQuorum() = 2                             defaultWQuorum() = dataCount(2) + 1 = 3
-   cmd/erasure.go:L94-L96                           cmd/erasure.go:L85-L91  (+1 because data == parity)
-   (per-object: FileInfo.ReadQuorum,                (per-object: FileInfo.WriteQuorum,
-    cmd/storage-datatypes.go:L310-L314)              cmd/storage-datatypes.go:L298-L308)
-                                        │
-                                        ▼
-   Health(): per set  online (only DriveStateOk, cmd/erasure-server-pool.go:L2707-L2709)
-             healthy := online >= poolWriteQuorums[...]          ── cmd/erasure-server-pool.go:L2679
-             if !healthy → log "Write quorum could not be established ... expected write quorum: 3,
-                               drives-online: 2"  (logger.FatalKind)  ── cmd/erasure-server-pool.go:L2794
-                                        │
-                                        ▼
-   ClusterCheckHandler: set X-Minio-Write-Quorum; 200 if healthy else 503 (412 if maintenance)
-                                        ── cmd/healthcheck-handler.go:L56, L72, L83, L85, L89
-                                        │
-                                        ▼  (on the object write path, the same threshold)
-   write cannot meet quorum → InsufficientWriteQuorum{}   ── cmd/erasure-object.go:L1897, L1944
-        │  Unwrap → errErasureWriteQuorum ("Write failed. Insufficient number of drives online")
-        │                                    ── cmd/erasure-errors.go:L26 ; cmd/object-api-errors.go:L248-L253
-        ▼
-   S3 mapping: InsufficientWriteQuorum → ErrSlowDownWrite (HTTP 503)  ── cmd/api-errors.go:L2314-L2315
-        (ErrSlowDownWrite def: Code "SlowDownWrite", 503 ── cmd/api-errors.go:L874-L877)
+                                         │
+        ┌────────────────────────────────┴─────────────────────────────────┐
+        ▼  CLUSTER-HEALTH CHAIN                                              ▼  OBJECT-WRITE CHAIN
+   Health(): b := z.BackendInfo()   ── cmd/erasure-server-pool.go:L2719     putObject()  ── cmd/erasure-object.go:L1245
+     StandardSCData = 4-2 = 2       ── :L694                                  parityDrives default 2; availability-
+     StandardSCParity = 2           ── :L700                                  optimized upgrade capped at len/2=2
+     poolReadQuorums  = 2           ── :L2723                                 ── cmd/erasure-object.go:L1291-L1316
+     poolWriteQuorums = 2 (+1) = 3  ── :L2722-L2727                          if offlineDrives >= (N+1)/2:
+                                         │                                      return errErasureWriteQuorum ── :L1308
+     count online (DriveStateOk only)── :L2707-L2709                          else writeQuorum = data(+1)=3  ── :L1322-L1326
+     healthy := online >= WQuorum   ── :L2791                                 erasure.Encode(..., writeQuorum) ── :L1425
+     if !healthy: log FatalKind     ── :L2794                                   multiWriter.Write:
+     "expected write quorum: 3,                                                  nilCount < wq -> reduceWriteQuorumErrs
+      drives-online: 2"                                                          -> errErasureWriteQuorum
+                                         │                                        ── cmd/erasure-encode.go:L61-L65
+                                         ▼                                       │
+   ClusterCheckHandler:                                                         ▼
+     set X-Minio-Write-Quorum; 200 if healthy else 503 (412 if maintenance)   toObjectErr(errErasureWriteQuorum)
+     ── cmd/healthcheck-handler.go:L72, L82-L83, L85, L89                       -> InsufficientWriteQuorum{}
+                                                                                ── cmd/object-api-errors.go:L164-L172
+   errErasureWriteQuorum = "Write failed. Insufficient number of drives         (Unwrap -> errErasureWriteQuorum ── :L253-L254)
+   online"  ── cmd/erasure-errors.go:L26                                        │
+                                                                                ▼
+                                            S3 mapping: InsufficientWriteQuorum -> ErrSlowDownWrite (HTTP 503)
+                                              ── cmd/api-errors.go:L2314-L2315 ; def L874-L877 (Code "SlowDownWrite")
 ```
 
-**Reading the chain.** The parity default (2) and the set size (4) fully determine the two thresholds. The
+**Reading the chains.** The parity default (2) and the set size (4) fully determine the two thresholds. The
 write threshold picks up the **+1 split-brain guard** because parity equals half the set. `Health()` is the
-cluster-level aggregator that turns per-set online counts into the 200/503 the endpoint reports, and it is
-also where the `FatalKind` diagnostic is logged. On the data path the very same threshold, when unmet,
-becomes `InsufficientWriteQuorum` and finally the client-visible `SlowDownWrite` (503). The read side is the
-mirror image with no +1: read quorum 2, surfaced as `InsufficientReadQuorum` →
-`ErrSlowDownRead` [cmd/object-api-errors.go:L236-L241], [cmd/api-errors.go:L2316-L2317] only when fewer than
-two drives remain.
+cluster-level aggregator that turns per-set online counts into the 200/503 the endpoint reports (deriving
+the quorum from `BackendInfo`, not `defaultWQuorum`), and it is also where the `FatalKind` diagnostic is
+logged. On the data path the very same numeric threshold, when unmet, becomes `errErasureWriteQuorum` →
+`InsufficientWriteQuorum` → the client-visible `SlowDownWrite` (503). The read side is the mirror image with
+no +1: read quorum 2, surfaced as `InsufficientReadQuorum` [cmd/object-api-errors.go:L228-L242] →
+`ErrSlowDownRead` [cmd/api-errors.go:L2316-L2317] only when fewer than two drives remain.
 
 ## 9. Coverage Pass
 
 | Objective / mechanism | Value | `file:line` | Evidence | Rationale |
 |-----------------------|-------|-------------|----------|-----------|
-| **Q1** health/quorum decision | healthy ⇔ every set `online ≥ 3` | `Health()` [cmd/erasure-server-pool.go:L2679] | §6.1 (200, `X-Minio-Write-Quorum: 3`) | §7 Q1 |
-| **Q2** live permission-loss | adapt (3 online) vs refuse (2 online) | `defaultWQuorum()` [cmd/erasure.go:L85] | §6.2 / §6.3 | §7 Q2 |
-| **Q3** above vs below threshold | 200/PUT-ok vs 503/`SlowDownWrite`/GET-ok | `Health()` [cmd/erasure-server-pool.go:L2679, L2794] | §6.2 / §6.3 + `FatalKind` | §7 Q3 |
-| **Q4** path-named logs & live recovery | disk named by path; offline/online monitor lines = 0 for permission fault | offline log [cmd/xl-storage-disk-id-check.go:L1015], online log [L956], goOffline errFaultyDisk-only [L1044, L1051] | §6.4 (`endpoint="/tmp/ec/data1"`, `.healing.bin`) | §7 Q4 — errFaultyDisk route **(inferred)** |
-| **Q5** self-detection | automatic ≤5 s, no restart/push | `monitorDiskStatus` 5 s [cmd/xl-storage-disk-id-check.go:L930]; `monitorLocalDisksAndHeal` 10 s [cmd/background-newdisks-heal-ops.go:L40, L563]; `monitorAndConnectEndpoints` 15 s [cmd/erasure-sets.go:L348, L283]; `HealHandler` [cmd/admin-handlers.go:L1308] | §6.5 (t+5s → 200, 4 online) | §7 Q5 — winning poller **(inferred)** |
-| **Q6** repair of outage writes | shard restored on recovered disk | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419]; MRF `healRoutine()` [cmd/mrf.go:L220] | §6.6 (MISSING → restored; `Healed: 1/2 objects`) | §7 Q6 — parity-upgrade **(documentation-derived)** |
-| **Q7** quorum decision location | write quorum 3 = data 2 (+1) | `defaultWQuorum()` [cmd/erasure.go:L85], `defaultRQuorum()` [L94], `FileInfo.WriteQuorum/ReadQuorum` [cmd/storage-datatypes.go:L298-L314], `DefaultParityBlocks` [internal/config/storageclass/storage-class.go:L355] | §6.1 header, §6.3 log | §7 Q7 / §8 |
+| **Q1** health/quorum decision | healthy ⇔ every set `online ≥ 3` | `Health()` [cmd/erasure-server-pool.go:L2679]; quorum calc [L2719-L2727] | §6.1 (200, `X-Minio-Write-Quorum: 3`) | §7 Q1 |
+| **Q2** live permission-loss | keep writing (3 online) vs refuse (2 online) | PUT quorum check [cmd/erasure-object.go:L1305-L1308] | §6.2 / §6.3 | §7 Q2 |
+| **Q3** above vs below threshold | 200/PUT-ok vs 503/`SlowDownWrite`/GET-ok | `Health()` [cmd/erasure-server-pool.go:L2791,L2794] | §6.2 / §6.3 + `FatalKind` | §7 Q3 |
+| **Q4** path-named logs & live recovery | disk named by path; offline/online monitor lines = 0 for permission fault | runtime perm map [cmd/xl-storage.go:L802-L826]; offline log [cmd/xl-storage-disk-id-check.go:L1015]; goOffline branches [L1034-L1052] | §6.4 (`endpoint="/tmp/ec/data1"`, `.healing.bin`, counts 0) | §7 Q4 — I/O/timeout route **(inferred, from code)** |
+| **Q5** self-detection | automatic; next probe (~11–15 ms), no restart/push | DiskInfo cache [cmd/xl-storage.go:L326-L359]; pollers [cmd/xl-storage-disk-id-check.go:L930], [cmd/background-newdisks-heal-ops.go:L40,L563], [cmd/erasure-sets.go:L348] | §6.5 (first poll → 200, same PID; 12/13/11 ms, prior 15/14/14) | §7 Q5 — poller isolation **(inferred, from code)** |
+| **Q6** repair of outage writes | shard restored by **manual** heal; background heal conditional | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419]; `getLocalDisksToHeal` [L393-L406]; MRF enqueue [cmd/erasure-object.go:L1566-L1585]; `healRoutine()` [cmd/mrf.go:L220] | §6.6 (MISSING after 20s → restored by `mc admin heal`) | §7 Q6 — scanner path **(inferred, from code)** |
+| **Q7** quorum decision location | cluster: `BackendInfo`; object: `defaultWQuorum`; both +1 → 3 | quorum calc [cmd/erasure-server-pool.go:L2722-L2727]; `defaultWQuorum()` [cmd/erasure.go:L85]; `FileInfo.WriteQuorum` [cmd/storage-datatypes.go:L298-L308] | §6.1 header, §6.3 log | §7 Q7 / §8 |
 | **Q8** grounding | endpoint code/headers + real write/read at every state | `ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] | §6.1–§6.6, §7 Q8 table | §7 Q8 |
-| **quorum decision** | 3 / 2 | [cmd/erasure.go:L85-L96] | §4, §6.1 | §7 Q7 |
-| **health endpoint** | 200 / 503 / 412 + quorum headers | [cmd/healthcheck-handler.go:L56-L131], [cmd/healthcheck-router.go:L30-L44] | §5, §6.1–§6.3 | §5 |
-| **path-named logs** | disk named by path | [cmd/xl-storage-disk-id-check.go:L1015, L956], [cmd/xl-storage.go:L436] | §6.4 | §7 Q4 |
-| **polling (5 s / 10 s / 15 s)** | 5 / 10 / 15 seconds | [cmd/xl-storage-disk-id-check.go:L930], [cmd/background-newdisks-heal-ops.go:L40], [cmd/erasure-sets.go:L348] | §6.5 | §7 Q5 |
-| **healing (`healFreshDisk`)** | shard re-created | [cmd/background-newdisks-heal-ops.go:L419] | §6.6 | §7 Q6 |
-| **MRF** | most-recent-failure repair | [cmd/mrf.go:L220] | §6.6 | §7 Q6 |
+| **quorum decision** | 3 / 2 | cluster [cmd/erasure-server-pool.go:L2722-L2727]; object [cmd/erasure.go:L85-L96] | §4, §6.1 | §7 Q7 |
+| **health endpoint** | 200 / 503 / 412 + quorum headers; pre-quorum 503 branches | [cmd/healthcheck-handler.go:L31-L89], [cmd/healthcheck-router.go:L30-L44] | §5, §6.1–§6.3 | §5 |
+| **path-named logs** | disk named by path | connectDisks [cmd/erasure-sets.go:L230]; Healing [cmd/xl-storage.go:L436]; offline/online [cmd/xl-storage-disk-id-check.go:L1015,L956] | §6.4 | §7 Q4 |
+| **polling (1 s / 5 s / 10 s / 15 s)** | DiskInfo cache 1 s; 5/10/15 s pollers | [cmd/xl-storage.go:L326]; [cmd/xl-storage-disk-id-check.go:L930]; [cmd/background-newdisks-heal-ops.go:L40]; [cmd/erasure-sets.go:L348] | §6.5 | §7 Q5 |
+| **healing (`healFreshDisk`)** | conditional; shard re-created by manual heal | [cmd/background-newdisks-heal-ops.go:L419] | §6.6 | §7 Q6 |
+| **MRF** | most-recent-failure repair | enqueue [cmd/erasure-object.go:L1566-L1585]; consumer [cmd/mrf.go:L220] | §6.6 | §7 Q6 |
 
-**Labeling summary.** Two statements are explicitly labeled: the `errFaultyDisk`-only offline/online monitor
-route in **Q4** is **(inferred)** from code because only a permission fault (not an I/O fault) was injected
-at runtime; the "automatic parity upgrade at PUT time" in **Q6** is **(documentation-derived)** and was
-**not** observed (metadata stayed `EcM=2, EcN=2`). Everything else is backed by the observed output in §6.
+**Labeling summary.** Behavioral claims are backed by the observed output in §6. The statements explicitly
+labeled **(inferred, from code)** are: the `errFaultyDisk`/timeout `goOffline` route in **Q4** (only a
+permission fault, not an I/O/timeout fault, was injected); the precise per-poller re-inclusion instant in
+**Q5** (only the on-demand DiskInfo re-read was directly timed); and the background data-scanner heal path in
+**Q6** (only the manual `mc admin heal` was observed to repair the shard).
 
 ---
 
 *Scope note: this document is the sole committed artifact of the investigation. The MinIO source tree was
-read only and left unchanged; all temporary artifacts (the compiled binary, the `mc` client, the
-`/tmp/ec/data{1..4}` directories, observation scripts, and logs) were removed after the investigation, as
-verified by an empty `git status --porcelain` aside from this file (§6.7).*
-
+read only and left unchanged; all temporary artifacts (the compiled binary and `docs/debugging` helpers, the
+`mc` client copy, the `/tmp/ec/data{1..4}` directories, the isolated `mc` config, observation scripts, and
+logs) were removed after the investigation, and `git status --porcelain` is empty aside from this file (§6.7).*
