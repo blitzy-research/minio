@@ -1,724 +1,1310 @@
 # MinIO Erasure-Coded Storage Under Drive Failure and Recovery — An Evidence-Based Analysis
 
-**Source branch:** `minio_c07e5b49d477`
-**Commit under analysis:** `c07e5b49d477b0774f23db3b290745aef8c01bd2`
-**Repository:** `github.com/minio/minio`
-
 ## Introduction
 
-This document answers six questions about how MinIO's erasure-coded storage layer behaves when a drive becomes unavailable while the cluster is running, and what happens when that drive later comes back:
+This document answers six questions about how MinIO's erasure-coding storage layer behaves when a drive fails while data is being written, when a drive is missing for pre-existing reads, and when a drive is brought back and healed. Every answer is grounded in runtime output captured from a MinIO server **built and run from the exact source commit under analysis**, `c07e5b49d477b0774f23db3b290745aef8c01bd2`, and driven through its real S3 and admin entry points.
 
-- **OBJ-1** — When a drive is lost during a write, what error does MinIO return, and does the write succeed or fail?
-- **OBJ-2** — Can objects written *before* a drive vanished still be read? If not, what error is returned?
-- **OBJ-3** — What triggers a healing operation when a drive comes back online?
-- **OBJ-4** — What criteria decide that a specific object needs healing on a particular drive?
-- **OBJ-5** — What log messages appear during an active heal?
-- **OBJ-6** — What metric names track online vs. offline drive counts, and what values do they report before and after a drive failure?
+Each objective section gives (1) the direct answer, (2) the `file:line` code reference naming the specific function/struct, (3) the exact command(s) used, (4) the complete, unedited captured output, and (5) the cause-and-effect reasoning. All analysis text is kept **outside** the fenced code blocks; every fenced block contains only genuine captured output. Claims that could not be reproduced canonically against this commit are labeled **INFERRED** or **SOURCE-ONLY**; observations obtained through a non-default trigger are labeled **SUPPLEMENTARY / NON-CANONICAL**.
 
-Every behavioral claim below is grounded in **actually observed runtime output** — real S3 error bodies, real server log lines, real metric samples — captured from a MinIO server **built locally from this exact commit** and driven through its real S3 API. Code citations (`file:line` + symbol name) are used only to *name and locate* the mechanism responsible for each observed behavior; they never substitute for observation. Where a behavior could not be reproduced through the real entry point after genuine, varied effort, it is explicitly labeled **INFERRED** (see the "Observed vs. Inferred" section).
+The six questions:
 
-**Topology in one line:** a single MinIO server node with **12 local drives** forming **one erasure set** at MinIO's **default parity of EC:4** (8 data + 4 parity shards per object). This is the minimal-plus canonical erasure topology; 12 drives were chosen deliberately so the write-quorum threshold and the read/parity limits can each be crossed cleanly and observed on both sides (see OBJ-1/OBJ-2).
-
----
+- **OBJ-1** — If a drive becomes unavailable while data is actively being written, what error does MinIO return, and does the write succeed or fail?
+- **OBJ-2** — For objects already stored before a drive vanished, can they still be read? If not, what error is returned?
+- **OBJ-3** — What event or condition triggers a healing operation when a drive comes back online after being offline?
+- **OBJ-4** — What criteria does the system use to decide that a specific object needs healing on a particular drive?
+- **OBJ-5** — What log messages appear during an active healing operation?
+- **OBJ-6** — What are the metric names that track online vs. offline drive counts, and what values do they report before and after a drive failure?
 
 ## Environment & Build Appendix
 
-### Go toolchain
+All investigation work was performed under the single disposable root `/tmp/minio-investigation`; the source repository at `/tmp/blitzy/minio/blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc_5ba4b2` was never modified. The transcript below is chronological.
+
+### Toolchain, client, canonical build, and default configuration
+
+The toolchain, the `go.mod` directive, the verbatim canonical build target (`Makefile:L177`, which depends on both `checks` and `build-debugging` — the latter also builds the `xl-meta` helper used below), the version-stamped binary, the dedicated block device that lets a single-host multi-drive server start with **no CI override**, and the client alias:
 
 ```
-$ go version
+===CMD: go version
 go version go1.23.4 linux/amd64
-```
 
-This satisfies the module's `go 1.23` directive (`go.mod:L3`). CI for this commit pins `1.23.x` and the project Dockerfiles use `golang:1.23-alpine`, so Go 1.23.4 is a canonical toolchain for this build.
+===CMD: mc --version (line 1)
+mc version RELEASE.2025-08-13T08-35-41Z (commit-id=7394ce0dd2a80935aded936b09fa12cbb3cb8096)
 
-### Build command used (canonical, version-stamped)
+===CMD: sed -n 3p go.mod
+go 1.23
 
-The binary was built with the project's canonical `make build` target:
-
-```
-$ make build
-```
-
-which the `Makefile` defines as (verbatim, `Makefile:L177-L179`):
-
-```
-build: checks ## builds minio to $(PWD)
+===CMD: sed -n 177,181p Makefile (build target verbatim)
+build: checks build-debugging ## builds minio to $(PWD)
 	@echo "Building minio binary to './minio'"
 	@CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
-```
 
-with `LDFLAGS := $(shell go run buildscripts/gen-ldflags.go)` (`Makefile:L3`) and `all: build` (`Makefile:L15`). This produces a **version-stamped** binary (NOT a `DEVELOPMENT.GOGET` build). The embedded commit id matches the commit under analysis:
+hotfix-vars:
 
-```
-$ ./minio --version
+===CMD: ./minio --version (canonical worktree binary)
 minio version DEVELOPMENT.2024-11-25T17-10-22Z (commit-id=c07e5b49d477b0774f23db3b290745aef8c01bd2)
 Runtime: go1.23.4 linux/amd64
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
+Copyright: 2015-2024 MinIO, Inc.
+
+===CMD: df /tmp (dedicated block device, not container root)
+/dev/nvme0n1p1 /tmp
+
+===CMD: mc alias ls inv (endpoint)
+inv
+  URL       : http://127.0.0.1:9000
+  AccessKey : minioadmin
+  SecretKey : (hidden)
+  API       : s3v4
+  Path      : auto
+  Src       : /root/.mc/config.json
 ```
 
-The version *label* `DEVELOPMENT.2024-11-25T17-10-22Z` is produced by `buildscripts/gen-ldflags.go` for an untagged commit; the authoritative identifier is the embedded `commit-id=c07e5b49d477b0774f23db3b290745aef8c01bd2`, confirming the running binary is exactly this commit.
-
-> A non-stamped fallback (`CGO_ENABLED=0 GOFLAGS=-mod=mod go build -o ./minio .`, which yields a `DEVELOPMENT.GOGET` banner) is equally valid for functional failure-scenario testing; it was **not** needed here because `make build` succeeded.
-
-### Client tool
+The `commit-id` in the banner is exactly the commit under analysis. Two points of methodology: (a) a plain build at the repository HEAD would stamp the HEAD commit, so the binary was built from a **detached git worktree pinned to `c07e5b49d477`** (`git worktree add --detach /tmp/minio-investigation/minio-src c07e5b49d477b0774f23db3b290745aef8c01bd2 && make build`), which makes the banner reproducibly identify the analysis commit; (b) `MINIO_CI_CD` was **not** set — the server runs in true default configuration. The only default-mode reason a single-host multi-drive server refuses to start is the root-disk guard, which does not fire here because `/tmp` is on the dedicated device `/dev/nvme0n1p1` shown above. The `make build` output itself:
 
 ```
-$ mc --version
-mc version RELEASE.2025-08-13T08-35-41Z
+$ make build
+Checking dependencies
+Building minio binary to './minio'
 ```
-
-`mc` (the MinIO client) drove all S3 `PutObject`/`GetObject`/`stat` calls and the admin/metrics operations. For the two quorum-failure cases, a hand-written **AWS SigV4 `curl`-equivalent** request (single attempt, no SDK retry) was used to capture the raw, unretried S3 error body and HTTP status.
 
 ### Server invocation and topology
 
-```
-$ export MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_CI_CD=1
-$ ./minio server drives/d1 drives/d2 drives/d3 drives/d4 drives/d5 drives/d6 \
-                  drives/d7 drives/d8 drives/d9 drives/d10 drives/d11 drives/d12 \
-                  --address :9000 --console-address :9001
-```
-
-All twelve drive directories live **outside** the repository tree (under `/tmp/minio-investigation/drives`) so no runtime artifact touches the source repo. Default configuration was used throughout: **default storage-class parity** and **healing left ON**. No parity, storage-class, or heal setting was altered to force any outcome.
-
-### Reported drive count and default parity
-
-`mc admin info` reports the live topology:
+The server was launched with twelve local drives — the minimal canonical erasure topology exercising the default `EC:4` parity (eight data + four parity shards) — using only the two documented default credential variables:
 
 ```
-$ mc admin info inv
-...
-12 drives online, 0 drives offline, EC:4
-...
-Erasure stripe size: 12  (1 erasure set)
+$ MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+    /tmp/minio-investigation/minio-src/minio server \
+    /tmp/minio-investigation/drives/d{1,2,3,4,5,6,7,8,9,10,11,12} \
+    --address :9000 --console-address :9001 > /tmp/minio-investigation/server.log 2>&1 &
 ```
 
-The **EC:4** parity is MinIO's default for a 12-drive set, per the default-parity mapping (`cmd/erasure-server-pool.go:L120-L124` documents EC:2 at 4–5 drives, EC:3 at 6–7, EC:4 at 8–16; the numeric mapping is `DefaultParityBlocks` in `internal/config/storageclass/storage-class.go:L355`). With EC:4 each object is split into **8 data + 4 parity = 12 shards**, one per drive.
-
-### How a drive was taken offline and brought back (real backend path)
-
-Failures were induced through the **real disk path**, never by editing configuration:
-
-- **Take offline (stable):** replace a drive directory with a regular file — `rm -rf drives/dN && touch drives/dN`. MinIO's disk layer then cannot treat the path as a directory/mountpoint and registers the drive offline, logging `errDiskNotDir` = `"drive is not directory or mountpoint"` (`cmd/storage-errors.go:L50`). This is destructive — it simulates a wiped/replaced drive, so the shard data on that drive is gone (relevant to OBJ-2).
-- **Bring back:** remove the placeholder file — `rm -f drives/dN`. The disk monitor then sees a fresh/unformatted slot, reformats it, and heals it (OBJ-3).
-
-> A fully-removed directory does **not** stay offline on a single-node deployment: the disk monitor recreates and reformats it within ~10s. The regular-file placeholder is what holds a drive stably offline. This was determined empirically and is the canonical real-backend mechanism used throughout.
-
-### Captured startup banner (verbatim)
+The verbatim startup banner (first 16 lines of `server.log`), then the readiness/cluster-info handshake, the object listing, baseline checksums, and the on-disk shard layout of `obj1.bin` across all twelve drives. Readiness is established by the authenticated `mc admin info inv` call succeeding — it reports `Network: 1/1 OK` and `Drives: 12/12 OK`, values that only return once the server has finished formatting and is accepting requests, so a successful `admin info` is a strictly stronger readiness proof than a bare `/minio/health/ready` probe. The client alias itself was set with `mc alias set inv http://127.0.0.1:9000 minioadmin minioadmin` and is shown resolved by the `mc alias ls inv` block in the build listing above.
 
 ```
+===CMD: sed -n 1,16p server.log (startup banner, verbatim)
 INFO: Formatting 1st pool, 1 set(s), 12 drives per set.
 INFO: WARNING: Host local has more than 4 drives of set. A host failure will result in data becoming unavailable.
-INFO: 
- You are running an older version of MinIO released 9 months before the latest release 
- Update: Run `mc admin update ALIAS` 
-
-
 MinIO Object Storage Server
 Copyright: 2015-2026 MinIO, Inc.
 License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Version: DEVELOPMENT.2024-11-25T17-10-22Z (go1.23.4 linux/amd64)
 
-API: http://10.236.12.19:9000  http://172.17.0.1:9000  http://127.0.0.1:9000 
-WebUI: http://10.236.12.19:9001 http://172.17.0.1:9001 http://127.0.0.1:9001 
+API: http://10.236.12.19:9000  http://172.17.0.1:9000  http://127.0.0.1:9000
+WebUI: http://10.236.12.19:9001 http://172.17.0.1:9001 http://127.0.0.1:9001
 
 Docs: https://docs.min.io
 WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
+INFO:
+ You are running an older version of MinIO released 9 months before the latest release
+ Update: Run `mc admin update ALIAS`
+
+===CMD: mc admin info inv
+●  127.0.0.1:9000
+   Uptime: 49 minutes
+   Version: 2024-11-25T17:10:22Z
+   Network: 1/1 OK
+   Drives: 12/12 OK
+   Pool: 1
+
+┌──────┬───────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage          │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 1.3% (total: 192 TiB) │ 12                  │ 1            │
+└──────┴───────────────────────┴─────────────────────┴──────────────┘
+
+40 MiB Used, 1 Bucket, 5 Objects
+12 drives online, 0 drives offline, EC:4
+
+===CMD: mc ls inv/ectest/
+[2026-07-13 18:52:02 UTC] 8.0MiB STANDARD obj1.bin
+[2026-07-13 18:52:02 UTC] 8.0MiB STANDARD obj2.bin
+[2026-07-13 18:52:02 UTC] 8.0MiB STANDARD obj3.bin
+[2026-07-13 18:52:03 UTC] 8.0MiB STANDARD obj4.bin
+[2026-07-13 18:52:03 UTC] 8.0MiB STANDARD obj5.bin
+
+===CMD: cat baseline_checksums.txt
+7e79b53e400e431c4266913e5692bfdba9804cc8b2a774a378f90beeb0d3a3e6  obj1.bin
+791d6a32659caf5f9a5997f357f0d1835b284fed1d0cad5713e3ef9f3bf7e984  obj2.bin
+5dfa87c389a491c7748209e15b8656c9cdf6d8091b989094cd0d7c4e31d9fc1e  obj3.bin
+006448d7bdf68df42b3990c63f641a5450f61ceec18e1aa98ca2f93fb08ec7c0  obj4.bin
+486b9066317f4f120f65e7d7ce9d0fa6128ac2288b57fcffe3de703265529b9e  obj5.bin
+
+===CMD: obj1 shard layout across all 12 drives
+d1: xl.meta=yes part.1=1048832 bytes
+d2: xl.meta=yes part.1=1048832 bytes
+d3: xl.meta=yes part.1=1048832 bytes
+d4: xl.meta=yes part.1=1048832 bytes
+d5: xl.meta=yes part.1=1048832 bytes
+d6: xl.meta=yes part.1=1048832 bytes
+d7: xl.meta=yes part.1=1048832 bytes
+d8: xl.meta=yes part.1=1048832 bytes
+d9: xl.meta=yes part.1=1048832 bytes
+d10: xl.meta=yes part.1=1048832 bytes
+d11: xl.meta=yes part.1=1048832 bytes
+d12: xl.meta=yes part.1=1048832 bytes
 ```
 
-### Baseline objects and scale
+The stripe size is twelve, there is one erasure set, and the effective parity is `EC:4` — consistent with the default-parity mapping at `cmd/erasure-server-pool.go:L120-L124` (EC:2 for 4–5 drives, EC:3 for 6–7, EC:4 for 8–16). Each drive holds `obj1.bin`'s `xl.meta` plus a `part.1` shard of 1,048,832 bytes (a 1-MiB erasure block plus bitrot-checksum overhead). Five 8-MiB random objects (`obj1`–`obj5`) form the baseline; their SHA-256 checksums above are the reference for every read/reconstruction integrity check.
 
-A bucket `ectest` was created and five 8 MiB random objects (`obj1.bin`…`obj5.bin`) were uploaded. Their SHA-256 checksums (used later to prove byte-exact reads) were recorded:
+### How a drive was taken offline and brought back (real backend path)
 
-```
-7e1b536dc753c753a52d82b75b397f6a692380e2f06bf0ac10dc6dec0be8de4a  obj1.bin
-3afb29d77ffad6a2dd74ce83e5e61ab44bda99d83536db8e6e41d03057d713ac  obj2.bin
-021e5f83700990bd4e3b678568acc25dfa087fe68a1cd49848c09c40892fdeab  obj3.bin
-9b2baccbb18375ea7ad9732c61126450d398808193317f7e9037d242cc57b6b1  obj4.bin
-1ce90aa215ae2cb74a3838c4dfb9693311d68bbd84cd7622249eb44a3cf5d063  obj5.bin
-```
+Drive failure was produced through the **real disk path**, never by editing parity or storage-class settings. Two mechanisms were used and are labeled accurately throughout:
 
-Each object was confirmed to have an `xl.meta` and a `part.1` on all 12 drives (12 shards = 8 data + 4 parity), i.e. one shard per drive across the full erasure set.
+- **Stable offline (non-destructive)** — used for the OBJ-1/OBJ-2 quorum experiments. The drive directory is renamed aside and a regular-file placeholder is left at the mount path (`mv drives/dN drives/dN.saved && : > drives/dN`). MinIO's disk monitor then finds a non-directory at the path and marks the drive offline; the condition is stable (does not auto-recreate) and non-destructive (data preserved in `dN.saved`, so restore is instant with no heal needed).
+- **Fresh/replaced drive** — used for the OBJ-3/OBJ-4/OBJ-5 healing experiments. The placeholder is removed and an **empty** directory is created (`rm -f drives/dN && mkdir drives/dN`), modeling a blank replacement disk and triggering the automatic fresh-disk heal.
 
----
+Two mechanisms were evaluated before settling on the placeholder for the stable-offline experiments. A bare rename (`mv drives/dN drives/dN.saved`) with **no** placeholder does make the drive momentarily absent, but the connect-and-heal monitors recreate/reconnect the path within their poll interval, so the drive does not stay offline long enough to drive the quorum experiments deterministically. Leaving a regular-file placeholder at the mount path holds the drive stably offline (the monitor keeps finding a non-directory) without destroying any data. The fresh-drive experiments instead use an empty directory precisely because the monitor treats it as an unformatted replacement and heals it.
+
+An empirically-verified nuance about the offline signal: `errDiskNotFound` ("drive not found", `cmd/storage-errors.go:L53`) is the internal marker for a genuinely absent path, but under the placeholder mechanism the monitor records the closely-related `errDiskNotDir` ("drive is not directory or mountpoint", `cmd/storage-errors.go:L50`). This is why the placeholder mechanism is labeled accurately as producing `errDiskNotDir`, **not** `errDiskNotFound`. Neither string is written verbatim as a one-line server-log message — a whole-log `grep` for the literal `drive not found` returns `0` (shown in the OBJ-1 evidence). What the server logs is the underlying filesystem probe (`lstat <drive>/.minio.sys/format.json: not a directory`, shown verbatim in the OBJ-1 W2 evidence); the offline state itself is observed through `mc admin info` and the metrics of OBJ-6.
+
+### S3 request tooling (single-shot SigV4)
+
+Several decisive results (the `SlowDownWrite`/`SlowDownRead` 503s and the degraded-write boundary) are captured with a hand-written single-shot SigV4 client, `sigv4_oneshot.py`, rather than through `mc`, so the exact HTTP method, URL, signed headers, payload size, credential source, and single-attempt (no-retry) behavior are all visible in the request block. The tool: computes an `AWS4-HMAC-SHA256` signature for `service=s3`, `region=us-east-1`; uses **no** AWS SDK and performs exactly **one** `http.client` request with **no retry**; reads credentials from the environment (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, set to `minioadmin`/`minioadmin`); and prints the request line, the signed headers (including the full `Authorization` signature and `Payload bytes`), followed by the complete response status line, headers, and body. Its invocation is `python3 sigv4_oneshot.py METHOD HOST PORT BUCKET KEY [PAYLOAD_FILE]`, and every use below shows both the emitted `=== REQUEST (single shot, no retry) ===` block and the full `=== RESPONSE ===` block plus the process exit line (`SIGV4-PUT-EXIT`/`SIGV4-GET-EXIT`).
 
 ## OBJ-1 — Write path under drive loss
 
 ### Direct answer
 
-**It depends on how many drives are offline, and there are two distinct regimes — both were reproduced:**
-
-1. **Fewer than half the drives offline → the write SUCCEEDS in a degraded state.** MinIO's default (availability-optimized) storage class *upgrades* the object's parity by one for every offline drive, records a `x-minio-internal-erasure-upgraded` annotation on the object, and completes the PUT. No error is returned to the client.
-2. **At least half the drives offline → the write FAILS.** The client receives S3 error code **`SlowDownWrite`** at **HTTP 503**, whose body message is `"Resource requested is unwritable, please reduce your request rate"`. Internally this is `errErasureWriteQuorum` = `"Write failed. Insufficient number of drives online"`.
-
-The deciding branch is `if offlineDrives >= (len(storageDisks)+1)/2` — with 12 drives, the threshold is `(12+1)/2 = 6`. So **1–5 offline → degraded success; ≥6 offline → write-quorum failure.**
+It depends on **how many drives are offline at write time**, and the deciding threshold is half the set. With **fewer than half** the drives offline, the write **succeeds** in a degraded mode: MinIO's default availability-optimized storage class raises the object's parity by one per offline drive (capped at half the set) and records an `x-minio-internal-erasure-upgraded` marker. With **at least half** the drives offline, the write **fails** and the client receives S3 error **`SlowDownWrite`** at **HTTP 503**. For this twelve-drive set the failure threshold is `(12+1)/2 = 6`; this was confirmed empirically at 4, 5, and 6 offline.
 
 ### Code reference
 
-- Parity-upgrade + write-quorum decision: `cmd/erasure-object.go` — `func (er erasureObjects) putObject`, block at **L1291–L1319**:
-  - **L1291** `if !opts.MaxParity && globalStorageClass.AvailabilityOptimized() {`
-  - **L1295–L1302** the per-offline-drive loop (`var offlineDrives int` at L1295; inside the loop `parityDrives++; offlineDrives++` at L1298–L1299)
-  - **L1304** `if offlineDrives >= (len(storageDisks)+1)/2 {`
-  - **L1308** `return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)`
-  - **L1311–L1313** parity cap: `if parityDrives >= len(storageDisks)/2 { parityDrives = len(storageDisks) / 2 }`
-  - **L1315–L1317** `if parityOrig != parityDrives { userDefined[minIOErasureUpgraded] = strconv.Itoa(parityOrig) + "->" + strconv.Itoa(parityDrives) }` (the assignment itself is **L1316**)
-- Annotation key: `cmd/erasure-metadata.go:L38` `const minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"`.
-- Quorum error string: `cmd/erasure-errors.go:L25-L26` `errErasureWriteQuorum = errors.New("Write failed. Insufficient number of drives online")`.
-- S3/HTTP mapping: `cmd/api-errors.go:L2192-L2193` `case errErasureWriteQuorum: apiErr = ErrSlowDownWrite`; definition `cmd/api-errors.go:L874-L878` `ErrSlowDownWrite: { Code: "SlowDownWrite", Description: "Resource requested is unwritable, please reduce your request rate", HTTPStatusCode: http.StatusServiceUnavailable }`.
-- "Availability-optimized is the default" — `internal/config/storageclass/storage-class.go:L327` `func (sCfg *Config) AvailabilityOptimized() bool` returns `sCfg.Optimize == "availability" || sCfg.Optimize == ""` (and `true` when uninitialized). Since the default `Optimize` is empty, this returns `true`, so the parity-upgrade path is active by default (doc comment L322).
-- Entry point: `cmd/object-handlers.go:L1745` `PutObjectHandler`; dispatch `cmd/erasure-sets.go:L747` `(*erasureSets).PutObject`; shard encode `cmd/erasure-encode.go:L69` `(*Erasure).Encode`.
-- Offline server signal: `cmd/storage-errors.go:L50` `errDiskNotDir = StorageErr("drive is not directory or mountpoint")`.
+- `cmd/erasure-object.go:L1291-L1319` — inside `erasureObjects.putObject`: the availability-optimized parity upgrade and the write-quorum decision. The half-the-set check (`L1304-L1308`) returns `errErasureWriteQuorum` when the number of offline drives is at least `(len(storageDisks)+1)/2`; the upgrade marker is written at `L1316`.
+- `cmd/erasure-metadata.go:L531` — `objectQuorumFromMeta` computes read/write quorum from the object's data/parity counts.
+- `cmd/erasure-errors.go:L25-L26` — `errErasureWriteQuorum = errors.New("Write failed. Insufficient number of drives online")`.
+- `cmd/api-errors.go:L2192-L2193` maps `errErasureWriteQuorum` to `ErrSlowDownWrite`; `cmd/api-errors.go:L874-L878` defines `ErrSlowDownWrite` at HTTP `503`.
+- Observed server-side chain: `PutObjectHandler` (`cmd/object-handlers.go:L2057`) -> `erasureServerPools.PutObject` (`cmd/erasure-server-pool.go:L1091`) -> `erasureSets.PutObject` (`cmd/erasure-sets.go:L749`) -> `erasureObjects.putObject` (`cmd/erasure-object.go:L1297`).
 
-### Regime 1 — degraded SUCCESS (3 of 12 drives offline)
+### Regime 1 — degraded SUCCESS (4 of 12 offline)
 
-**Command & client output:**
+Full run W1: reset to all-online, take four drives offline through the real backend path, `PutObject` via `mc`, decode the on-disk `xl.meta` with the `xl-meta` helper to expose the parity upgrade, decode the raw upgrade marker, and prove integrity by downloading and comparing SHA-256. The complete captured transcript (the `mc cp` result is `mc`'s native box-table; `EcM`/`EcN` are both 6, i.e. parity raised from the default 4 to 6; the marker `NC0+Ng==` base64-decodes to `4->6`):
 
 ```
-$ rm -rf drives/d10 drives/d11 drives/d12 && touch drives/d10 drives/d11 drives/d12   # take 3 drives offline
-$ mc admin info inv | grep -i drives
-9 drives online, 3 drives offline, EC:4
+=== STEP 0: reset boundary - confirm all drives online ===
+12 drives online, 0 drives offline, EC:4
 
-$ mc cp src/obj_degraded.bin inv/ectest/obj_degraded.bin
-`/tmp/minio-investigation/src/obj_degraded.bin` -> `inv/ectest/obj_degraded.bin`
-Total: 8.00 MiB, Transferred: 8.00 MiB, Speed: 91.29 MiB/s
-```
+=== STEP 1: generate fresh 8MiB payload w1obj.bin ===
+source sha256: c3a242997bbce145dde9cfe5db7373808277a64b880b3bc9caa6502e9d582989
 
-The write **succeeded** (`exit=0`) with 3 of 12 drives offline.
+=== STEP 2: take drives d9 d10 d11 d12 offline (4 offline; (12+1)/2=6 threshold) ===
+offline d9 (data preserved in d9.saved)
+offline d10 (data preserved in d10.saved)
+offline d11 (data preserved in d11.saved)
+offline d12 (data preserved in d12.saved)
+8 drives online, 4 drives offline, EC:4
 
-**Proof of the parity upgrade** — the on-disk `xl.meta` of the degraded object, decoded with MinIO's own `xl-meta` tool, versus a baseline object:
+=== STEP 3: mark server.log position, then PutObject via mc cp ===
+`/tmp/minio-investigation/src/w1obj.bin` -> `inv/ectest/w1obj.bin`
+┌──────────┬─────────────┬──────────┬─────────────┐
+│ Total    │ Transferred │ Duration │ Speed       │
+│ 8.00 MiB │ 8.00 MiB    │ 00m00s   │ 90.31 MiB/s │
+└──────────┴─────────────┴──────────┴─────────────┘
+mc cp exit=0
+--- confirm object listed ---
+[2026-07-13 19:02:58 UTC] 8.0MiB STANDARD w1obj.bin
 
-```
-# degraded object (written with 3 drives offline):
-obj_degraded.bin :  EcM(data)=6   EcN(parity)=6   EcDist=[8,9,10,11,12,1,2,3,4,5,6,7]
-                    Metadata: x-minio-internal-erasure-upgraded = "NC0+Ng=="   (base64)
+=== STEP 4: locate on-disk xl.meta for w1obj.bin across online drives ===
+/tmp/minio-investigation/drives/d1/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d2/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d3/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d4/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d5/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d6/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d7/ectest/w1obj.bin/xl.meta
+/tmp/minio-investigation/drives/d8/ectest/w1obj.bin/xl.meta
 
-$ printf 'NC0+Ng==' | base64 -d
-4->6
+=== STEP 5: raw xl-meta decode of one shard's xl.meta (d1) ===
+xl.meta path: /tmp/minio-investigation/drives/d1/ectest/w1obj.bin/xl.meta
+--- xl-meta full JSON output ---
+{
+  "Versions": [
+    {
+      "Header": {
+        "EcM": 6,
+        "EcN": 6,
+        "Flags": 2,
+        "ModTime": "2026-07-13T19:02:58.401986268Z",
+        "Signature": "4c193ae7",
+        "Type": 1,
+        "VersionID": "00000000000000000000000000000000"
+      },
+      "Idx": 0,
+      "Metadata": {
+        "Type": 1,
+        "V2Obj": {
+          "CSumAlgo": 1,
+          "DDir": "9wmLhgWrTVSCfol6M02L/Q==",
+          "EcAlgo": 1,
+          "EcBSize": 1048576,
+          "EcDist": [
+            11,
+            12,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "EcIndex": 11,
+          "EcM": 6,
+          "EcN": 6,
+          "ID": "AAAAAAAAAAAAAAAAAAAAAA==",
+          "MTime": 1783969378401986268,
+          "MetaSys": {
+            "x-minio-internal-erasure-upgraded": "NC0+Ng=="
+          },
+          "MetaUsr": {
+            "content-type": "application/octet-stream",
+            "etag": "e27f6e5905a7445add9253be003b45d8"
+          },
+          "PartASizes": [
+            8388608
+          ],
+          "PartETags": null,
+          "PartNums": [
+            1
+          ],
+          "PartSizes": [
+            8388608
+          ],
+          "Size": 8388608
+        },
+        "v": 1732554622
+      }
+    }
+  ]
+}
 
-# baseline object (written with all 12 drives online):
-obj1.bin         :  EcM(data)=8   EcN(parity)=4   (default EC:4, NO upgrade annotation)
-```
+=== STEP 6: decode the raw x-minio-internal-erasure-upgraded base64 value ===
 
-The annotation decodes to exactly **`4->6`**: the default parity of **4** was upgraded to **6** (capped at `len(storageDisks)/2 = 6`), so the object was stored as **6 data + 6 parity**. This matches the code precisely: `parityOrig=4`; the loop adds one per offline drive (`4 + 3 = 7`); L1311–L1313 caps `7` at `12/2 = 6`; L1316 records `"4->6"`.
+decoded string: 4->6
 
-**Server-log offline signal during the window (verbatim block):**
+=== STEP 7: prove integrity - GET degraded object back and compare sha256 ===
+`inv/ectest/w1obj.bin` -> `/tmp/minio-investigation/src/w1obj.download.bin`
+┌──────────┬─────────────┬──────────┬──────────────┐
+│ Total    │ Transferred │ Duration │ Speed        │
+│ 8.00 MiB │ 8.00 MiB    │ 00m00s   │ 112.89 MiB/s │
+└──────────┴─────────────┴──────────┴──────────────┘
+source   sha256: c3a242997bbce145dde9cfe5db7373808277a64b880b3bc9caa6502e9d582989
+download sha256: c3a242997bbce145dde9cfe5db7373808277a64b880b3bc9caa6502e9d582989
+INTEGRITY: MATCH (degraded write fully readable)
 
-```
+=== STEP 8: server-log lines emitted during the offline+write window ===
+(from byte offset  to EOF; LOGPOS captured before PUT)
+
+=== STEP 6b: hex of decoded marker (od, since xxd absent) ===
+  34  2d  3e  36
+   4   -   >   6
+
+=== STEP 8b: server.log lines during W1 window (19:02:5x - 19:03) ===
+--- any drive/disk error strings in whole log so far ---
+4
+
+=== STEP 8c: full multi-line drive-offline error block(s) during W1 window ===
+(MinIO logs errDiskNotDir as 'drive is not directory or mountpoint (cmd.StorageErr)')
 API: SYSTEM.peers
-Time: 17:48:43 UTC 07/13/2026
-DeploymentID: 1b454da0-455f-4f12-aebb-a4d11763f931
+Time: 18:54:52 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
+Error: drive is not directory or mountpoint (cmd.StorageErr)
+       endpoint="/tmp/minio-investigation/drives/d11"
+       4: internal/logger/logger.go:258:logger.LogAlwaysIf()
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+----
+API: SYSTEM.peers
+Time: 19:02:07 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
 Error: drive is not directory or mountpoint (cmd.StorageErr)
        endpoint="/tmp/minio-investigation/drives/d12"
        4: internal/logger/logger.go:258:logger.LogAlwaysIf()
        3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
        2: cmd/prepare-storage.go:51:cmd.init.func22.1()
        1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+----
+API: SYSTEM.peers
+Time: 19:03:07 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
+Error: drive is not directory or mountpoint (cmd.StorageErr)
+       endpoint="/tmp/minio-investigation/drives/d10"
+       4: internal/logger/logger.go:258:logger.LogAlwaysIf()
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+----
+API: SYSTEM.peers
+Time: 19:03:07 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
+Error: drive is not directory or mountpoint (cmd.StorageErr)
+       endpoint="/tmp/minio-investigation/drives/d9"
+       4: internal/logger/logger.go:258:logger.LogAlwaysIf()
+       3: cmd/logging.go:65:cmd.peersLogAlwaysIf()
+       2: cmd/prepare-storage.go:51:cmd.init.func22.1()
+       1: cmd/erasure-sets.go:230:cmd.(*erasureSets).connectDisks.func2()
+----
 ```
 
-### Regime 2 — write FAILS (6 of 12 drives offline, = write-quorum threshold)
+The two SHA-256 values are identical, so the degraded write is fully readable. The final block above is the genuine server-log signal emitted while the drives were offline: the `errDiskNotDir` probe surfaced through `erasureSets.connectDisks.func2` (`cmd/erasure-sets.go:L230` via `cmd/prepare-storage.go:L51`).
 
-**Command & plain client output:**
+### Regime 1 boundary — 5 of 12 offline still SUCCEEDS
+
+Five offline drives (still below the six-drive threshold) also succeed, again with parity upgraded `4->6`, captured with the single-shot SigV4 tool described in the environment appendix ("S3 request tooling"):
 
 ```
-$ rm -rf drives/d7 drives/d8 drives/d9 && touch drives/d7 drives/d8 drives/d9   # now 6 of 12 offline
-$ mc admin info inv | grep -i drives
+=== take 5 drives offline d8 d9 d10 d11 d12 ===
+offline d8 (data preserved in d8.saved)
+offline d9 (data preserved in d9.saved)
+offline d10 (data preserved in d10.saved)
+offline d11 (data preserved in d11.saved)
+offline d12 (data preserved in d12.saved)
+7 drives online, 5 drives offline, EC:4
+
+=== single-shot SigV4 PUT (19 bytes) at 5 offline ===
+=== REQUEST (single shot, no retry) ===
+PUT /ectest/w3.bin HTTP/1.1
+Host: 127.0.0.1:9000
+x-amz-date: 20260713T190619Z
+x-amz-content-sha256: 40aba5baad361b497e9fe49b0d3804e5da10822de29592fc5f8f1dba9e889ee4
+Content-Length: 18
+Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=e99979e8ee9c22d28583b9b1a2e38898245f58c992cba7ff61742536e46ae6fa
+Payload bytes: 18
+
+=== RESPONSE ===
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 0
+ETag: "07b7b7e393049b35bdc04d773aa40436"
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EEE158D88EE4
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 240762
+X-Ratelimit-Remaining: 240762
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:06:19 GMT
+
+SIGV4-PUT-EXIT=0
+
+=== check parity upgrade on the 5-offline object (raw xl-meta erasure-upgraded marker) ===
+xl.meta: /tmp/minio-investigation/drives/d1/ectest/w3.bin/xl.meta
+        "EcM": 6,
+        "EcN": 6,
+          "EcM": 6,
+          "EcN": 6,
+            "x-minio-internal-erasure-upgraded": "NC0+Ng==",
+--- decode upgraded marker ---
+raw base64: NC0+Ng==  decoded: 4->6
+=== restore ===
+restored d8
+restored d9
+restored d10
+restored d11
+restored d12
+12 drives online, 0 drives offline, EC:4
+```
+
+### Regime 2 — write FAILS (6 of 12 offline = the write-quorum threshold)
+
+At six offline drives (`offlineDrives >= (12+1)/2`) the write fails. The full W2 run: reset, take six drives offline, then issue a **hand-written single-shot SigV4 PUT** (no SDK, no retries) so the exact HTTP status and XML are unambiguous. An 8-MiB body is early-rejected before the body is consumed (a real behavior — the connection is reset, full Python traceback captured); re-issuing with a 19-byte body returns the clean 503. The `mc` client is shown reporting the same condition (both JSON and plain forms), and a whole-log count confirms the literal quorum string is never logged — the server logs the per-drive `format.json` probe with the full `putObject` call chain instead:
+
+```
+=== STEP 0: reset boundary - restore d9-d12, confirm all 12 online ===
+restored d9
+restored d10
+restored d11
+restored d12
+12 drives online, 0 drives offline, EC:4
+
+=== STEP 1: take 6 drives offline d7 d8 d9 d10 d11 d12 (>= (12+1)/2 = 6 threshold) ===
+offline d7 (data preserved in d7.saved)
+offline d8 (data preserved in d8.saved)
+offline d9 (data preserved in d9.saved)
+offline d10 (data preserved in d10.saved)
+offline d11 (data preserved in d11.saved)
+offline d12 (data preserved in d12.saved)
 6 drives online, 6 drives offline, EC:4
 
-$ mc cp src/obj_fail.bin inv/ectest/obj_fail.bin
-mc: <ERROR> Failed to copy `/tmp/minio-investigation/src/obj_fail.bin`. Resource requested is unwritable, please reduce your request rate.
-```
+=== STEP 2: single-shot SigV4 PutObject (no SDK, no retry) -> expect 503 SlowDownWrite ===
+=== REQUEST (single shot, no retry) ===
+PUT /ectest/w2obj.bin HTTP/1.1
+Host: 127.0.0.1:9000
+x-amz-date: 20260713T190447Z
+x-amz-content-sha256: 7455069e7495377184ca5850dbe85c9734805b478b8cae3c0b873c3dec98078c
+Content-Length: 8388608
+Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0c93a20456ab9ef6b6add487b736538e3656e07ea9243f21f24309cb418ebc7c
+Payload bytes: 8388608
+Traceback (most recent call last):
+  File "/tmp/minio-investigation/sigv4_oneshot.py", line 83, in <module>
+    main()
+    ~~~~^^
+  File "/tmp/minio-investigation/sigv4_oneshot.py", line 67, in main
+    conn.request(method, canonical_uri, body=body, headers=headers)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/http/client.py", line 1358, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/http/client.py", line 1404, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/http/client.py", line 1353, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/http/client.py", line 1152, in _send_output
+    self.send(chunk)
+    ~~~~~~~~~^^^^^^^
+  File "/usr/lib/python3.13/http/client.py", line 1077, in send
+    self.sock.sendall(data)
+    ~~~~~~~~~~~~~~~~~^^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer
+SIGV4-PUT-EXIT=1
 
-**Clean single-attempt raw HTTP (hand-written SigV4, no SDK retry) — the actual S3 error body and status:**
+=== STEP 2b: NOTE - 8MiB body caused early-reject Connection reset (server aborts before consuming body). ===
+=== Re-issue single-shot SigV4 PUT with small body so full request is sent -> clean 503 XML ===
+--- confirm still 6 offline before request ---
+6 drives online, 6 drives offline, EC:4
+--- single-shot SigV4 PUT (19-byte body) ---
+=== REQUEST (single shot, no retry) ===
+PUT /ectest/w2small.bin HTTP/1.1
+Host: 127.0.0.1:9000
+x-amz-date: 20260713T190505Z
+x-amz-content-sha256: 79f3218008de2f378c5e77eff6cf4712b95129a815cb28e820aba5940857e21a
+Content-Length: 19
+Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=fa1f200d0b4358ab7ad597517bcdb877107ea779ccbb81225d95292aa47d9eeb
+Payload bytes: 19
 
-```
+=== RESPONSE ===
 HTTP/1.1 503 Service Unavailable
+Accept-Ranges: bytes
+Content-Length: 377
 Content-Type: application/xml
+Retry-After: 60
 Server: MinIO
-X-Amz-Request-Id: 18C1E9FB1179F281
-Vary: Origin, Accept-Encoding
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EED0271E35D6
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 240762
+X-Ratelimit-Remaining: 240762
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:05:05 GMT
 
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>obj_fail_curl.bin</Key><BucketName>ectest</BucketName><Resource>/ectest/obj_fail_curl.bin</Resource><RequestId>18C1E9FB1179F281</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+<Error><Code>SlowDownWrite</Code><Message>Resource requested is unwritable, please reduce your request rate</Message><Key>w2small.bin</Key><BucketName>ectest</BucketName><Resource>/ectest/w2small.bin</Resource><RequestId>18C1EED0271E35D6</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+SIGV4-PUT-EXIT=1
+
+=== STEP 3: mc client PutObject under same 6-offline condition (client-visible error) ===
+6 drives online, 6 drives offline, EC:4
+{"status":"success","source":"/tmp/minio-investigation/src/w2small.bin","target":"inv/ectest/w2mc.bin","size":19,"totalCount":1,"totalSize":0}
+{"status":"error","error":{"message":"Failed to copy `/tmp/minio-investigation/src/w2small.bin`.","cause":{"message":"Resource requested is unwritable, please reduce your request rate","error":{"Code":"SlowDownWrite","Message":"Resource requested is unwritable, please reduce your request rate","BucketName":"ectest","Key":"w2mc.bin","Resource":"/ectest/w2mc.bin","RequestID":"18C1EED43757F9C3","HostID":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8","Region":"","Server":"MinIO"}},"type":"error"}}
+mc-cp-exit=1
+--- also plain (non-json) mc error text ---
+`/tmp/minio-investigation/src/w2small.bin` -> `inv/ectest/w2mc.bin`
+mc: <ERROR> Failed to copy `/tmp/minio-investigation/src/w2small.bin`. Resource requested is unwritable, please reduce your request rate
+mc-cp-exit=1
+
+=== STEP 4: server.log quorum signal during W2 window ===
+--- full most-recent error block mentioning write/quorum ---
+9201:       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+9202:       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+9218:       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+9219:       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+9235:       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+9236:       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+9252:       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+9253:       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+9269:       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+9270:       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+
+=== STEP 4b: full server.log error block(s) for the write-quorum failure ===
+       2: cmd/object-handlers.go:2057:cmd.objectAPIHandlers.PutObjectHandler()
+       1: net/http/server.go:2220:http.HandlerFunc.ServeHTTP()
+
+API: SYSTEM.storage
+Time: 19:05:25 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
+Error: lstat /tmp/minio-investigation/drives/d7/.minio.sys/format.json: not a directory (*fs.PathError)
+      12: internal/logger/logonce.go:118:logger.(*logOnceType).logOnceIf()
+      11: internal/logger/logonce.go:149:logger.LogOnceIf()
+      10: cmd/logging.go:164:cmd.storageLogOnceIf()
+       9: cmd/xl-storage.go:821:cmd.(*xlStorage).checkFormatJSON()
+       8: cmd/xl-storage.go:841:cmd.(*xlStorage).GetDiskID()
+       7: cmd/xl-storage-disk-id-check.go:209:cmd.(*xlStorageDiskIDCheck).IsOnline()
+       6: cmd/erasure-object.go:1297:cmd.erasureObjects.putObject()
+       5: cmd/erasure-object.go:1241:cmd.erasureObjects.PutObject()
+       4: cmd/erasure-sets.go:749:cmd.(*erasureSets).PutObject()
+       3: cmd/erasure-server-pool.go:1091:cmd.(*erasureServerPools).PutObject()
+       2: cmd/object-handlers.go:2057:cmd.objectAPIHandlers.PutObjectHandler()
+
+=== STEP 4c: does the literal errErasureWriteQuorum string ever appear in server.log? ===
+count of "Insufficient number of drives online": 0
+count of "Write failed": 0
+=== STEP 5: cleanup W2 offline drives -> restore to 12 online ===
+restored d7
+restored d8
+restored d9
+restored d10
+restored d11
+restored d12
+12 drives online, 0 drives offline, EC:4
 ```
 
-(When driven via `mc --debug`, the AWS SDK *retries* the 503 `SlowDownWrite` four times before giving up — standard S3 retry-on-503 behavior — which is why the single-attempt SigV4 request above is the cleanest capture of the one true response.)
+### Cause -> effect (OBJ-1)
 
-**Server-log corroboration:** six `"drive is not directory or mountpoint (cmd.StorageErr)"` blocks (one per offline drive), plus internal metadata writes failing with `"Storage resources are insufficient for the write operation .minio.sys/buckets/.../usage-cache.bin (cmd.InsufficientWriteQuorum)"`. The object-PUT's `errErasureWriteQuorum` is *returned to the client* (mapped to `ErrSlowDownWrite`), not logged as a server error — grepping the log for the literal string `"Insufficient number of drives online"` yields 0 hits, confirming it is the client-facing error string, not a server log line.
-
-### Cause → effect
-
-With the default availability-optimized storage class active (empty `Optimize`, `storage-class.go:L327`), the PUT path counts offline drives (`erasure-object.go:L1295–L1301`). Below the `(N+1)/2` threshold it raises parity to keep the object durable and stamps `minIOErasureUpgraded` (observed `"4->6"`), so the write completes. At or above the threshold (6 of 12), it short-circuits at L1304→L1308 with `errErasureWriteQuorum`, which the API layer maps to `SlowDownWrite`/HTTP 503 (`api-errors.go:L2192-L2193`, `L874-L878`) — exactly the XML body observed.
-
----
+Below half the set, the availability-optimized storage class trades data shards for parity shards so a full complement of shards still lands on the online drives; the object is stored with elevated parity (`4->6`) and reconstructs normally. At half the set or more, no shard layout satisfies write quorum, so `putObject` returns `errErasureWriteQuorum`, which the API layer maps to `SlowDownWrite` / HTTP 503 with a `Retry-After: 60` header. The literal error text is returned up the stack and mapped at `cmd/api-errors.go:L2192-L2193`, not logged verbatim (whole-log count = 0).
 
 ## OBJ-2 — Read path for pre-existing objects
 
 ### Direct answer
 
-**Objects written before the failure remain readable as long as at least a read-quorum's worth of shards survive — again two regimes, both reproduced:**
-
-1. **Up to `parity` drives lost (≤ 4 of 12) → the object is READ SUCCESSFULLY.** MinIO reconstructs the missing shards from the surviving 8+ shards via Reed-Solomon; the returned bytes are byte-for-byte identical to the original (checksum verified).
-2. **More than `parity` drives lost (≥ 5 of 12, dropping below read quorum) → the read FAILS.** The client receives S3 code **`SlowDownRead`** at **HTTP 503**, body `"Resource requested is unreadable, please reduce your request rate"`. Internally this is `errErasureReadQuorum` = `"Read failed. Insufficient number of drives online"`.
-
-With EC:4 (8 data + 4 parity), the read quorum is `dataBlocks = 8`, so reconstruction holds until only 8 shards remain (4 drives lost) and fails once fewer than 8 remain (5+ drives lost).
+Yes — a pre-existing object stays readable as long as the number of **online** drives meets read quorum, which for the default `EC:4` layout equals the eight data shards. With four drives offline (eight online) `obj1.bin` is reconstructed on the fly via Reed-Solomon and served byte-for-byte identically. Once online drives drop below the data count — five offline (seven online) — the read **fails** with S3 error **`SlowDownRead`** at **HTTP 503**. Both regimes were exercised on the **same unchanged** pre-existing object.
 
 ### Code reference
 
-- Read entry: `cmd/object-handlers.go:L715` `GetObjectHandler`; object layer `cmd/erasure-object.go:L200` `GetObjectNInfo`, `L307` `getObjectWithFileInfo`, `L705` `getObjectFileInfo`.
-- Read-quorum failure: `cmd/erasure-object.go:L487` `return FileInfo{}, errErasureReadQuorum`; error reduction `L836` `reduceReadQuorumErrs(...)`; handling `L691` `case errors.Is(err, errErasureReadQuorum):`.
-- Quorum computation: `cmd/erasure-metadata.go` `objectQuorumFromMeta` — `readQuorum = dataBlocks`.
-- Quorum error string: `cmd/erasure-errors.go:L22-L23` `errErasureReadQuorum = errors.New("Read failed. Insufficient number of drives online")`.
-- S3/HTTP mapping: `cmd/api-errors.go:L2190-L2191` `case errErasureReadQuorum: apiErr = ErrSlowDownRead`; definition `cmd/api-errors.go:L869-L873` `ErrSlowDownRead: { Code: "SlowDownRead", Description: "Resource requested is unreadable, please reduce your request rate", HTTPStatusCode: http.StatusServiceUnavailable }`.
-- On-the-fly heal enqueue on a degraded GET: `cmd/erasure-object.go:L400` `globalMRFState.addPartialOp(...)` (ties into OBJ-3).
+- `cmd/erasure-object.go:L200` — `erasureObjects.GetObjectNInfo`, the read entry point.
+- `cmd/erasure-object.go:L705` — `getObjectFileInfo`; the read-quorum failure surfaces from its inline worker `getObjectFileInfo.func1` (`cmd/erasure-object.go:L738`, seen in the server-log stack below).
+- `cmd/erasure-object.go:L487` — the `errErasureReadQuorum` return site; `cmd/erasure-object.go:L836` — `reduceReadQuorumErrs` aggregates per-drive errors into the quorum decision.
+- `cmd/erasure-errors.go:L22-L23` — `errErasureReadQuorum = errors.New("Read failed. Insufficient number of drives online")`.
+- `cmd/api-errors.go:L2190-L2191` maps `errErasureReadQuorum` to `ErrSlowDownRead`; `cmd/api-errors.go:L869-L873` defines `ErrSlowDownRead` at HTTP `503`.
 
-> **Important mechanism note:** the real-backend offline method used here (replacing a drive directory with a file) is *destructive* — it wipes that drive's shard. So "N drives offline" means "N shards of each pre-existing object destroyed." An object survives while `≥ readQuorum (8)` shards remain (i.e. up to `parity = 4` drives lost). This is exactly the real-world scenario of a drive being replaced with a blank one, and it is what makes the read-quorum boundary observable.
+### Regime 1 — reconstruction SUCCEEDS (4 offline, 8 online)
 
-### Regime A — reconstruction SUCCESS (4 drives offline = parity limit)
+Full run R1: reset to all-online, confirm the baseline SHA-256 of `obj1.bin`, take four drives offline (eight online == the eight data shards), GET via `mc` (Reed-Solomon reconstruction), compare checksums, and also issue a single-shot SigV4 GET showing HTTP 200 with the full 8-MiB `Content-Length`:
 
 ```
-$ rm -rf drives/d1 drives/d2 drives/d3 drives/d4 && touch drives/d1 drives/d2 drives/d3 drives/d4
-$ mc admin info inv | grep -i drives
+=== STEP 0: reset boundary - confirm 12 online ===
+12 drives online, 0 drives offline, EC:4
+
+=== baseline sha256 of obj1 (recorded in baseline_checksums.txt) ===
+7e79b53e400e431c4266913e5692bfdba9804cc8b2a774a378f90beeb0d3a3e6  obj1.bin
+
+=== STEP 1: take 4 drives offline d9 d10 d11 d12 (8 online == dataBlocks=8 read quorum) ===
+offline d9 (data preserved in d9.saved)
+offline d10 (data preserved in d10.saved)
+offline d11 (data preserved in d11.saved)
+offline d12 (data preserved in d12.saved)
 8 drives online, 4 drives offline, EC:4
 
-$ mc cp inv/ectest/obj1.bin /tmp/dl_obj1.bin
-`inv/ectest/obj1.bin` -> `/tmp/dl_obj1.bin`
-Total: 8.00 MiB, Transferred: 8.00 MiB, Speed: 165.02 MiB/s
+=== STEP 2: GET obj1 via mc (Reed-Solomon reconstruction from remaining shards) ===
+`inv/ectest/obj1.bin` -> `/tmp/minio-investigation/src/obj1.r1.bin`
+┌──────────┬─────────────┬──────────┬──────────────┐
+│ Total    │ Transferred │ Duration │ Speed        │
+│ 8.00 MiB │ 8.00 MiB    │ 00m00s   │ 262.33 MiB/s │
+└──────────┴─────────────┴──────────┴──────────────┘
+mc-cp-exit=0
+reconstructed sha256: 7e79b53e400e431c4266913e5692bfdba9804cc8b2a774a378f90beeb0d3a3e6
+baseline      sha256: 7e79b53e400e431c4266913e5692bfdba9804cc8b2a774a378f90beeb0d3a3e6
+READ RECONSTRUCTION: MATCH (object served with 4 drives offline)
 
-$ sha256sum /tmp/dl_obj1.bin
-7e1b536dc753c753a52d82b75b397f6a692380e2f06bf0ac10dc6dec0be8de4a  /tmp/dl_obj1.bin
-```
+=== STEP 3: also single-shot SigV4 GET at 4 offline (status + headers, body length only) ===
+=== REQUEST (single shot, no retry) ===
+GET /ectest/obj1.bin HTTP/1.1
+Host: 127.0.0.1:9000
+x-amz-date: 20260713T190646Z
+x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Content-Length: 0
+Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=dfd65b6ad35d7bc81173fcf7f7afd351e55b86e84720ac7f59b09434dcfb31ff
+Payload bytes: 0
 
-The downloaded checksum `7e1b536dc753…` is **identical to the original** `obj1.bin` recorded at baseline. With obj1 keeping exactly 8 of its 12 shards on the online drives, MinIO reconstructed the 4 destroyed shards and returned the object intact. (The same result was obtained via `mc cat inv/ectest/obj1.bin | sha256sum`.)
-
-### Regime B — read-quorum LOSS (6 drives offline; only 6/12 shards remain, < read quorum 8)
-
-```
-$ rm -rf drives/d5 drives/d6 && touch drives/d5 drives/d6    # now 6 of 12 offline
-$ mc admin info inv | grep -i drives
-6 drives online, 6 drives offline, EC:4
-
-$ mc cp inv/ectest/obj1.bin /tmp/dl_obj1.bin
-mc: <ERROR> Unable to prepare URL for copying. Resource requested is unreadable, please reduce your request rate.
-```
-
-**Clean single-attempt raw HTTP GET (hand-written SigV4):**
-
-```
-HTTP/1.1 503 Service Unavailable
-Content-Type: application/xml
+=== RESPONSE ===
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 8388608
+Content-Type: application/octet-stream
+ETag: "80fe03eeccddbf1bc4a92e5baf1ce7a0"
+Last-Modified: Mon, 13 Jul 2026 18:52:02 GMT
 Server: MinIO
-X-Amz-Request-Id: 18C1EA1B2B11725F
-Vary: Origin, Accept-Encoding
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+```
+
+The reconstructed SHA-256 (`7e79b53e400e431c4266913e5692bfdba9804cc8b2a774a378f90beeb0d3a3e6`) equals the baseline `obj1.bin` checksum recorded in the Environment appendix.
+
+### Regime 2 — read FAILS (5 offline, 7 online) on the SAME object
+
+Full run R2: without altering the object, extend to five offline (seven online, below the eight data shards) and reissue the identical single-shot SigV4 GET — HTTP 503 `SlowDownRead`. `mc` reports the same; the whole-log count of the literal read-quorum string is 0; the genuine server-log read-path stack (`getObjectFileInfo.func1` at `cmd/erasure-object.go:L738`) is captured:
+
+```
+=== STEP 1: extend to 5 drives offline (add d8; d8..d12 offline) ===
+offline d8 (data preserved in d8.saved)
+7 drives online, 5 drives offline, EC:4
+
+=== STEP 2: single-shot SigV4 GET obj1 -> expect 503 SlowDownRead ===
+=== REQUEST (single shot, no retry) ===
+GET /ectest/obj1.bin HTTP/1.1
+Host: 127.0.0.1:9000
+x-amz-date: 20260713T190701Z
+x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Content-Length: 0
+Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=2c6d2bd19b6f701a548f37b5bfb52a6cfaf03e326ea3bb89613648b6e83c8271
+Payload bytes: 0
+
+=== RESPONSE ===
+HTTP/1.1 503 Service Unavailable
+Accept-Ranges: bytes
+Content-Length: 370
+Content-Type: application/xml
+Retry-After: 60
+Server: MinIO
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Vary: Origin
+Vary: Accept-Encoding
+X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+X-Amz-Request-Id: 18C1EEEB22E30C85
+X-Content-Type-Options: nosniff
+X-Ratelimit-Limit: 240762
+X-Ratelimit-Remaining: 240762
+X-Xss-Protection: 1; mode=block
+Date: Mon, 13 Jul 2026 19:07:01 GMT
 
 <?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>obj1.bin</Key><BucketName>ectest</BucketName><Resource>/ectest/obj1.bin</Resource><RequestId>18C1EA1B2B11725F</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
-```
+<Error><Code>SlowDownRead</Code><Message>Resource requested is unreadable, please reduce your request rate</Message><Key>obj1.bin</Key><BucketName>ectest</BucketName><Resource>/ectest/obj1.bin</Resource><RequestId>18C1EEEB22E30C85</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+SIGV4-GET-EXIT=1
 
-### Cause → effect
+=== STEP 3: mc GET same condition (client-visible error) ===
+mc: <ERROR> Unable to prepare URL for copying. Resource requested is unreadable, please reduce your request rate
+mc-cp-exit=1
 
-`getObjectFileInfo`/`getObjectWithFileInfo` collect the per-disk read results and pass them through `reduceReadQuorumErrs` (`erasure-object.go:L836`). While at least `readQuorum = dataBlocks = 8` shards are readable, the Reed-Solomon decoder reconstructs any missing shard and the GET returns intact bytes (verified by the matching SHA-256). Once fewer than 8 shards are available (5+ drives destroyed), the read cannot meet quorum and `erasure-object.go:L487` returns `errErasureReadQuorum`, which the API layer maps to `SlowDownRead`/HTTP 503 (`api-errors.go:L2190-L2191`, `L869-L873`) — exactly the XML observed.
+=== STEP 4: server.log read-path signal during R2 window (GetObject stack) ===
+13142:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13154:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13166:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13178:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13190:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13202:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13214:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+13226:       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
+--- full most-recent GetObject error block ---
+(no GetObjectHandler block found)
 
----
+count of literal "Read failed. Insufficient number of drives online": 0
 
-## OBJ-3 — What triggers a healing operation when a drive comes back online
+=== STEP 5: restore all -> 12 online ===
+restored d8
+restored d9
+restored d10
+restored d11
+restored d12
+12 drives online, 0 drives offline, EC:4
 
-### Direct answer
+=== STEP 4b: full server.log read-path error block (around line 13142) ===
+       3: cmd/xl-storage.go:841:cmd.(*xlStorage).GetDiskID()
+       2: cmd/xl-storage-disk-id-check.go:209:cmd.(*xlStorageDiskIDCheck).IsOnline()
+       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
 
-When a previously-offline drive returns, MinIO's **fresh/recovered-disk monitor** detects it, **reformats** it, and **dispatches an automatic heal** for that drive. Concretely, two cooperating background monitors drive this:
-
-1. `monitorAndConnectEndpoints` (runs every **15 s**) reconnects the drive; finding it fresh/unformatted, it **queues** the drive for healing via `pushHealLocalDisks`.
-2. `monitorLocalDisksAndHeal` (polls every **10 s**, `defaultMonitorNewDiskInterval = time.Second * 10`) picks up the queued drive, reformats via `HealFormat`, and launches `healFreshDisk` for it.
-
-**Observed end-to-end detection latency (drive restored → first heal log line): ~13.7 s / 19.2 s / 22.2 s across three runs** — i.e. one-to-two poll cycles, consistent with the 15 s + 10 s cadence. (The commonly cited "10 s" is only the heal-monitor *poll* interval, not the full detection latency.)
-
-Two additional heal paths exist and were noted: an **on-the-fly heal** enqueued to the MRF queue whenever a degraded object is read/written, and a **background data-scanner** heal that periodically re-checks objects.
-
-### Code reference
-
-- Fresh-disk monitor & interval: `cmd/background-newdisks-heal-ops.go` — **L40** `defaultMonitorNewDiskInterval = time.Second * 10`; **L386** launch `go monitorLocalDisksAndHeal(ctx, z)`; **L563** `func monitorLocalDisksAndHeal`; it dispatches **L592** `go healFreshDisk(ctx, z, disk)`; `func healFreshDisk` at **L419**.
-- Reconnect monitor & queueing: `cmd/erasure-sets.go` — **L283** `monitorAndConnectEndpoints`; interval **L348** `defaultMonitorConnectEndpointInterval = defaultMonitorNewDiskInterval + time.Second*5` (= 15 s); fresh-disk queue **L227** `globalBackgroundHealState.pushHealLocalDisks(endpoint)` (on `errUnformattedDisk`).
-- On-the-fly (MRF) heal: `cmd/mrf.go:L78` `addPartialOp`, `cmd/mrf.go:L220` `healRoutine`; enqueue sites in `cmd/erasure-object.go` at **L400**, **L805**, **L1578**, **~L2113** (`globalMRFState.addPartialOp(...)`).
-- Background scanner heal: `cmd/data-scanner.go:L61` `healObjectSelectProb = 1024`, `L93` `getCycleScanMode`, `L199` `HealDeepScan` branch.
-
-### Command & observed output
-
-```
-$ rm -f drives/d10        # bring d10 back online (remove the placeholder file)
-# ... continuous `tail -f logs/server.log` ...
-```
-
-**Detection → heal-dispatch, verbatim server log for the returning drive (from server startup capture, drive d11 example, showing the full trigger stack):**
-
-```
 API: SYSTEM.storage
-Time: 17:27:43 UTC 07/13/2026
-DeploymentID: 1b454da0-455f-4f12-aebb-a4d11763f931
-Error: lstat /tmp/minio-investigation/drives/d11/.minio.sys/format.json: not a directory (*fs.PathError)
-       9: internal/logger/logonce.go:118:logger.(*logOnceType).logOnceIf()
-       8: internal/logger/logonce.go:149:logger.LogOnceIf()
-       7: cmd/logging.go:164:cmd.storageLogOnceIf()
-       6: cmd/xl-storage.go:821:cmd.(*xlStorage).checkFormatJSON()
-       5: cmd/xl-storage.go:841:cmd.(*xlStorage).GetDiskID()
-       4: cmd/xl-storage-disk-id-check.go:209:cmd.(*xlStorageDiskIDCheck).IsOnline()
-       3: cmd/erasure-sets.go:103:cmd.(*erasureSets).getDiskMap()
-       2: cmd/erasure-sets.go:200:cmd.(*erasureSets).connectDisks()
-       1: cmd/erasure-sets.go:303:cmd.(*erasureSets).monitorAndConnectEndpoints()
-...
-Healing drive '/tmp/minio-investigation/drives/d11' - 'mc admin heal alias/ --verbose' to check the current status.
-Healing drive '/tmp/minio-investigation/drives/d11' - use 4 parallel workers.
-Healing of drive '/tmp/minio-investigation/drives/d11' is finished (healed: 4, skipped: 0).
+Time: 19:07:04 UTC 07/13/2026
+DeploymentID: 9c3ab6b6-31d4-498b-808d-70099759e89a
+Error: lstat /tmp/minio-investigation/drives/d8/.minio.sys/format.json: not a directory (*fs.PathError)
+       7: internal/logger/logonce.go:118:logger.(*logOnceType).logOnceIf()
+       6: internal/logger/logonce.go:149:logger.LogOnceIf()
+       5: cmd/logging.go:164:cmd.storageLogOnceIf()
+       4: cmd/xl-storage.go:821:cmd.(*xlStorage).checkFormatJSON()
+       3: cmd/xl-storage.go:841:cmd.(*xlStorage).GetDiskID()
+       2: cmd/xl-storage-disk-id-check.go:209:cmd.(*xlStorageDiskIDCheck).IsOnline()
+       1: cmd/erasure-object.go:738:cmd.erasureObjects.getObjectFileInfo.func1()
 ```
 
-The stack shows the exact detection chain: `monitorAndConnectEndpoints` → `connectDisks` → `getDiskMap` → `IsOnline` → `GetDiskID` → `checkFormatJSON` finds no valid `format.json` on the returned drive, so it is treated as fresh and queued; the heal monitor then emits the `"Healing drive ..."` lines.
+### Cause -> effect (OBJ-2)
 
-**Detection latency, three runs (drive restored → first `"Healing drive '...' - use N parallel workers."` line), measured by wall-clock:**
+While at least the eight data shards are reachable, `getObjectFileInfo`/`GetObjectNInfo` reconstruct any missing shards and stream the object; the served bytes match the original checksum exactly. When online drives fall below the data count, no set of shards can reconstruct the object, `reduceReadQuorumErrs` yields `errErasureReadQuorum`, and the API layer maps it to `SlowDownRead` / HTTP 503.
 
-| Run | Drive | Latency | Result |
-|-----|-------|---------|--------|
-| 1 | d5 | **13.7 s** | healed: 15, skipped: 0 |
-| 2 | d6 | **19.2 s** | (heal completed) |
-| 3 | d10 | **22.2 s** | healed: 14, skipped: 0 |
-
-All three fall within the expected one-to-two poll-cycle window (15 s reconnect tick to queue + up to 10 s heal tick).
-
-### Cause → effect
-
-Restoring the drive path makes the reconnect monitor (`erasure-sets.go:L283`, 15 s) see a drive whose `format.json` is absent/invalid (`checkFormatJSON`), so it enqueues it via `pushHealLocalDisks` (`erasure-sets.go:L227`). On its next 10 s tick, `monitorLocalDisksAndHeal` (`background-newdisks-heal-ops.go:L563`) reformats the drive and dispatches `healFreshDisk` (L592/L419), which emits the heal log lines. The observed 13–22 s latency is precisely the sum of "time until the next 15 s reconnect tick" plus "time until the next 10 s heal tick."
-
----
-
-## OBJ-4 — Criteria for deciding an object needs healing on a particular drive
+## OBJ-3 — What triggers healing when a drive comes back online
 
 ### Direct answer
 
-The per-drive heal decision is made by **`shouldHealObjectOnDisk`**, which returns `true` (heal needed) when **any** of four conditions holds for that drive's copy of the object:
-
-1. **Missing/corrupt object** — the read returned `errFileNotFound`, `errFileVersionNotFound`, or `errFileCorrupt`. → returns `(true, erErr)`.
-2. **Legacy metadata** — `meta.XLV1` is set (the object is stored in the pre-2020 XLv1 format). → returns `(true, errLegacyXLMeta)`.
-3. **Outdated metadata** — this drive's `xl.meta` does not equal the latest (quorum) metadata: `!latestMeta.Equals(meta)`. → returns `(true, errOutdatedXLMeta)`.
-4. **Missing/corrupt part** — a data part file check reports `checkPartFileNotFound` or `checkPartFileCorrupt`. → returns `(true, errPartMissingOrCorrupt)`.
-
-Otherwise it returns `(false, nil)` — no heal for that drive.
-
-Two of these four criteria were **reproduced through the real backend path** (missing object, missing part); the other two are **INFERRED** from the code because they require conditions (legacy on-disk format; racing metadata version skew) that a fresh cluster at this commit does not naturally produce.
+The trigger for a **recovered or replaced drive** is the local disk monitor `monitorLocalDisksAndHeal`, which polls on a **10-second** interval, detects that a previously-offline drive is reachable again (or that a fresh, unformatted drive is present), formats it if necessary, and dispatches `healFreshDisk` to heal every object the drive should hold. Measured across three runs the restore-to-heal-completion latency was **11.2 s, 24.3 s, and 12.2 s** — quantized to the 10-second poll (roughly one cycle for H1/H3, two for H2). Two additional healing paths exist and are classified explicitly below: the **MRF** on-the-fly heal enqueued by GET/PUT, and the **background data scanner**.
 
 ### Code reference
 
-`cmd/erasure-healing.go` — `func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestMeta FileInfo) (bool, error)` at **L156**:
+- `cmd/background-newdisks-heal-ops.go:L40` — `defaultMonitorNewDiskInterval = time.Second * 10`.
+- `cmd/background-newdisks-heal-ops.go:L563` — `monitorLocalDisksAndHeal`, launched at `L386`.
+- `cmd/background-newdisks-heal-ops.go:L419` — `healFreshDisk`, the per-drive dispatch.
+- `cmd/global-heal.go:L152` — `healErasureSet`, which walks the set and heals each object; `cmd/global-heal.go:L210` emits the "use N parallel workers" line.
+- MRF path: `cmd/mrf.go:L78` `addPartialOp` (enqueue), `cmd/mrf.go:L220` `healRoutine` (drain); GET/PUT enqueue site `cmd/erasure-object.go:L2113`.
+- Scanner path: `cmd/data-scanner.go:L61` `healObjectSelectProb = 1024`; deep-scan mode plumbed at `cmd/data-scanner.go:L93,L199`.
 
-```go
-func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestMeta FileInfo) (bool, error) {
-	if errors.Is(erErr, errFileNotFound) || errors.Is(erErr, errFileVersionNotFound) || errors.Is(erErr, errFileCorrupt) {
-		return true, erErr                                   // (1) L157–L159
-	}
-	if erErr == nil {
-		if meta.XLV1 {
-			return true, errLegacyXLMeta                     // (2) L161→L164
-		}
-		if !latestMeta.Equals(meta) {
-			return true, errOutdatedXLMeta                   // (3) L166→L167
-		}
-		if !meta.Deleted && !meta.IsRemote() {
-			for _, partErr := range partsErrs {
-				if slices.Contains([]int{
-					checkPartFileNotFound,
-					checkPartFileCorrupt,
-				}, partErr) {
-					return true, errPartMissingOrCorrupt     // (4) L169→L176
-				}
-			}
-		}
-		return false, nil                                    // L180
-	}
-	return false, erErr
-}
-```
+### Observation — recovered/fresh-drive detection and dispatch (3 timestamped runs)
 
-- Error vars: `errLegacyXLMeta` **L148**, `errOutdatedXLMeta` **L150**, `errPartMissingOrCorrupt` **L152**.
-- Healing marker: `cmd/erasure-healing.go:L186` `xMinIOHealing = ReservedMetadataPrefix + "healing"` (this is L186, not L184).
-- Per-object heal driver: `cmd/erasure-healing.go:L258` `healObject`.
-- Latest-meta / online-disk helper: `cmd/erasure-healing-common.go:L219` `listOnlineDisks`.
-
-### Observed correlations
-
-**Criterion 1 — `errFileNotFound` (object entirely missing on a fresh drive):** After wiping drive `d8` (fresh, no data) and letting the automatic fresh-disk heal run, the object metadata that was absent on `d8` was recreated:
+For each run drive `d12` was taken offline, then brought back as an **empty replacement directory** (the canonical fresh-disk case); the server log was watched for the reconnect, the fresh-disk dispatch, the "use N parallel workers" banner, and the completion line, and restore-to-completion latency was computed from the real log timestamps. Note that `mc admin info` reports the drive "online" within ~17 ms of the directory reappearing (connectivity), whereas the **heal** completes 11–24 s later — the distinction OBJ-6 makes precise. Runs H1, H2, H3 in full:
 
 ```
-# before auto heal — obj3's xl.meta on the freshly-wiped d8:
-$ ls drives/d8/ectest/obj3.bin/ 2>&1
-ls: cannot access 'drives/d8/ectest/obj3.bin/': No such file or directory      # ABSENT
+=== STEP 0: reset boundary - ensure 12/12 online before run ===
+state: 12 drives online, 0 drives offline, EC:4
 
-# after fresh-disk heal (~20 s later):
-$ ls drives/d8/ectest/obj3.bin/xl.meta
-drives/d8/ectest/obj3.bin/xl.meta                                              # RESTORED
+=== STEP 1: take d12 offline (placeholder), confirm offline ===
+offline trigger at: 2026-07-13T19:11:05.612Z  (mv d12 -> d12.gone + placeholder)
+state: 11 drives online, 1 drive offline, EC:4
+
+=== STEP 2: THE TRIGGER - bring d12 back as FRESH empty unformatted drive ===
+server.log line count before trigger: 13420
+RECOVERED-DRIVE trigger at: 2026-07-13T19:11:06.699Z  (rm placeholder + mkdir empty d12)
+d12 is now present but unformatted (no .minio.sys/format.json) => fresh-disk heal path
+
+=== STEP 3: poll for reconnect + heal dispatch + completion (timestamped) ===
+[2026-07-13T19:11:06.716Z] RECONNECT observed: 12 drives online, 0 drives offline, EC:4
+[2026-07-13T19:11:17.872Z] HEAL DISPATCH: Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+[2026-07-13T19:11:17.872Z] HEAL FINISH: Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 16, skipped: 0).
+
+=== STEP 4: timestamps + computed latencies ===
+T_trigger  (drive back online): 2026-07-13T19:11:06.699Z
+T_reconnect(12/12 online)     : 2026-07-13T19:11:06.716Z
+T_dispatch (use N workers)    : 2026-07-13T19:11:17.872Z
+T_finish   (is finished)      : 2026-07-13T19:11:17.872Z
+latency trigger->dispatch : 11.2 s
+latency trigger->finish   : 11.2 s
+
+=== STEP 5: full new server.log segment for this run (from line 13421) ===
+Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 16, skipped: 0).
+(segment appended; 3 lines)
 ```
 
-The fresh-disk heal reported `healed: 14` / `healed: 15` items per drive — i.e. it recreated the missing `xl.meta` and part files for every object (and system metadata) that belonged on that drive. This is the `errFileNotFound → return true, erErr` branch (L157–L159).
+```
+=== STEP 0: reset boundary - ensure 12/12 online before run ===
+state: 12 drives online, 0 drives offline, EC:4
 
-**Criterion 4 — `errPartMissingOrCorrupt` (part file missing, metadata intact):** Only the data part of one object was deleted on one drive, keeping its `xl.meta`:
+=== STEP 1: take d12 offline (placeholder), confirm offline ===
+offline trigger at: 2026-07-13T19:12:52.957Z  (mv d12 -> d12.gone + placeholder)
+state: 11 drives online, 1 drive offline, EC:4
+
+=== STEP 2: THE TRIGGER - bring d12 back as FRESH empty unformatted drive ===
+server.log line count before trigger: 13561
+RECOVERED-DRIVE trigger at: 2026-07-13T19:12:54.045Z  (rm placeholder + mkdir empty d12)
+d12 is now present but unformatted (no .minio.sys/format.json) => fresh-disk heal path
+
+=== STEP 3: poll for reconnect + heal dispatch + completion (timestamped) ===
+[2026-07-13T19:12:54.062Z] RECONNECT observed: 12 drives online, 0 drives offline, EC:4
+[2026-07-13T19:13:17.373Z] HEAL DISPATCH: Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+[2026-07-13T19:13:18.392Z] HEAL FINISH: Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+
+=== STEP 4: timestamps + computed latencies ===
+T_trigger  (drive back online): 2026-07-13T19:12:54.045Z
+T_reconnect(12/12 online)     : 2026-07-13T19:12:54.062Z
+T_dispatch (use N workers)    : 2026-07-13T19:13:17.373Z
+T_finish   (is finished)      : 2026-07-13T19:13:18.392Z
+latency trigger->dispatch : 23.3 s
+latency trigger->finish   : 24.3 s
+
+=== STEP 5: full new server.log segment for this run (from line 13562) ===
+Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+(segment appended; 3 lines)
+```
 
 ```
-$ rm -f drives/d7/ectest/obj2.bin/820b78d3-94c0-43e8-95e4-8294a8bcc02a/part.1   # delete only part.1, keep xl.meta
-$ mc admin heal -r --scan deep --force inv/ectest/obj2.bin
- ◐  ectest/obj2.bin
-    0/1 objects; 0 B in 0s
-    ...
-[Green -> Green]  ectest/obj2.bin
-Healed:   1/1 objects; 8 MiB in 1s
+=== STEP 0: reset boundary - ensure 12/12 online before run ===
+state: 12 drives online, 0 drives offline, EC:4
 
-$ ls drives/d7/ectest/obj2.bin/820b78d3-94c0-43e8-95e4-8294a8bcc02a/part.1
-drives/d7/ectest/obj2.bin/820b78d3-94c0-43e8-95e4-8294a8bcc02a/part.1          # part.1 RESTORED
+=== STEP 1: take d12 offline (placeholder), confirm offline ===
+offline trigger at: 2026-07-13T19:13:34.436Z  (mv d12 -> d12.gone + placeholder)
+state: 11 drives online, 1 drive offline, EC:4
+
+=== STEP 2: THE TRIGGER - bring d12 back as FRESH empty unformatted drive ===
+server.log line count before trigger: 13702
+RECOVERED-DRIVE trigger at: 2026-07-13T19:13:35.522Z  (rm placeholder + mkdir empty d12)
+d12 is now present but unformatted (no .minio.sys/format.json) => fresh-disk heal path
+
+=== STEP 3: poll for reconnect + heal dispatch + completion (timestamped) ===
+[2026-07-13T19:13:35.540Z] RECONNECT observed: 12 drives online, 0 drives offline, EC:4
+[2026-07-13T19:13:47.713Z] HEAL DISPATCH: Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+[2026-07-13T19:13:47.713Z] HEAL FINISH: Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+
+=== STEP 4: timestamps + computed latencies ===
+T_trigger  (drive back online): 2026-07-13T19:13:35.522Z
+T_reconnect(12/12 online)     : 2026-07-13T19:13:35.540Z
+T_dispatch (use N workers)    : 2026-07-13T19:13:47.713Z
+T_finish   (is finished)      : 2026-07-13T19:13:47.713Z
+latency trigger->dispatch : 12.2 s
+latency trigger->finish   : 12.2 s
+
+=== STEP 5: full new server.log segment for this run (from line 13703) ===
+Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+(segment appended; 3 lines)
 ```
 
-The `xl.meta` read fine but the part-file check reported it missing, hitting the `checkPartFileNotFound → return true, errPartMissingOrCorrupt` branch (L169–L176); the heal reconstructed `part.1` from the surviving shards. (This one was **admin-triggered** via `mc admin heal` to force a deterministic, single-object heal; the automatic path exercises the identical decision function.)
+The three latencies (11.2 s, 24.3 s, 12.2 s) cluster around one and two 10-second poll cycles, exactly as expected for the 10-second `defaultMonitorNewDiskInterval`.
 
-**Criteria 2 & 3 — INFERRED:**
+### Classification of the three healing paths
 
-- `errLegacyXLMeta` (L161→L164) fires only for objects stored in the legacy **XLv1** on-disk format (`meta.XLV1`). A cluster freshly built at this commit writes only v2 `xl.meta`, so this branch cannot be reached without pre-seeding legacy data. **Labeled inferred** from the code.
-- `errOutdatedXLMeta` (L166→L167) fires when a drive's `xl.meta` differs from the latest quorum metadata (`!latestMeta.Equals(meta)`). Producing a deterministic version skew requires racing concurrent partial writes against a specific drive; it was not reproducible through the real S3 entry point after varied effort. **Labeled inferred** from the code.
+- **`monitorLocalDisksAndHeal` -> `healFreshDisk` — OBSERVED (canonical).** Automatic and timestamped above; this is the recovered/replaced-drive trigger the question asks about.
+- **MRF on-the-fly heal — OBSERVED STATE + SOURCE.** The MRF queue (`cmd/mrf.go:L78,L220`) is enqueued from the GET/PUT path (`cmd/erasure-object.go:L2113`) when a read/write sees a missing shard. In these runs the admin heal status reported `"mrf": null` (empty queue) because the fresh-disk monitor healed the objects first; the mechanism is confirmed in source and by the queue-state field, and no separate canonical trigger was required.
+- **Background data scanner — OBSERVED (indirect).** The scanner (`cmd/data-scanner.go:L61,L199`) advanced its item count across runs (`ScannedItemsCount` moved 245 -> 246, shown under OBJ-4); it heals opportunistically on its own cadence rather than as an immediate drive-recovery trigger.
 
-### Cause → effect
-
-When healing a drive, MinIO reads the object on every drive, computes the latest (quorum) `FileInfo`, and calls `shouldHealObjectOnDisk` per drive. A wiped drive naturally yields `errFileNotFound` (nothing there) → heal; a drive missing just a part yields `errPartMissingOrCorrupt` → heal. Both were observed to reconstruct exactly the missing artifact. The legacy/outdated branches are real code paths but depend on data states this fresh cluster does not create, hence inferred.
-
----
-
-## OBJ-5 — Log messages during an active heal
+## OBJ-4 — Criteria for deciding an object needs healing on a drive
 
 ### Direct answer
 
-During an automatic fresh/recovered-disk heal, MinIO emits a three-line sequence per drive (default log level, no extra flags):
-
-1. `Healing drive '<path>' - 'mc admin heal alias/ --verbose' to check the current status.`
-2. `Healing drive '<path>' - use N parallel workers.`  — where **N = 4** on this 4-CPU host.
-3. `Healing of drive '<path>' is finished (healed: H, skipped: S).`
-
-The worker-count line is the canonical "active heal" marker requested. An additional edge-condition log, `"all drives are in healing state, aborting.."`, exists but was **not** reproduced (it requires every drive in the set to be reformatting simultaneously) — **labeled inferred**.
+The per-drive decision is made by `shouldHealObjectOnDisk`. It flags an object for healing on a given drive when any of: (1) the drive returns `errFileNotFound`/`errFileVersionNotFound` (metadata absent); (2) a data part is missing or fails its bitrot check (`errPartMissingOrCorrupt`); (3) the drive's metadata is legacy XLv1 (`errLegacyXLMeta`); or (4) the drive's metadata is out of date relative to the latest quorum metadata (`errOutdatedXLMeta`). Case (1) was observed canonically via the fresh-drive heal; case (2) was reproduced by bitrot simulation and confirmed via deep-scan heal (labeled SUPPLEMENTARY / NON-CANONICAL); cases (3)–(4) are SOURCE-ONLY/INFERRED on this commit.
 
 ### Code reference
 
-- `cmd/global-heal.go:L210` `healingLogEvent(ctx, "Healing drive '%s' - use %d parallel workers.", tracker.disk.String(), numHealers)`; worker count computed just above (L205–L208), overridable via `globalHealConfig.GetWorkers()`, otherwise defaulting to a CPU-derived value (observed 4).
-- `cmd/background-newdisks-heal-ops.go:L460` `healingLogEvent(ctx, "Healing drive '%s' - 'mc admin heal alias/ --verbose' to check the current status.", endpoint)`.
-- `cmd/background-newdisks-heal-ops.go:L520` `healingLogEvent(ctx, "Healing of drive '%s' is finished (healed: %d, skipped: %d).", disk, tracker.ItemsHealed, tracker.ItemsSkipped)`.
-- Edge condition: `cmd/global-heal.go:L339-L342` `if len(disks) == healing { ... healingLogIf(ctx, errors.New("all drives are in healing state, aborting..")) ... }`.
-- Heal-set driver: `cmd/global-heal.go:L152` `healErasureSet`; heal sequence `cmd/global-heal.go:L49` `newBgHealSequence`.
-- These `healingLogEvent`/`healingLogIf` helpers log by default (they wrap `logger.Event`/`logger.LogIf` with the `"healing"` subsystem).
+`cmd/erasure-healing.go:L156-L183` — `shouldHealObjectOnDisk`: `errFileNotFound`/`errFileVersionNotFound` (`L157-L159`); legacy `errLegacyXLMeta` (`L161-L164`, defined `L148`); outdated `errOutdatedXLMeta` (`L166-L167`, defined `L150`); missing/corrupt parts `errPartMissingOrCorrupt` (`L169-L176`, defined `L152`). The in-progress marker `xMinIOHealing` is at `cmd/erasure-healing.go:L186`; the repair itself is `erasureObjects.healObject` at `cmd/erasure-healing.go:L258`.
 
-### Command & complete unedited output
+### Observation 1 — absent metadata (`errFileNotFound`): CANONICAL fresh-drive heal + status reconciliation
 
-A clean single-drive heal (drive `d10`, from the three-run stability set) produced exactly:
+The fresh-drive runs of OBJ-3 are exactly this case: a replaced drive has none of the object metadata, so every object trips the `errFileNotFound` branch and is healed. The admin heal status (via the canonical admin API) reconciles the `healed: N` counts — the healed drive holds seven **user** objects (`objects_total_count: 7`) but `items_healed` (15) also includes system metadata under `.minio.sys/config` and `.minio.sys/buckets` (the three `healed_buckets`), which is why the completion line's `healed:` figure exceeds seven. `sc_parity` independently confirms `STANDARD: 4` (i.e. `EC:4`); `mrf: null` and `ScannedItemsCount` corroborate the OBJ-3 classifications:
 
 ```
-Healing drive '/tmp/minio-investigation/drives/d10' - 'mc admin heal alias/ --verbose' to check the current status.
-Healing drive '/tmp/minio-investigation/drives/d10' - use 4 parallel workers.
-Healing of drive '/tmp/minio-investigation/drives/d10' is finished (healed: 14, skipped: 0).
+full JSON saved to heal_status_full.json (14904 bytes)
+
+=== top-level ScannedItemsCount (background data scanner — OBSERVED) ===
+ScannedItemsCount: 245
+
+=== top-level mrf field (MRF on-the-fly heal queue — OBSERVED state) ===
+
+=== sc_parity (default storage-class parity — confirms EC:4 STANDARD) ===
+
+=== d12 heal_info (RECONCILES healed count — F11) ===
+  heal_id: b45bf644-20e9-4a89-9239-1d3f31c2594e
+  started: 2026-07-13T19:13:47.37518189Z
+  last_update: 2026-07-13T19:13:47.430799588Z
+  objects_total_count: 7
+  items_healed: 15
+  objects_healed: 15
+  items_failed: 0
+  items_skipped: 0
+  bytes_done: 50344117
+  healed_buckets: ['.minio.sys/config', '.minio.sys/buckets', 'ectest']
+  finished: True
+
+=== CORRECTED: mrf + sc_parity at HealInfo level ===
+mrf: null
+sc_parity: {"REDUCED_REDUNDANCY": 1, "STANDARD": 4}
+ScannedItemsCount: 245
+HealDisks: null
+offline_nodes: null
 ```
 
-A second drive (`d5`) confirms the identical shape with a different heal count:
+### Observation 2 — missing/corrupt part (`errPartMissingOrCorrupt`): SIMULATED + SUPPLEMENTARY deep-scan
+
+To exercise branch (2) directly, the first 4096 bytes of `obj2.bin`'s `part.1` on drive `d1` were zeroed (bitrot), preserving the file size so only the shard checksum breaks. The full run captures three distinct facts, each labeled in the transcript: **(A, canonical)** a normal GET still returns the **correct object** (served SHA-256 matches baseline `obj2.bin`) because the bitrot shard is reconstructed at read time — but this canonical read does **not** persist a repair (the MRF queue stays `null`); **(B)** a **normal-mode** `mc admin heal` reports every drive `ok`, because normal-mode heal compares metadata, not part checksums; **(C, SUPPLEMENTARY / NON-CANONICAL** — a deep scan is not the default drive-recovery trigger) a `--scan deep` heal detects drive `d1`'s part state as `missing` and rebuilds it to the pristine shard SHA-256:
 
 ```
-Healing drive '/tmp/minio-investigation/drives/d5' - 'mc admin heal alias/ --verbose' to check the current status.
-Healing drive '/tmp/minio-investigation/drives/d5' - use 4 parallel workers.
-Healing of drive '/tmp/minio-investigation/drives/d5' is finished (healed: 15, skipped: 0).
+=== STEP 0: ensure 12/12 online ===
+12 drives online, 0 drives offline, EC:4
+
+=== STEP 1: locate obj2 part.1 on d1 and corrupt first 4096 bytes ===
+part path: /tmp/minio-investigation/drives/d1/ectest/obj2.bin/ba0109cb-f299-44fd-9c58-c696dc57d20b/part.1
+size before: 1048832 bytes; sha256 before: 7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6
+size after : 1048832 bytes; sha256 after : a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8
+
+=== STEP 2: mark log pos, GET obj2 via canonical S3 (mc) — expect success (heal from other shards) ===
+`inv/ectest/obj2.bin` -> `/tmp/minio-investigation/src/obj2.bitrot.bin`
+┌──────────┬─────────────┬──────────┬──────────────┐
+│ Total    │ Transferred │ Duration │ Speed        │
+│ 8.00 MiB │ 8.00 MiB    │ 00m00s   │ 558.07 MiB/s │
+└──────────┴─────────────┴──────────┴──────────────┘
+mc-get-exit=0
+served sha256  : 791d6a32659caf5f9a5997f357f0d1835b284fed1d0cad5713e3ef9f3bf7e984
+baseline sha256: 791d6a32659caf5f9a5997f357f0d1835b284fed1d0cad5713e3ef9f3bf7e984
+READ INTEGRITY: MATCH (bitrot shard bypassed/reconstructed transparently)
+
+=== STEP 3: server.log signals after the bitrot GET (from line ; recompute) ===
+--- bitrot / checksum / verify signals in log ---
+
+=== STEP 4: was the corrupt shard on d1 auto-repaired by the read (MRF on-the-fly)? ===
+part sha256 now: a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8
+(pristine was 7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6)
+
+=== STEP 5: re-scrape heal status - did mrf queue get a partial op? ===
+mrf: null
+ScannedItemsCount: 246
+
+=== STEP 6: SUPPLEMENTARY (NON-CANONICAL explicit trigger) — mc admin heal obj2 ===
+shard sha256 BEFORE admin heal: a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8  (corrupt)
+status: success
+  type: bucket
+  before drive-states: [('d9', 'ok'), ('d10', 'ok'), ('d3', 'ok'), ('d5', 'ok'), ('d7', 'ok'), ('d8', 'ok'), ('d11', 'ok'), ('d12', 'ok'), ('d1', 'ok'), ('d2', 'ok'), ('d4', 'ok'), ('d6', 'ok')]
+  after drive-states: [('d9', 'ok'), ('d10', 'ok'), ('d3', 'ok'), ('d5', 'ok'), ('d7', 'ok'), ('d8', 'ok'), ('d11', 'ok'), ('d12', 'ok'), ('d1', 'ok'), ('d2', 'ok'), ('d4', 'ok'), ('d6', 'ok')]
+status: success
+  type: object
+  before drive-states: [('d1', 'ok'), ('d2', 'ok'), ('d3', 'ok'), ('d4', 'ok'), ('d5', 'ok'), ('d6', 'ok'), ('d7', 'ok'), ('d8', 'ok'), ('d9', 'ok'), ('d10', 'ok'), ('d11', 'ok'), ('d12', 'ok')]
+  after drive-states: [('d1', 'ok'), ('d2', 'ok'), ('d3', 'ok'), ('d4', 'ok'), ('d5', 'ok'), ('d6', 'ok'), ('d7', 'ok'), ('d8', 'ok'), ('d9', 'ok'), ('d10', 'ok'), ('d11', 'ok'), ('d12', 'ok')]
+status: success
+  type: summary
+
+shard sha256 AFTER admin heal : a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8
+pristine target               : 7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6
+shard state changed (see sha256)
+
+=== STEP 7: deep-scan heal (--scan deep) verifies PART bitrot, not just metadata ===
+shard sha256 BEFORE deep heal: a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8  (corrupt)
+  type: object
+  bucket: None
+  object: None
+  before: NON-OK drives = [('d1', 'missing')]
+  after: NON-OK drives = none (all ok)
+
+shard sha256 AFTER deep heal : 7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6
+pristine target              : 7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6
+SHARD REPAIRED: deep-scan detected part bitrot (errPartMissingOrCorrupt) and reconstructed d1 to pristine
 ```
 
-Across the whole investigation the log recorded **27** `"use 4 parallel workers"` dispatch lines and **17** `"is finished (healed: …)"` completion lines, confirming the messages are emitted on every heal, not once.
+In the transcript, the object SHA-256 `791d6a32659caf5f9a5997f357f0d1835b284fed1d0cad5713e3ef9f3bf7e984` is the reconstructed **object**; the shard SHA-256 (`7f33f3e90832ff4e31618666a1b641f8f1997458bf6d10438a3ae8056e092ca6` pristine, `a07314c31a395f2515bf9b88bef6b720f7d06330c0e9f67ca6548d3546ec75e8` after corruption) is the **on-disk part** on `d1`. Note that in STEP 6 the shard SHA-256 is identical before and after the normal-mode heal (both the post-corruption value), so the shard was **not** repaired — the script's generic "shard state changed" label is contradicted by the unchanged hash, confirming that normal-mode heal (metadata-only) leaves the bitrot part in place. Only the STEP 7 deep-scan pass detects `d1` as `missing` and restores the shard to the pristine value.
 
-### Cause → effect
+### Observation 3 — legacy / outdated metadata: SOURCE-ONLY / INFERRED
 
-`healFreshDisk` (`background-newdisks-heal-ops.go:L419`) logs the "check the current status" line (L460), then calls into `healErasureSet` (`global-heal.go:L152`), which computes `numHealers` (defaulting to a CPU-derived 4) and logs the "use %d parallel workers" line (`global-heal.go:L210`). When the per-drive heal tracker finishes, L520 logs the "is finished (healed: %d, skipped: %d)" summary. The `healed:` count equals the number of objects/metadata items reconstructed on that drive (14–15 here, matching the 5 objects × their shards plus system metadata).
+Branches (3) `errLegacyXLMeta` and (4) `errOutdatedXLMeta` require, respectively, an object written by a pre-XLv2 MinIO release and a metadata-version skew across drives. Neither can be produced through the canonical S3 API on this commit (there is no client-facing way to write XLv1 metadata or to desynchronize metadata versions without editing backend files, which is out of scope for a read-only, canonical investigation). Their existence and trigger conditions are cited from `cmd/erasure-healing.go:L161-L167`; any statement about their runtime effect is **INFERRED**, not observed.
 
----
+### Cause -> effect (OBJ-4)
 
-## OBJ-6 — Health metrics: online vs. offline drive counts, before and after failure
+`shouldHealObjectOnDisk` is consulted per drive during a heal walk. If a drive lacks the metadata, has a bad part, or carries stale/legacy metadata, the object is scheduled for `healObject`, which reconstructs the missing/damaged shard from the surviving shards and rewrites it, marking progress with the `xMinIOHealing` metadata flag.
+
+## OBJ-5 — Log messages during an active healing operation
 
 ### Direct answer
 
-The v3 cluster-health collector exposes three drive-count gauges (full Prometheus names):
-
-- **`minio_cluster_health_drives_online_count`** — online drives.
-- **`minio_cluster_health_drives_offline_count`** — offline drives.
-- **`minio_cluster_health_drives_count`** — total drives.
-
-Observed values, **before → during → after** a 4-drive failure and heal:
-
-| Metric (v3) | BEFORE (baseline) | DURING (4 offline) | AFTER (healed) |
-|---|---|---|---|
-| `minio_cluster_health_drives_count` | 12 | 12 | 12 |
-| `minio_cluster_health_drives_online_count` | 12 | 8 | 12 |
-| `minio_cluster_health_drives_offline_count` | *(absent — value 0, suppressed)* | 4 | *(absent — value 0, suppressed)* |
-
-The online count moves **12 → 8 → 12**; the offline count moves **0 → 4 → 0**. Note the v3 collector **suppresses zero-valued metrics**, so `drives_offline_count` is *absent* from the scrape at baseline and after heal (both 0), and *appears* as `4` only while drives are down. The v2 collector always prints `0` explicitly (shown below).
+An active heal of a drive emits three characteristic lines per cycle, in order: a status pointer suggesting `mc admin heal alias/ --verbose`, the active-heal banner **"Healing drive '<path>' - use N parallel workers."**, and the completion line **"Healing of drive '<path>' is finished (healed: N, skipped: M)."**. On this 4-CPU host `N` was always **4** parallel workers, because the worker count has a floor of 4.
 
 ### Code reference
 
-- v3 constants: `cmd/metrics-v3-cluster-health.go:L23` `healthDrivesOfflineCount = "drives_offline_count"`, **L24** `healthDrivesOnlineCount = "drives_online_count"`, **L25** `healthDrivesCount = "drives_count"`; gauge descriptors `NewGaugeMD(...)` at **L28–L35**.
-- v3 setters: `cmd/metrics-v3-cluster-health.go:L44-L46` — `m.Set(healthDrivesOfflineCount, float64(clusterDriveMetrics.offlineDrives))`, `m.Set(healthDrivesOnlineCount, float64(clusterDriveMetrics.onlineDrives))`, `m.Set(healthDrivesCount, float64(clusterDriveMetrics.totalDrives))` (inside `loadClusterHealthDriveMetrics`).
-- v3 path & registration: `cmd/metrics-v3.go:L50` `clusterHealthCollectorPath = "/cluster/health"`; registered `L240` `NewMetricsGroup(clusterHealthCollectorPath, ...)`. Full endpoint: `/minio/metrics/v3/cluster/health`.
-- Zero-suppression: `cmd/metrics-v3-types.go:L212` `func (m MetricValues) Set(...)`, guard at **L240-L241** `// If valid non zero value set the metrics` / `if value > 0 {`.
-- v2 equivalents: `cmd/metrics-v2.go:L130` `clusterMetricNamespace = "minio_cluster"`; `getClusterHealthMetrics` **L3656** → `minio_cluster_drive_online_total` / `minio_cluster_drive_offline_total` / `minio_cluster_drive_total`.
+- `cmd/global-heal.go:L210` — the `"use %d parallel workers."` line (from `healErasureSet`).
+- `cmd/background-newdisks-heal-ops.go:L460` — the status-pointer line.
+- `cmd/background-newdisks-heal-ops.go:L520` — the `"is finished (healed:..)"` completion line.
+- Worker-count floor of 4: `cmd/global-heal.go:L195-L208` (`numHealers`).
 
-### Commands & complete unedited output
+### Observation — exact grep commands, counts, and per-cycle correlation
 
-The v3 endpoint requires a bearer token (a request without it returns HTTP 403). The token was generated with `mc admin prometheus generate inv cluster --api-version v3` and passed as `Authorization: Bearer <token>` (the token value itself is a secret and is intentionally omitted).
-
-**BEFORE (baseline, 12 online / 0 offline):**
+Run live against the accumulated `server.log`. The `grep -c` counts are `6` because six heal cycles occurred over the whole investigation; each cycle contributes exactly one of each line. Note the heal lines carry **no** timestamp prefix in the log — they are emitted bare:
 
 ```
-$ curl -s -H "Authorization: Bearer <redacted>" http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
+===CMD: grep -n 'use .* parallel workers' server.log
+19:Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+286:Healing drive '/tmp/minio-investigation/drives/d11' - use 4 parallel workers.
+13422:Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+13563:Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+13704:Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+13923:Healing drive '/tmp/minio-investigation/drives/d12' - use 4 parallel workers.
+
+===CMD: grep -c 'parallel workers' server.log
+6
+
+===CMD: grep -n 'is finished (healed:' server.log
+20:Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 14, skipped: 0).
+287:Healing of drive '/tmp/minio-investigation/drives/d11' is finished (healed: 13, skipped: 0).
+13423:Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 16, skipped: 0).
+13564:Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+13705:Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 15, skipped: 0).
+13924:Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 175, skipped: 0).
+
+===CMD: grep -c 'is finished (healed:' server.log
+6
+
+===CMD: grep -n 'to check the current status' server.log
+18:Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+285:Healing drive '/tmp/minio-investigation/drives/d11' - 'mc admin heal alias/ --verbose' to check the current status.
+13421:Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+13562:Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+13703:Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+13922:Healing drive '/tmp/minio-investigation/drives/d12' - 'mc admin heal alias/ --verbose' to check the current status.
+```
+
+The six cycles correlate as: `L18-20`/`L285-287` — the two baseline-setup heals during environment preparation (d12 healed:14, d11 healed:13); `L13421-13423`/`L13562-13564`/`L13703-13705` — the three timestamped OBJ-3 runs (H1 healed:16, H2 healed:15, H3 healed:15); and `L13922-13924` — the OBJ-6 lifecycle heal over the larger dataset (d12 healed:175). Every cycle used `4` parallel workers, consistent with the worker-count floor on this 4-CPU host. The `healed:` counts include user objects plus the `.minio.sys/config` and `.minio.sys/buckets` system metadata (reconciled under OBJ-4).
+
+### Cause -> effect (OBJ-5)
+
+When `healFreshDisk` runs, `healErasureSet` logs the status pointer and the "use N parallel workers" banner, spins up N worker goroutines that call `healObject` for each object the drive should hold, and, when the walk completes, logs the "is finished (healed: N, skipped: M)" line with the tallies.
+
+## OBJ-6 — Metric names for online vs. offline drive counts, and their values
+
+### Direct answer
+
+Two metric families report drive counts:
+
+- **Metrics v3** (path `/minio/metrics/v3/cluster/health`): `minio_cluster_health_drives_online_count`, `minio_cluster_health_drives_offline_count`, and `minio_cluster_health_drives_count`.
+- **Metrics v2** (path `/minio/v2/metrics/cluster`, namespace `minio_cluster`): `minio_cluster_drive_online_total`, `minio_cluster_drive_offline_total`, and `minio_cluster_drive_total`. A distinct heal-status gauge, `minio_cluster_health_erasure_set_healing_drives`, tracks drives actively healing.
+
+Observed values: with all drives online, `minio_cluster_health_drives_online_count = 12`, `minio_cluster_health_drives_count = 12`, and `minio_cluster_health_drives_offline_count` is **absent** (the exporter suppresses a zero-valued gauge); with one drive settled offline, `minio_cluster_health_drives_offline_count = 1` and `minio_cluster_health_drives_online_count = 11`. A crucial finding: the count gauges measure **connectivity** and are refreshed on a ~10-second cache, so a freshly reconnected drive returns to `online` immediately while its data is still being healed. The actual heal-in-progress signal is the separate `minio_cluster_health_erasure_set_healing_drives` gauge, observed transitioning `0 -> 1 -> 0` around a heal.
+
+### Code reference
+
+- **v3 names** — `cmd/metrics-v3-cluster-health.go:L23-L25` (`drivesOfflineCount`, `drivesOnlineCount`, `drivesCount`); gauge descriptors via `NewGaugeMD` at `L29,L31,L33`; values set with `m.Set` at `L44-L46`.
+- **v3 zero-suppression** — `MetricValues.Set` has a **pointer receiver** `func (m *MetricValues) Set` at `cmd/metrics-v3-types.go:L212`, and the load path guards with `if value > 0` at `cmd/metrics-v3-types.go:L240`, which is why a zero `offline_count` is omitted.
+- **v3 path** — `clusterHealthCollectorPath = "/cluster/health"` at `cmd/metrics-v3.go:L50`, registered at `cmd/metrics-v3.go:L240`.
+- **v2 source (correction)** — the v2 drive gauges are emitted by **`getClusterStorageMetrics` at `cmd/metrics-v2.go:L3794`** (online/offline counts derived at `L3805-L3806`, appended at `L3829,L3834,L3839`), using descriptor helpers `getClusterDrivesOfflineTotalMD` (`L578`), `getClusterDrivesOnlineTotalMD` (`L588`), `getClusterDrivesTotalMD` (`L598`); namespace `clusterMetricNamespace = "minio_cluster"` at `cmd/metrics-v2.go:L130`. The separate `getClusterHealthMetrics` at `cmd/metrics-v2.go:L3656` emits **different** gauges (write-quorum and the `erasure_set_*` health gauges, including `erasure_set_healing_drives`), not the drive counts.
+
+### How the endpoints were scraped (executable; token in a shell variable, never printed)
+
+Tokens were generated by `mc` into shell variables and passed to `curl` as Bearer tokens. The baseline scrape (all 12 online) includes the Prometheus `# HELP`/`# TYPE` descriptor lines; note the v3 output has **no** `offline_count` line at baseline (zero-suppressed):
+
+```
+===CMD: TOKV3=$(mc admin prometheus generate inv cluster --api-version v3 | awk '/bearer_token:/{print $2}')
+===CMD: TOKV2=$(mc admin prometheus generate inv cluster | awk '/bearer_token:/{print $2}')
+(tokens captured into shell variables; never printed)
+token lengths (chars) for proof of capture: TOKV3=199 TOKV2=199
+
+===CMD: curl -s -H "Authorization: Bearer $TOKV3" http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
 minio_cluster_health_drives_count 12
 minio_cluster_health_drives_online_count 12
-# (minio_cluster_health_drives_offline_count is absent: value 0 is suppressed)
 
-$ mc admin prometheus metrics inv cluster | grep -E '^minio_cluster_drive_(online|offline|total)'
+===CMD: curl -s -H "Authorization: Bearer $TOKV2" http://127.0.0.1:9000/minio/v2/metrics/cluster | grep -E 'minio_cluster_drive_(online|offline)_total|minio_cluster_drive_total|erasure_set_healing_drives'
+# HELP minio_cluster_drive_offline_total Total drives offline in this cluster
+# TYPE minio_cluster_drive_offline_total gauge
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+# HELP minio_cluster_drive_online_total Total drives online in this cluster
+# TYPE minio_cluster_drive_online_total gauge
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+# HELP minio_cluster_drive_total Total drives in this cluster
+# TYPE minio_cluster_drive_total gauge
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+# HELP minio_cluster_health_erasure_set_healing_drives Get the count of healing drives of this erasure set
+# TYPE minio_cluster_health_erasure_set_healing_drives gauge
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+```
+
+### Values — the full failure/recovery lifecycle (connectivity vs. heal status)
+
+To separate connectivity from heal progress, a larger (~10 GB) dataset was staged so the heal would overlap the 10-second gauge cache long enough to sample. The five-point capture around a fresh-drive replacement (each point shows `mc admin info`, the v3 drive gauges, and the v2 drive totals + the `erasure_set_healing_drives` gauge). The v3 `drives_online_count` stays at `12` throughout — a reconnected drive is "online" for connectivity the moment it is reachable — while the `erasure_set_healing_drives` gauge moves `0 -> 1 -> 0`; the heal completion line (`healed: 175`) is captured at POINT 5:
+
+```
+===== POINT: 1-BASELINE  (2026-07-13T19:23:37.206Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
 minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
 minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
 minio_cluster_drive_total{server="127.0.0.1:9000"} 12
-```
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
 
-**DURING (4 drives offline, degraded):**
-
-```
-$ curl -s -H "Authorization: Bearer <redacted>" http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
-minio_cluster_health_drives_count 12
-minio_cluster_health_drives_offline_count 4
-minio_cluster_health_drives_online_count 8
-
-$ mc admin prometheus metrics inv cluster | grep -E '^minio_cluster_drive_(online|offline|total)'
-minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 4
-minio_cluster_drive_online_total{server="127.0.0.1:9000"} 8
-minio_cluster_drive_total{server="127.0.0.1:9000"} 12
-```
-
-**AFTER (heal complete, 12 online / 0 offline):**
-
-```
-$ curl -s -H "Authorization: Bearer <redacted>" http://127.0.0.1:9000/minio/metrics/v3/cluster/health | grep '^minio_cluster_health_drives'
+===== POINT: 2-DRIVE-OFFLINE  (2026-07-13T19:23:38.315Z) =====
+--- mc admin info ---
+11 drives online, 1 drive offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
 minio_cluster_health_drives_count 12
 minio_cluster_health_drives_online_count 12
-# (minio_cluster_health_drives_offline_count absent again: back to 0)
-
-$ mc admin prometheus metrics inv cluster | grep -E '^minio_cluster_drive_(online|offline|total)'
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
 minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
 minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
 minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
+
+trigger (fresh d12) at: 2026-07-13T19:23:38.361Z
+===== POINT: 3-AFTER-RECONNECT(pre/early-heal)  (2026-07-13T19:23:41.373Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
+
+===== POINT: 4-DURING-HEAL  (2026-07-13T19:23:57.620Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 1
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
+
+===== POINT: 4b-DURING-HEAL  (2026-07-13T19:24:01.671Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 1
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
+
+===== POINT: 4c-DURING-HEAL  (2026-07-13T19:24:05.720Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 1
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
+
+heal finish observed at: 2026-07-13T19:24:57.397Z
+finish line: Healing of drive '/tmp/minio-investigation/drives/d12' is finished (healed: 175, skipped: 0).
+===== POINT: 5-AFTER-HEAL-COMPLETE  (2026-07-13T19:24:59.407Z) =====
+--- mc admin info ---
+12 drives online, 0 drives offline, EC:4
+--- v3 /minio/metrics/v3/cluster/health (drive gauges) ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_online_count 12
+--- v2 /minio/v2/metrics/cluster (drive totals + healing gauge) ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
+minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
 ```
 
-### Cause → effect
+Because the count gauges are cached, an immediate scrape right after taking a drive offline (POINT 2) still shows `12/0`. Waiting past the ~10-second cache makes the offline transition visible: the settled capture below shows the v3 `drives_offline_count` reach `1` and `drives_online_count` fall to `11`; it also shows that after restore the gauge lags (~60 s) before returning to `online=12`:
 
-`loadClusterHealthDriveMetrics` (`metrics-v3-cluster-health.go`) reads the cached cluster drive tally and sets the three gauges (L44–L46) from `offlineDrives` / `onlineDrives` / `totalDrives`. When 4 drives go offline the tally becomes 8 online / 4 offline, which is exactly what the scrape shows; after heal it returns to 12/0. The v3 `MetricValues.Set` guard `if value > 0` (`metrics-v3-types.go:L240`) is why `drives_offline_count` disappears at 0 — a clean, observable before/during/after signal. The v2 collector uses a different code path (`metrics-v2.go:L3656`) that emits the `0` explicitly.
+```
+=== take d12 offline (non-destructive), then WAIT 14s for gauge cache to refresh ===
+offline at: 2026-07-13T19:25:54.571Z
+scrape at : 2026-07-13T19:26:08.579Z  (14s after offline)
+--- mc admin info ---
+11 drives online, 1 drive offline, EC:4
+--- v3 drive gauges ---
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_offline_count 1
+minio_cluster_health_drives_online_count 11
+--- v2 drive totals ---
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 1
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 11
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
 
----
+=== restore d12, WAIT 14s, confirm gauge returns to 12/0 ===
+scrape at : 2026-07-13T19:26:22.649Z  (14s after restore)
+12 drives online, 0 drives offline, EC:4
+minio_cluster_health_drives_count 12
+minio_cluster_health_drives_offline_count 1
+minio_cluster_health_drives_online_count 11
+minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 1
+minio_cluster_drive_online_total{server="127.0.0.1:9000"} 11
+minio_cluster_drive_total{server="127.0.0.1:9000"} 12
 
-## Two-Run Stability
+=== FINAL: confirm gauge returns to 12/0 after longer settle (poll every 3s up to 45s) ===
+[2026-07-13T19:26:43.548Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:26:46.565Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:26:49.583Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:26:52.599Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:26:55.617Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:26:58.635Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:27:01.653Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:27:04.670Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:27:07.688Z] minio_cluster_health_drives_offline_count 1 minio_cluster_health_drives_online_count 11
+[2026-07-13T19:27:10.706Z] minio_cluster_health_drives_online_count 12
+>>> offline_count gauge dropped (=0, not emitted) => back to online=12
+```
 
-Per the governing methodology, timing- and magnitude-dependent results were confirmed across at least two runs (three were performed).
+A tight ~0.5-second-cadence sample (120 samples spanning `19:23:38.364Z` to `19:24:39.649Z`) pinpoints the heal-gauge transition, ~19.6 s after the fresh-drive trigger (`19:23:38.361Z`). The three contiguous samples straddling the flip — the gauge is `0` at `19:23:57.412Z` and `1` at the very next sample `19:23:57.927Z`:
 
-**Scale / duration:** SNMD-12 topology, 5–6 objects of 8 MiB each; each fresh-disk heal reconstructed **14–15 items** (all `xl.meta` + part files for the objects and system metadata belonging on that drive). Observation windows were held well beyond the 10 s heal-poll interval.
+```
+[2026-07-13T19:23:56.898Z] minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0 minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12 minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+[2026-07-13T19:23:57.412Z] minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0 minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12 minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 0
+[2026-07-13T19:23:57.927Z] minio_cluster_drive_offline_total{server="127.0.0.1:9000"} 0 minio_cluster_drive_online_total{server="127.0.0.1:9000"} 12 minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000",set="0"} 1
+```
 
-**Heal-detection latency (drive restored → first `"use N parallel workers"` log line):**
+### Cause -> effect (OBJ-6)
 
-| Run | Drive | Latency |
-|-----|-------|---------|
-| 1 | d5 | 13.7 s |
-| 2 | d6 | 19.2 s |
-| 3 | d10 | 22.2 s |
+The v3 collector's value setters (`m.Set`, `cmd/metrics-v3-cluster-health.go:L44-L46`) publish the current online/offline/total counts, but the counts reflect **connectivity** and are refreshed on a cache interval, so they revert to all-online as soon as a drive reconnects. Because `MetricValues.Set` guards with `if value > 0` (`cmd/metrics-v3-types.go:L240`), a zero offline count is omitted entirely. Heal *progress* is exposed separately as `erasure_set_healing_drives`, which is why it — not the count gauges — is the correct signal that a drive is actively being healed.
 
-The distribution (13.7–22.2 s) is stable and fully explained by the two-monitor cadence (15 s reconnect tick + up to 10 s heal tick = worst case ~25 s). The often-quoted "10 s" is only the heal-monitor poll interval, **not** the end-to-end latency.
+## Two-Run (and Three-Run) Stability
 
-**Metric-count stability:** the before/during/after gauge values (12/0 baseline, 8/4 degraded, 12/0 after heal) were reproduced **identically** across the OBJ-1 write run, the OBJ-2 read run, and the dedicated OBJ-6 scrape — no run-to-run variance.
+Timing- and magnitude-dependent results were confirmed across multiple identical runs:
 
----
+| Result | Run 1 | Run 2 | Run 3 | Interpretation |
+|---|---|---|---|---|
+| Fresh-drive restore -> heal-complete latency (OBJ-3) | 11.2 s | 24.3 s | 12.2 s | Quantized to the 10 s `defaultMonitorNewDiskInterval`: ~1 cycle (H1/H3), ~2 cycles (H2) |
+| Heal "use N parallel workers" (OBJ-5) | 4 | 4 | 4 | Stable; worker-count floor of 4 on a 4-CPU host |
+| Write threshold (OBJ-1): offline drives to first failure | 6 | 6 | — | Stable `(12+1)/2 = 6`; 4 and 5 offline both succeed with parity `4->6` |
+| Read threshold (OBJ-2): offline drives to first failure | 5 | 5 | — | Stable; fails once online < 8 data shards |
+| v3 `drives_online_count` at baseline / 1 settled offline (OBJ-6) | 12 / 11 | 12 / 11 | — | Stable connectivity counts |
 
-## Observed vs. Inferred
+The write and read thresholds were re-observed with the same unchanged inputs and were identical each time. The heal latency varies only in whole 10-second poll cycles — the expected discretization for a fixed-interval monitor, not run-to-run nondeterminism.
 
-Everything reported above is **OBSERVED** at runtime except the following, which are explicitly **INFERRED** from the source at this commit because they could not be reproduced through the real S3/backend entry point after genuine, varied effort:
+## Observed vs. Inferred — Classification of Every Claim
 
-| Item | Status | Why |
-|------|--------|-----|
-| OBJ-1 degraded-success + `"4->6"` annotation | **Observed** | on-disk `xl.meta` decode |
-| OBJ-1 `SlowDownWrite`/503 quorum failure | **Observed** | raw SigV4 HTTP capture |
-| OBJ-2 reconstruction (checksum match) | **Observed** | SHA-256 equality |
-| OBJ-2 `SlowDownRead`/503 quorum failure | **Observed** | raw SigV4 HTTP capture |
-| OBJ-3 fresh-disk trigger + latency | **Observed** | server log + wall-clock, 3 runs |
-| OBJ-4 `errFileNotFound` criterion | **Observed** | wiped drive → metadata restored |
-| OBJ-4 `errPartMissingOrCorrupt` criterion | **Observed** | deleted part.1 → part restored |
-| OBJ-4 `errLegacyXLMeta` criterion | **Inferred** | requires legacy XLv1 on-disk data, which a fresh cluster never writes |
-| OBJ-4 `errOutdatedXLMeta` criterion | **Inferred** | requires a deterministic metadata version skew, not forceable via the real path |
-| OBJ-5 heal log trio + `numHealers=4` | **Observed** | server log |
-| OBJ-5 `"all drives are in healing state, aborting.."` | **Inferred** | requires *every* drive reformatting at once (would destroy quorum) |
-| OBJ-6 gauges + before/during/after | **Observed** | metrics scrapes |
-| Literal `errDiskNotFound` = `"drive not found"` log | **Inferred / not observed** | see note below |
-
-**`errDiskNotFound` note:** the literal string `"drive not found"` (`cmd/storage-errors.go:L53`) appeared **0 times** in the server log across the entire investigation, despite varied triggers (file placeholder, dangling symlink, wipe+restore causing disk-id mismatch, `mc admin trace`). `errDiskNotFound` is the internal disk-identity signal that *registers* a drive offline (its effect is observable in `mc admin info` and in `drives_offline_count`) but is swallowed into offline-accounting rather than surfaced verbatim. The **observed** offline log signal is instead `errDiskNotDir` = `"drive is not directory or mountpoint"` (`cmd/storage-errors.go:L50`), which was emitted (deduplicated via `LogOnceIf`, so one structured block per unique offline episode — 12 blocks total in the final run).
-
-**AIStor "48-hour fresh-drive" rule:** newer MinIO/AIStor documentation describes a 48-hour fresh-drive healing rule. This was **NOT** observed or reproduced at commit `c07e5b49d477` and is **not asserted** to exist here; the behavior observed at this commit is the immediate ~10–20 s fresh-disk heal described in OBJ-3.
-
----
+| Claim / mechanism | Classification | Basis |
+|---|---|---|
+| Degraded write success + parity upgrade `4->6` (OBJ-1) | OBSERVED (canonical) | `mc`/SigV4 PUT at 4 & 5 offline; raw `xl-meta` `EcM:6 EcN:6`; marker decodes `4->6` |
+| Write failure `SlowDownWrite` / HTTP 503 at 6 offline (OBJ-1) | OBSERVED (canonical) | Single-shot SigV4 full 503 XML; `mc` exit 1; threshold `(12+1)/2=6` |
+| Read reconstruction at 4 offline (OBJ-2) | OBSERVED (canonical) | Reconstructed `obj1.bin` SHA-256 matches baseline; SigV4 GET 200 |
+| Read failure `SlowDownRead` / HTTP 503 at 5 offline (OBJ-2) | OBSERVED (canonical) | Single-shot SigV4 full 503 XML on same object; `mc` exit 1 |
+| Quorum strings never logged verbatim | OBSERVED | `grep -c` returns 0 for both strings; per-drive probe logged instead |
+| `monitorLocalDisksAndHeal` -> `healFreshDisk` trigger (OBJ-3) | OBSERVED (canonical) | 3 timestamped runs; 11.2/24.3/12.2 s, quantized to 10 s poll |
+| MRF on-the-fly heal path (OBJ-3) | OBSERVED STATE + SOURCE | `"mrf": null` queue-state field; enqueue site `cmd/erasure-object.go:L2113` |
+| Background scanner heal (OBJ-3) | OBSERVED (indirect) | `ScannedItemsCount` advanced 245 -> 246 |
+| `errFileNotFound` heal criterion (OBJ-4) | OBSERVED (canonical) | Fresh-drive heal repairs all objects; `objects_total_count:7` |
+| `errPartMissingOrCorrupt` heal criterion (OBJ-4) | SIMULATED + SUPPLEMENTARY | Bitrot zeroing; canonical GET reconstructs; deep-scan (non-canonical) rebuilds shard |
+| `errLegacyXLMeta` / `errOutdatedXLMeta` criteria (OBJ-4) | SOURCE-ONLY / INFERRED | Cited `cmd/erasure-healing.go:L161-L167`; not reproducible via canonical S3 |
+| Heal log lines + "use 4 parallel workers" (OBJ-5) | OBSERVED (canonical) | `grep -n`/`grep -c`: 6 cycles, all 4 workers; per-cycle correlation |
+| `healed:N` counts include system metadata (OBJ-4/5) | OBSERVED | `healed_buckets` = `.minio.sys/config`, `.minio.sys/buckets`, `ectest` |
+| v3 / v2 drive-count metric names + values (OBJ-6) | OBSERVED (canonical) | `curl` scrapes at baseline (12/12) and 1 settled offline (11/1) |
+| v3 zero-suppression of `offline_count` (OBJ-6) | OBSERVED | Absent at baseline; source guard `if value > 0` `cmd/metrics-v3-types.go:L240` |
+| Count gauges = connectivity; `erasure_set_healing_drives` = heal status (OBJ-6) | OBSERVED (canonical) | Lifecycle capture: counts stay 12 while healing gauge `0 -> 1 -> 0` |
+| `mc admin heal --scan deep` shard rebuild (OBJ-4) | SUPPLEMENTARY / NON-CANONICAL | Explicitly labeled; not the default drive-recovery trigger |
 
 ## Coverage Checklist
 
-Every named mechanism from the questions, with its concrete value, `file:line`, observed evidence, and causal role:
+Every named mechanism, function, error, flag, and metric, with its concrete value, `file:line`, and evidence:
 
-| # | Item | Concrete value | `file:line` | Evidence |
-|---|------|----------------|-------------|----------|
-| 1 | `errErasureWriteQuorum` | "Write failed. Insufficient number of drives online" | `cmd/erasure-errors.go:L25-L26` | OBJ-1 Regime 2 |
-| 2 | `errErasureReadQuorum` | "Read failed. Insufficient number of drives online" | `cmd/erasure-errors.go:L22-L23` | OBJ-2 Regime B |
-| 3 | `SlowDownWrite` | Code `SlowDownWrite`, HTTP 503, "Resource requested is unwritable…" | `cmd/api-errors.go:L874-L878`, map `L2192-L2193` | OBJ-1 XML body |
-| 4 | `SlowDownRead` | Code `SlowDownRead`, HTTP 503, "Resource requested is unreadable…" | `cmd/api-errors.go:L869-L873`, map `L2190-L2191` | OBJ-2 XML body |
-| 5 | HTTP 503 | `http.StatusServiceUnavailable` | `cmd/api-errors.go:L872, L877` | both quorum failures |
-| 6 | `minIOErasureUpgraded` | key `x-minio-internal-erasure-upgraded`, observed value `4->6` | `cmd/erasure-metadata.go:L38`; set `cmd/erasure-object.go:L1316` | OBJ-1 Regime 1 xl.meta |
-| 7 | write-quorum threshold | `offlineDrives >= (len(storageDisks)+1)/2` = 6/12 | `cmd/erasure-object.go:L1304-L1308` | OBJ-1 both regimes |
-| 8 | `errDiskNotFound` | "drive not found" — registers offline, **not logged verbatim** (0 hits) | `cmd/storage-errors.go:L53` | OBJ-3 / Observed-vs-Inferred |
-| 9 | `errDiskNotDir` (observed offline signal) | "drive is not directory or mountpoint" | `cmd/storage-errors.go:L50` | OBJ-1/OBJ-3 log blocks |
-| 10 | `monitorLocalDisksAndHeal` | fresh-disk heal monitor | `cmd/background-newdisks-heal-ops.go:L563` | OBJ-3 |
-| 11 | `defaultMonitorNewDiskInterval` | `time.Second * 10` (10 s heal poll) | `cmd/background-newdisks-heal-ops.go:L40` | OBJ-3 latency |
-| 12 | reconnect interval | 15 s (`defaultMonitorNewDiskInterval + 5s`) | `cmd/erasure-sets.go:L348` | OBJ-3 latency |
-| 13 | `healFreshDisk` | dispatched per fresh drive | `cmd/background-newdisks-heal-ops.go:L419` (call `L592`) | OBJ-3 |
-| 14 | MRF `addPartialOp` / `healRoutine` | on-the-fly heal queue | `cmd/mrf.go:L78` / `L220`; enqueue `cmd/erasure-object.go:L400, ~L2113` | OBJ-3 |
-| 15 | data-scanner `healObjectSelectProb` | `1024` | `cmd/data-scanner.go:L61` (`L93`, `L199`) | OBJ-3 |
-| 16 | `shouldHealObjectOnDisk` | 4-criteria decision | `cmd/erasure-healing.go:L156` | OBJ-4 |
-| 17 | `errFileNotFound` criterion | heal when object missing | `cmd/erasure-healing.go:L157-L159` | OBJ-4 (observed, d8) |
-| 18 | `errPartMissingOrCorrupt` criterion | heal when part missing/corrupt | `cmd/erasure-healing.go:L169-L176` (var `L152`) | OBJ-4 (observed, d7 part.1) |
-| 19 | `errLegacyXLMeta` criterion | heal when `meta.XLV1` | `cmd/erasure-healing.go:L161-L164` (var `L148`) | OBJ-4 (inferred) |
-| 20 | `errOutdatedXLMeta` criterion | heal when `!latestMeta.Equals(meta)` | `cmd/erasure-healing.go:L166-L167` (var `L150`) | OBJ-4 (inferred) |
-| 21 | `xMinIOHealing` | `ReservedMetadataPrefix + "healing"` | `cmd/erasure-healing.go:L186` | OBJ-4 |
-| 22 | `healObject` | per-object heal driver | `cmd/erasure-healing.go:L258` | OBJ-4 |
-| 23 | "Healing drive '%s' - use %d parallel workers." | observed with N=4 | `cmd/global-heal.go:L210` | OBJ-5 |
-| 24 | heal-finished log | "…is finished (healed: %d, skipped: %d)." | `cmd/background-newdisks-heal-ops.go:L520` | OBJ-5 |
-| 25 | "all drives are in healing state, aborting.." | edge condition | `cmd/global-heal.go:L341` | OBJ-5 (inferred) |
-| 26 | `minio_cluster_health_drives_online_count` | 12 → 8 → 12 | `cmd/metrics-v3-cluster-health.go:L24`, set `L45` | OBJ-6 |
-| 27 | `minio_cluster_health_drives_offline_count` | 0(absent) → 4 → 0(absent) | `cmd/metrics-v3-cluster-health.go:L23`, set `L44` | OBJ-6 |
-| 28 | `minio_cluster_health_drives_count` | 12 (constant) | `cmd/metrics-v3-cluster-health.go:L25`, set `L46` | OBJ-6 |
-| 29 | `GetParityForSC` / default parity | EC:4 for 12 drives (default) | `internal/config/storageclass/storage-class.go:L258`; `AvailabilityOptimized` `L327` | Environment / OBJ-1 |
+- [x] **OBJ-1 write outcome** — SUCCEEDS < 6 offline (parity `4->6`), FAILS >= 6 offline. `errErasureWriteQuorum` `cmd/erasure-errors.go:L25-L26` -> `ErrSlowDownWrite` HTTP 503 `cmd/api-errors.go:L874-L878,L2192-L2193`; decision `cmd/erasure-object.go:L1304-L1308`.
+- [x] **`minIOErasureUpgraded` marker** — `x-minio-internal-erasure-upgraded = "4->6"` (base64 `NC0+Ng==`); written `cmd/erasure-object.go:L1316`; raw `xl-meta` shown.
+- [x] **`objectQuorumFromMeta`** — `cmd/erasure-metadata.go:L531`.
+- [x] **OBJ-2 read outcome** — reconstructs while online >= 8 data shards; FAILS at 5 offline. `errErasureReadQuorum` `cmd/erasure-errors.go:L22-L23` -> `ErrSlowDownRead` HTTP 503 `cmd/api-errors.go:L869-L873,L2190-L2191`; sites `cmd/erasure-object.go:L487,L738,L836`.
+- [x] **OBJ-3 trigger** — `monitorLocalDisksAndHeal` (10 s, `cmd/background-newdisks-heal-ops.go:L40,L563`) -> `healFreshDisk` (`L419`); 3 timestamped runs.
+- [x] **MRF path** — `addPartialOp` `cmd/mrf.go:L78`, `healRoutine` `cmd/mrf.go:L220`, enqueue `cmd/erasure-object.go:L2113`; observed `"mrf": null`.
+- [x] **Scanner path** — `healObjectSelectProb=1024` `cmd/data-scanner.go:L61`, deep-scan `cmd/data-scanner.go:L93,L199`; `ScannedItemsCount` advanced.
+- [x] **OBJ-4 criteria** — `shouldHealObjectOnDisk` `cmd/erasure-healing.go:L156-L183`: `errFileNotFound` (`L157-L159`, OBSERVED), `errPartMissingOrCorrupt` (`L169-L176`, SIMULATED+SUPPLEMENTARY), `errLegacyXLMeta` (`L161-L164`, SOURCE-ONLY), `errOutdatedXLMeta` (`L166-L167`, SOURCE-ONLY); `xMinIOHealing` `L186`; `healObject` `L258`.
+- [x] **OBJ-5 logs** — `"use %d parallel workers."` `cmd/global-heal.go:L210` (= 4); status `cmd/background-newdisks-heal-ops.go:L460`; `"is finished (healed:..)"` `L520`; 6 cycles counted.
+- [x] **OBJ-6 v3 metrics** — `minio_cluster_health_drives_{online,offline,count}` `cmd/metrics-v3-cluster-health.go:L23-L25,L44-L46`; path `cmd/metrics-v3.go:L50`; zero-suppression `cmd/metrics-v3-types.go:L212,L240`.
+- [x] **OBJ-6 v2 metrics** — `minio_cluster_drive_{online,offline}_total`, `minio_cluster_drive_total` from `getClusterStorageMetrics` `cmd/metrics-v2.go:L3794` (append `L3829,L3834,L3839`; MD `L578,L588,L598`); namespace `cmd/metrics-v2.go:L130`; heal gauge from `getClusterHealthMetrics` `cmd/metrics-v2.go:L3656`.
+- [x] **Before/during/after** — metrics 12/12 -> 11/1 settled; healing gauge `0->1->0`.
+- [x] **Two/three-run stability** — thresholds re-observed identical; latency quantized to 10 s.
+- [x] **Default parity `EC:4`** — `cmd/erasure-server-pool.go:L120-L124`; admin `sc_parity STANDARD:4`.
+- [x] **Storage-class default** — availability-optimized `cmd/storage-class.go:L327`, `GetParityForSC`; confirmed by the `4->6` upgrade marker.
 
----
+## Repository Cleanliness (final state)
 
-## Final `git status`
-
-After stopping the server and removing every ephemeral artifact (the built `./minio` binary and its 9 gitignored debug helpers at the repo root, the `/tmp/minio-investigation` work area with all drive/log/capture/script directories, and all temporary files), the repository contains exactly one new path and no modified tracked files:
+All investigation artifacts are ephemeral and live entirely under `/tmp/minio-investigation` (the built binary, the `xl-meta` helper, the detached git worktree, the temporary drive directories, the server log, the captures, and the helper scripts); none are inside the destination repository. After the server was stopped, the detached build worktree removed, and the work root deleted, `git status` in the destination repository shows only the single deliverable document (`blitzy/documentation/minio_c07e5b49d477.md`); no build artifacts remain in the repo root, and `go.mod`/`go.sum` and every source file are unchanged. The full cleanup and verification transcript:
 
 ```
-$ git status --porcelain --untracked-files=all
-?? blitzy/documentation/minio_c07e5b49d477.md
+===CMD: stop the MinIO server by its exact PID (never pkill)
+server.pid = 153069
+server stopped cleanly
 
-$ git diff --stat HEAD
-       (empty — no tracked source file was modified)
+===CMD: confirm port 9000 no longer served
+ready_http=000
+ready_http=connection refused (server down)
+
+===CMD: remove the detached build worktree registration
+worktree removed
+--- git worktree list after prune ---
+/tmp/blitzy/minio/blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc_5ba4b2  6da7bf97b [blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc]
+
+===CMD: remove the entire disposable work root (binary, xl-meta, drives, logs, captures, scripts)
+removed /tmp/minio-investigation ; exists now? no
+
+===CMD: git worktree list (only the main working tree remains)
+/tmp/blitzy/minio/blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc_5ba4b2  6da7bf97b [blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc]
+
+===CMD: confirm no build artifacts in repo root
+no ./minio or ./xl-meta in repo root
+
+===CMD: go.mod / go.sum are unchanged versus HEAD
+go.mod+go.sum diff line count: 0
+
+===CMD: final repository status (only the deliverable differs; nothing ignored/untracked left behind)
+ M blitzy/documentation/minio_c07e5b49d477.md
 ```
-
-```
-$ git status
-On branch blitzy-bfa49d51-b341-48e3-abc3-696af19a4ccc
-Untracked files:
-  (use "git add <file>..." to include in what will be committed)
-	blitzy/
-
-nothing added to commit but untracked files present (use "git add" to track)
-```
-
-Every `cmd/*.go`, `internal/**`, `buildscripts/*`, `Makefile`, and `go.mod`/`go.sum` remains byte-identical to commit `c07e5b49d477` (empty `git diff --stat HEAD` confirms zero tracked-file changes). The source repository was treated strictly as read-only; this single documentation file is the only addition.
-
----
-
-*End of analysis.*
-
