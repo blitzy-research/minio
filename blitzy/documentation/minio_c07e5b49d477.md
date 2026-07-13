@@ -1273,7 +1273,7 @@ Every named mechanism, function, error, flag, and metric, with its concrete valu
 - [x] **Before/during/after** — metrics 12/12 -> 11/1 settled; healing gauge `0->1->0`.
 - [x] **Two/three-run stability** — thresholds re-observed identical; latency quantized to 10 s.
 - [x] **Default parity `EC:4`** — `cmd/erasure-server-pool.go:L120-L124`; admin `sc_parity STANDARD:4`.
-- [x] **Storage-class default** — availability-optimized `cmd/storage-class.go:L327`, `GetParityForSC`; confirmed by the `4->6` upgrade marker.
+- [x] **Storage-class default** — availability-optimized `internal/config/storageclass/storage-class.go:L327` (`AvailabilityOptimized`), `GetParityForSC` at `L258`; confirmed by the `4->6` upgrade marker.
 
 ## Repository Cleanliness (final state)
 
