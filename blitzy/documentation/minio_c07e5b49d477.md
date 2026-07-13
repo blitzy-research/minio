@@ -87,7 +87,8 @@ HealHandler (cmd/admin-handlers.go:1308)
 ```
 
 The exported `HealObject` wrapper at `cmd/erasure-healing.go:1039` translates the internal
-error through `toObjectErr` (`cmd/object-api-errors.go:152`), which is what turns the raw
+error through `toObjectErr` (declared at `cmd/object-api-errors.go:30`; the
+`errErasureReadQuorum` case at `cmd/object-api-errors.go:152`), which is what turns the raw
 sentinel `errErasureReadQuorum` into the public `InsufficientReadQuorum` type (§5.2).
 
 ### 3.2 `healObject` has **two** `deleteIfDangling` call sites, not one
@@ -1069,7 +1070,7 @@ on whether the marker itself holds a data-majority across drives.
 ### 6.1 BEFORE / AFTER status indicators
 
 Every object heal returns a `madmin.HealResultItem`
-(`github.com/minio/madmin-go/v3` `heal-commands.go:139-160`) with **`Before`** and **`After`**
+(`github.com/minio/madmin-go/v3` `heal-commands.go:139-157`) with **`Before`** and **`After`**
 blocks, each a list of per-drive `HealDriveInfo{UUID, Endpoint, State}`
 (`heal-commands.go:132-135`). This is the literal BEFORE/AFTER the question asks for: the
 `Before.Drives[i].State` shows each drive's pre-heal condition and `After.Drives[i].State` its
@@ -1082,9 +1083,11 @@ The item also carries `ParityBlocks`, `DataBlocks`, `DiskCount`, `ObjectSize`, a
 
 ### 6.2 Drive-state vocabulary and the client-side colour
 
-The server emits **states**, not colours. The state vocabulary is the `DriveState*` set of
-constants (`heal-commands.go:120-128`): `ok`, `offline`, `corrupt`, `missing`,
-`permission-denied`, `faulty`, `unformatted`. Observed mappings from the scenarios:
+The server emits **states**, not colours. The state vocabulary is the complete `DriveState*`
+set of nine constants (`heal-commands.go:120-128`): `ok`, `offline`, `corrupt`, `missing`,
+`permission-denied`, `faulty`, `root-mount`, `unknown`, and `unformatted` (the last is "only
+returned by disk" per the source comment at `heal-commands.go:128`). Observed mappings from
+the scenarios:
 
 - corrupt **part** → `missing` (§4.1) — `shouldHealObjectOnDisk` treats a bad part as
   `errPartMissingOrCorrupt` (§3.5).
@@ -1094,8 +1097,9 @@ constants (`heal-commands.go:120-128`): `ok`, `offline`, `corrupt`, `missing`,
 
 The green/yellow/red/grey **colour** is computed **client-side** by `minio/mc`
 (`getHColCode`, `mc cmd/admin-heal-ui.go`) from `surplus = onlineCount − DataBlocks` and
-`ParityBlocks`. The exact table `mc` uses (reproduced verbatim in the harness client and
-confirmed against every capture) is:
+`ParityBlocks`. The exact table `mc` uses (its integer `hColTable` and the `getHColCode`
+algorithm reproduced **verbatim** in the harness client and confirmed against every capture;
+only `mc`'s internal `col` return type is rendered here as a plain `string`) is:
 
 ```go
 var hColOrder = []string{"red", "yellow", "green"}
@@ -1269,7 +1273,7 @@ collision-checked port**, captured the server **PID**, and **polled readiness** 
 anything:
 
 ```console
-$ RUN_ROOT=/tmp/blitzy-heal-run.main          # unique disposable root (never the repo, never /app)
+$ RUN_ROOT=/tmp/blitzy-heal-run.main          # unique disposable root (never the repo, never the agent's own environment)
 $ PORT=19000 ; CONSOLE=19500                  # non-default; verified free before bind
 $ mkdir -p "$RUN_ROOT"/d1 "$RUN_ROOT"/d2 "$RUN_ROOT"/d3 "$RUN_ROOT"/d4
 $ MINIO_CI_CD=1 /tmp/minio-bin server \
@@ -1350,7 +1354,7 @@ tiny purpose-built clients compiled **against the exact pinned dependencies** fr
 
 | Harness client | Module used (pinned in `go.mod`) | Role |
 |----------------|----------------------------------|------|
-| `/tmp/healcli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | POSTs the canonical heal route (`madmin.Heal`), prints raw `HealResultItem` JSON, and reproduces `mc`'s `getHColCode` colour **verbatim** |
+| `/tmp/healcli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | POSTs the canonical heal route (`madmin.Heal`), prints raw `HealResultItem` JSON, and reproduces `mc`'s `getHColCode` colour algorithm and `hColTable` **verbatim** (return type adapted from `mc`'s internal `col` to `string`) |
 | `/tmp/s3cli-bin` | `github.com/minio/minio-go/v7 v7.0.80` | canonical S3 PUT/GET/STAT/RM/versioning used to build scenarios and observe reads |
 | `/tmp/tracecli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | subscribes to the canonical `ServiceTrace` stream (the same stream `mc admin trace` consumes) to prove write-back |
 
