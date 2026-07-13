@@ -848,11 +848,11 @@ The three latencies (11.2 s, 24.3 s, 12.2 s) cluster around one and two 10-secon
 
 ### Direct answer
 
-The per-drive decision is made by `shouldHealObjectOnDisk`. It flags an object for healing on a given drive when any of: (1) the drive returns `errFileNotFound`/`errFileVersionNotFound` (metadata absent); (2) a data part is missing or fails its bitrot check (`errPartMissingOrCorrupt`); (3) the drive's metadata is legacy XLv1 (`errLegacyXLMeta`); or (4) the drive's metadata is out of date relative to the latest quorum metadata (`errOutdatedXLMeta`). Case (1) was observed canonically via the fresh-drive heal; case (2) was reproduced by bitrot simulation and confirmed via deep-scan heal (labeled SUPPLEMENTARY / NON-CANONICAL); cases (3)–(4) are SOURCE-ONLY/INFERRED on this commit.
+The per-drive decision is made by `shouldHealObjectOnDisk`. It flags an object for healing on a given drive when any of: (1) the drive returns `errFileNotFound`/`errFileVersionNotFound`/`errFileCorrupt` (metadata absent or corrupt); (2) a data part is missing or fails its bitrot check (`errPartMissingOrCorrupt`); (3) the drive's metadata is legacy XLv1 (`errLegacyXLMeta`); or (4) the drive's metadata is out of date relative to the latest quorum metadata (`errOutdatedXLMeta`). Case (1) was observed canonically via the fresh-drive heal; case (2) was reproduced by bitrot simulation and confirmed via deep-scan heal (labeled SUPPLEMENTARY / NON-CANONICAL); cases (3)–(4) are SOURCE-ONLY/INFERRED on this commit.
 
 ### Code reference
 
-`cmd/erasure-healing.go:L156-L183` — `shouldHealObjectOnDisk`: `errFileNotFound`/`errFileVersionNotFound` (`L157-L159`); legacy `errLegacyXLMeta` (`L161-L164`, defined `L148`); outdated `errOutdatedXLMeta` (`L166-L167`, defined `L150`); missing/corrupt parts `errPartMissingOrCorrupt` (`L169-L176`, defined `L152`). The in-progress marker `xMinIOHealing` is at `cmd/erasure-healing.go:L186`; the repair itself is `erasureObjects.healObject` at `cmd/erasure-healing.go:L258`.
+`cmd/erasure-healing.go:L156-L183` — `shouldHealObjectOnDisk`: `errFileNotFound`/`errFileVersionNotFound`/`errFileCorrupt` (`L157-L159`); legacy `errLegacyXLMeta` (`L161-L164`, defined `L148`); outdated `errOutdatedXLMeta` (`L166-L167`, defined `L150`); missing/corrupt parts `errPartMissingOrCorrupt` (`L169-L176`, defined `L152`). The in-progress marker `xMinIOHealing` is at `cmd/erasure-healing.go:L186`; the repair itself is `erasureObjects.healObject` at `cmd/erasure-healing.go:L258`.
 
 ### Observation 1 — absent metadata (`errFileNotFound`): CANONICAL fresh-drive heal + status reconciliation
 
@@ -1028,7 +1028,7 @@ Two metric families report drive counts:
 - **Metrics v3** (path `/minio/metrics/v3/cluster/health`): `minio_cluster_health_drives_online_count`, `minio_cluster_health_drives_offline_count`, and `minio_cluster_health_drives_count`.
 - **Metrics v2** (path `/minio/v2/metrics/cluster`, namespace `minio_cluster`): `minio_cluster_drive_online_total`, `minio_cluster_drive_offline_total`, and `minio_cluster_drive_total`. A distinct heal-status gauge, `minio_cluster_health_erasure_set_healing_drives`, tracks drives actively healing.
 
-Observed values: with all drives online, `minio_cluster_health_drives_online_count = 12`, `minio_cluster_health_drives_count = 12`, and `minio_cluster_health_drives_offline_count` is **absent** (the exporter suppresses a zero-valued gauge); with one drive settled offline, `minio_cluster_health_drives_offline_count = 1` and `minio_cluster_health_drives_online_count = 11`. A crucial finding: the count gauges measure **connectivity** and are refreshed on a ~10-second cache, so a freshly reconnected drive returns to `online` immediately while its data is still being healed. The actual heal-in-progress signal is the separate `minio_cluster_health_erasure_set_healing_drives` gauge, observed transitioning `0 -> 1 -> 0` around a heal.
+Observed values: with all drives online, `minio_cluster_health_drives_online_count = 12`, `minio_cluster_health_drives_count = 12`, and `minio_cluster_health_drives_offline_count` is **absent** (the exporter suppresses a zero-valued gauge); with one drive settled offline, `minio_cluster_health_drives_offline_count = 1` and `minio_cluster_health_drives_online_count = 11`. A crucial finding: the count gauges measure **connectivity** and are refreshed on a **~1-minute (60 s) cache** — the v3 loader `loadClusterHealthDriveMetrics` reads the `clusterDriveMetrics` cache built by `newClusterStorageInfoCache` -> `cachevalue.NewFromFunc(1*time.Minute, …)` (`cmd/metrics-v3-cache.go:L273`), and the v2 drive totals come from `getClusterStorageMetrics` with `cacheInterval: 1 * time.Minute` (`cmd/metrics-v2.go:L3796`) — so a freshly reconnected drive returns to `online` only after that cache next refreshes (within about a minute), well before its data finishes healing. The actual heal-in-progress signal is the separate `minio_cluster_health_erasure_set_healing_drives` gauge, observed transitioning `0 -> 1 -> 0` around a heal.
 
 ### Code reference
 
@@ -1068,7 +1068,7 @@ minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000"
 
 ### Values — the full failure/recovery lifecycle (connectivity vs. heal status)
 
-To separate connectivity from heal progress, a larger (~10 GB) dataset was staged so the heal would overlap the 10-second gauge cache long enough to sample. The five-point capture around a fresh-drive replacement (each point shows `mc admin info`, the v3 drive gauges, and the v2 drive totals + the `erasure_set_healing_drives` gauge). The v3 `drives_online_count` stays at `12` throughout — a reconnected drive is "online" for connectivity the moment it is reachable — while the `erasure_set_healing_drives` gauge moves `0 -> 1 -> 0`; the heal completion line (`healed: 175`) is captured at POINT 5:
+To separate connectivity from heal progress, a larger (~10 GB) dataset was staged so the heal would overlap the ~1-minute gauge cache long enough to sample. The five-point capture around a fresh-drive replacement (each point shows `mc admin info`, the v3 drive gauges, and the v2 drive totals + the `erasure_set_healing_drives` gauge). The v3 `drives_online_count` stays at `12` throughout — a reconnected drive is "online" for connectivity the moment it is reachable — while the `erasure_set_healing_drives` gauge moves `0 -> 1 -> 0`; the heal completion line (`healed: 175`) is captured at POINT 5:
 
 ```
 ===== POINT: 1-BASELINE  (2026-07-13T19:23:37.206Z) =====
@@ -1166,7 +1166,7 @@ minio_cluster_health_erasure_set_healing_drives{pool="0",server="127.0.0.1:9000"
 minio_cluster_health_erasure_set_online_drives{pool="0",server="127.0.0.1:9000",set="0"} 12
 ```
 
-Because the count gauges are cached, an immediate scrape right after taking a drive offline (POINT 2) still shows `12/0`. Waiting past the ~10-second cache makes the offline transition visible: the settled capture below shows the v3 `drives_offline_count` reach `1` and `drives_online_count` fall to `11`; it also shows that after restore the gauge lags (~60 s) before returning to `online=12`:
+Because the count gauges are cached for ~1 minute, an immediate scrape right after taking a drive offline (POINT 2) still shows `12/0`. The offline transition becomes visible only once that ~1-minute (60 s) cache next refreshes: the settled capture below shows the v3 `drives_offline_count` reach `1` and `drives_online_count` fall to `11`; it also shows that after restore the gauge lags a full cache interval — it still reads `1`/`11` at the `+14 s` scrape and only returns to `online=12` at `19:27:10`, ~62 s after restore, confirming the ~1-minute cache:
 
 ```
 === take d12 offline (non-destructive), then WAIT 14s for gauge cache to refresh ===
@@ -1217,7 +1217,7 @@ A tight ~0.5-second-cadence sample (120 samples spanning `19:23:38.364Z` to `19:
 
 ### Cause -> effect (OBJ-6)
 
-The v3 collector's value setters (`m.Set`, `cmd/metrics-v3-cluster-health.go:L44-L46`) publish the current online/offline/total counts, but the counts reflect **connectivity** and are refreshed on a cache interval, so they revert to all-online as soon as a drive reconnects. Because `MetricValues.Set` guards with `if value > 0` (`cmd/metrics-v3-types.go:L240`), a zero offline count is omitted entirely. Heal *progress* is exposed separately as `erasure_set_healing_drives`, which is why it — not the count gauges — is the correct signal that a drive is actively being healed.
+The v3 collector's value setters (`m.Set`, `cmd/metrics-v3-cluster-health.go:L44-L46`) publish the current online/offline/total counts, but the counts reflect **connectivity** and are refreshed on a **~1-minute (60 s) cache interval** (`cmd/metrics-v3-cache.go:L273`; v2 `cmd/metrics-v2.go:L3796`), so they revert to all-online within about a minute after a drive reconnects. (The separate 10-second interval belongs to `getClusterHealthMetrics` at `cmd/metrics-v2.go:L3658`, which backs the `erasure_set_healing_drives` gauge — not the drive-count gauges.) Because `MetricValues.Set` guards with `if value > 0` (`cmd/metrics-v3-types.go:L240`), a zero offline count is omitted entirely. Heal *progress* is exposed separately as `erasure_set_healing_drives`, which is why it — not the count gauges — is the correct signal that a drive is actively being healed.
 
 ## Two-Run (and Three-Run) Stability
 
@@ -1266,7 +1266,7 @@ Every named mechanism, function, error, flag, and metric, with its concrete valu
 - [x] **OBJ-3 trigger** — `monitorLocalDisksAndHeal` (10 s, `cmd/background-newdisks-heal-ops.go:L40,L563`) -> `healFreshDisk` (`L419`); 3 timestamped runs.
 - [x] **MRF path** — `addPartialOp` `cmd/mrf.go:L78`, `healRoutine` `cmd/mrf.go:L220`, enqueue `cmd/erasure-object.go:L2113`; observed `"mrf": null`.
 - [x] **Scanner path** — `healObjectSelectProb=1024` `cmd/data-scanner.go:L61`, deep-scan `cmd/data-scanner.go:L93,L199`; `ScannedItemsCount` advanced.
-- [x] **OBJ-4 criteria** — `shouldHealObjectOnDisk` `cmd/erasure-healing.go:L156-L183`: `errFileNotFound` (`L157-L159`, OBSERVED), `errPartMissingOrCorrupt` (`L169-L176`, SIMULATED+SUPPLEMENTARY), `errLegacyXLMeta` (`L161-L164`, SOURCE-ONLY), `errOutdatedXLMeta` (`L166-L167`, SOURCE-ONLY); `xMinIOHealing` `L186`; `healObject` `L258`.
+- [x] **OBJ-4 criteria** — `shouldHealObjectOnDisk` `cmd/erasure-healing.go:L156-L183`: `errFileNotFound`/`errFileVersionNotFound`/`errFileCorrupt` (`L157-L159`, OBSERVED via `errFileNotFound`), `errPartMissingOrCorrupt` (`L169-L176`, SIMULATED+SUPPLEMENTARY), `errLegacyXLMeta` (`L161-L164`, SOURCE-ONLY), `errOutdatedXLMeta` (`L166-L167`, SOURCE-ONLY); `xMinIOHealing` `L186`; `healObject` `L258`.
 - [x] **OBJ-5 logs** — `"use %d parallel workers."` `cmd/global-heal.go:L210` (= 4); status `cmd/background-newdisks-heal-ops.go:L460`; `"is finished (healed:..)"` `L520`; 6 cycles counted.
 - [x] **OBJ-6 v3 metrics** — `minio_cluster_health_drives_{online,offline,count}` `cmd/metrics-v3-cluster-health.go:L23-L25,L44-L46`; path `cmd/metrics-v3.go:L50`; zero-suppression `cmd/metrics-v3-types.go:L212,L240`.
 - [x] **OBJ-6 v2 metrics** — `minio_cluster_drive_{online,offline}_total`, `minio_cluster_drive_total` from `getClusterStorageMetrics` `cmd/metrics-v2.go:L3794` (append `L3829,L3834,L3839`; MD `L578,L588,L598`); namespace `cmd/metrics-v2.go:L130`; heal gauge from `getClusterHealthMetrics` `cmd/metrics-v2.go:L3656`.
