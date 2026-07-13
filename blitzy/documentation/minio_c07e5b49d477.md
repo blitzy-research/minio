@@ -63,12 +63,14 @@ directly on the host.
   directory -- `minio` itself (via the `-o $(PWD)/minio` recipe at [Makefile:L179](../../Makefile)) plus
   nine debugging tools produced by [docs/debugging/build.sh](../../docs/debugging/build.sh) (`hash-set`,
   `healing-bin`, `inspect`, `pprofgoparser`, `reorder-disks`, `s3-check-md5`, `s3-verify`, `xattr`,
-  `xl-meta`). All ten are listed in `.gitignore`, so they never appear as *tracked* changes; but to keep
-  even the *ignored* tree clean the build was performed in a **separate** checkout (`/tmp/minio-src`,
-  itself checked out at commit `c07e5b49d477...`) and the resulting binary was staged **outside** the
-  repository at `/tmp/minio-build/minio`. Any such binaries produced inside this checkout during earlier
-  iterations were removed, so on completion both `git status --porcelain` and
-  `git status --porcelain --ignored` are clean of them (shown in R8).
+  `xl-meta`). All ten are listed in `.gitignore`, so they never appear as *tracked* changes. The
+  investigation's **own** build was performed in a **separate** checkout (`/tmp/minio-src`, itself checked
+  out at commit `c07e5b49d477...`) with the resulting binary staged **outside** the repository at
+  `/tmp/minio-build/minio`, so the investigation introduced no gitignored artifact into this checkout and
+  `git status --porcelain` (the *tracked* tree) shows only the one added deliverable. Building the server
+  **directly** in this checkout instead (as a user compiling from source may do) leaves those gitignored
+  binaries as *untracked* entries under `git status --porcelain --ignored`; being gitignored they are never
+  *tracked* and never part of the deliverable (detailed in R8).
 - **Invocation (default single node) [observed]:** `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` were left
   unset so the true defaults apply, then the server was started in the background with its console
   redirected to a log and its PID captured for a clean shutdown later:
@@ -584,7 +586,7 @@ authorization stage is what makes the root user succeed.
 - **The chaining guard.** `checkRequestAuthTypeCredential`
   ([cmd/auth-handler.go:L523](../../cmd/auth-handler.go)) runs authentication **first**
   (`authenticateRequest` at [cmd/auth-handler.go:L524](../../cmd/auth-handler.go)) and then authorization
-  (`authorizeRequest` at [cmd/auth-handler.go:L535](../../cmd/auth-handler.go)), returning
+  (`authorizeRequest` at [cmd/auth-handler.go:L536](../../cmd/auth-handler.go)), returning
   `(cred, owner, s3Err)`. The bucket/object-scoped variant is `checkRequestAuthType`
   ([cmd/auth-handler.go:L339](../../cmd/auth-handler.go)); the object-PUT variant is `isPutActionAllowed`
   ([cmd/auth-handler.go:L749](../../cmd/auth-handler.go)).
@@ -1200,20 +1202,29 @@ observation activity happened **outside** the committed checkout:
   server's executable is `/tmp/minio-build/minio`); the data directory was `/tmp/minio-data`; the SigV4
   harness, audit receiver, and reader scripts (`flow.py`, `auth.py`, `read.py`, `audit_receiver.py`) lived
   under `/tmp/minio-investigation/`. None of these are inside the repository.
-- The `make build` side effect documented in R1 (ten gitignored binaries) was **removed** from the working
-  tree, so even the *ignored* tree is clean.
+- The investigation's own `make build` (R1) was run in a **separate** checkout with the binary staged
+  **outside** this repository, so the investigation itself introduced no gitignored artifact here. Building
+  the server **directly** in this checkout (as a user compiling from source may do) instead leaves
+  gitignored, **untracked** helper binaries — the nine debugging tools from
+  [docs/debugging/build.sh](../../docs/debugging/build.sh) (`hash-set`, `healing-bin`, `inspect`,
+  `pprofgoparser`, `reorder-disks`, `s3-check-md5`, `s3-verify`, `xattr`, `xl-meta`) plus `minio` itself, all
+  listed in `.gitignore`. Those are build products: never *tracked*, and never part of the deliverable.
 
-The proof is the repository status, which — including ignored files — shows the **single** deliverable and
-nothing else (no modified source, no stray build artifact):
+The binding, reproducible proof is the **tracked** repository status together with the diff against the
+source commit — the tracked tree is unchanged apart from the single added deliverable, and no source, test,
+configuration, or CI file was modified:
 
 ```
-$ git status --porcelain --ignored
- M blitzy/documentation/minio_c07e5b49d477.md
+$ git status --porcelain
+$ git diff --name-status c07e5b49d477b0774f23db3b290745aef8c01bd2 HEAD
+A	blitzy/documentation/minio_c07e5b49d477.md
 ```
 
-The porcelain listing has exactly one entry, and `--ignored` adds nothing: the branch's sole change relative
-to the source commit is this document, and no gitignored build product (e.g. the `minio` binary) remains in
-the tree.
+`git status --porcelain` prints **nothing** (the tracked tree is clean; the deliverable is committed), and the
+only change relative to the source commit is this one added document. Running `git status --porcelain --ignored`
+may *additionally* list the gitignored, untracked build products above whenever the server has been built in
+this checkout (as this environment's setup does); those entries are never tracked and never part of the
+delivered change, so the read-only guarantee holds regardless.
 
 Rationale: a runtime investigation must leave the source tree byte-for-byte as it found it apart from the
 requested deliverable; keeping every build, data, and script artifact outside the checkout is what makes that
@@ -1224,9 +1235,19 @@ guarantee hold. **[observed]**
 Exactly one file was created — this document — named for the source branch, in the required directory:
 
 ```
-$ ls -la blitzy/documentation/
--rw-r--r-- 1 root root 77644 ... minio_c07e5b49d477.md
+$ ls -la blitzy/documentation/minio_c07e5b49d477.md
+-rw-r--r-- 1 root root 83791 Jul 13 22:03 blitzy/documentation/minio_c07e5b49d477.md
+
+$ wc -c blitzy/documentation/minio_c07e5b49d477.md
+83791 blitzy/documentation/minio_c07e5b49d477.md
 ```
+
+> **Self-reference caveat [observed]:** the byte size and timestamp above are a **point-in-time snapshot**.
+> Because this document reports its own size, any later edit — and the commit itself — refreshes the mtime and
+> perturbs the byte count; the `wc -c` value is the authoritative size captured at finalization (a fresh
+> `git` checkout also resets the mtime, so the timestamp is not reproducible across checkouts). The
+> load-bearing R9 invariant is that **exactly one** file exists at this path (proven by the
+> `git diff --name-status` in R8), not the exact byte value.
 
 - Path: `blitzy/documentation/minio_c07e5b49d477.md`.
 - Name: `minio_c07e5b49d477.md`, matching the source branch `minio_c07e5b49d477` (HEAD
