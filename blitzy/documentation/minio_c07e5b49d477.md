@@ -375,9 +375,9 @@ $MC encrypt info inv9000/r1bucket                  # readback
 $MC admin policy create inv9000 r1write     $INV/policies/r1writepolicy.json
 $MC admin policy create inv9000 r1denypol   $INV/policies/r1denypolicy.json
 $MC admin policy create inv9000 r1polusrpol $INV/policies/r1polusrpolicy.json
-$MC admin user add inv9000 r1user     r1userSECRET123
-$MC admin user add inv9000 r1denyuser r1denyuserSECRET123
-$MC admin user add inv9000 r1polusr   r1polusrSECRET123
+$MC admin user add inv9000 r1user     <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r1denyuser <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r1polusr   <REDACTED_USER_SECRET>
 $MC admin policy attach inv9000 r1write     --user r1user
 $MC admin policy attach inv9000 r1denypol   --user r1denyuser
 $MC admin policy attach inv9000 r1polusrpol --user r1polusr
@@ -468,7 +468,7 @@ Trigger sequence for each scenario (illustrated for 1A; 1B/1C differ only in use
 ```bash
 nohup $MC admin trace -v --funcname "s3.PutObject" inv9000 > $OUT/trace_1A_boto.txt 2>&1 &
 TPID=$!; sleep 2.5
-python3 $INV/scripts/r1_boto_put.py r1user r1userSECRET123 r1bucket auto-encrypt-1A-boto $OUT/payload_1A.bin
+python3 $INV/scripts/r1_boto_put.py r1user <REDACTED_USER_SECRET> r1bucket auto-encrypt-1A-boto $OUT/payload_1A.bin
 sleep 3; kill "$TPID"; wait "$TPID" 2>/dev/null
 ```
 
@@ -902,8 +902,8 @@ Fixtures (locks provisioned as root; every *delete trigger* runs as a non-admin 
 $MC mb --with-lock inv9000/r2bucket
 $MC admin policy create inv9000 r2bypass   $INV/policies/r2bypasspolicy.json
 $MC admin policy create inv9000 r2nobypass $INV/policies/r2nobypasspolicy.json
-$MC admin user add inv9000 r2bypassuser   r2bypassSECRET123
-$MC admin user add inv9000 r2nobypassuser r2nobypassSECRET123
+$MC admin user add inv9000 r2bypassuser   <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r2nobypassuser <REDACTED_USER_SECRET>
 $MC admin policy attach inv9000 r2bypass   --user r2bypassuser
 $MC admin policy attach inv9000 r2nobypass --user r2nobypassuser
 # PUT 5 objects (root) and record each VersionId (via r2_delete_locked.py putobj)
@@ -1031,7 +1031,7 @@ Each condition is triggered independently, capturing its own trace and audit sli
 a0=$(wc -l < $INV/out/audit.jsonl)
 nohup $MC admin trace -v --funcname "s3.DeleteObject" inv9000 > $OUT/trace_C1_legalhold.txt 2>&1 &
 T=$!; sleep 2.5
-python3 $INV/scripts/r2_delete_locked.py delver r2nobypassuser r2nobypassSECRET123 r2bucket c1_legalhold <VID>
+python3 $INV/scripts/r2_delete_locked.py delver r2nobypassuser <REDACTED_USER_SECRET> r2bucket c1_legalhold <VID>
 sleep 3; kill "$T"; wait "$T" 2>/dev/null
 tail -n +$((a0+1)) $INV/out/audit.jsonl > $OUT/audit_C1_legalhold.jsonl
 ```
@@ -1839,7 +1839,7 @@ Inline session policy `r4sessionpolicy.json` (narrow — Get only, **no** Put):
 $MC mb -p inv9000/r4bucket
 printf 'r4-seed-object-body' | $MC pipe inv9000/r4bucket/r4obj
 $MC admin policy create inv9000 r4parent $INV/policies/r4parentpolicy.json
-$MC admin user add inv9000 r4parentuser r4parentSECRET123
+$MC admin user add inv9000 r4parentuser <REDACTED_USER_SECRET>
 $MC admin policy attach inv9000 r4parent --user r4parentuser
 # then run the driver subcommands below
 ```
@@ -1935,7 +1935,7 @@ elif cmd == "assume_toobig":
 **Parent baseline. [Observed]** With the parent's long-term credentials, both GET and PUT succeed:
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py parent_baseline r4parentuser r4parentSECRET123
+python3 $INV/scripts/r4_sts_test.py parent_baseline r4parentuser <REDACTED_USER_SECRET>
 ```
 
 ```
@@ -1946,14 +1946,14 @@ PARENT PutObject  -> HTTP 200
 **AssumeRole — one session. [Observed]** The issued temporary `AccessKeyId` equals the JWT session-token's `accessKey` claim (`CORRELATION_MATCH = True`); the secret is redacted (ephemeral, torn down):
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py assume r4parentuser r4parentSECRET123 $INV/policies/r4sessionpolicy.json
+python3 $INV/scripts/r4_sts_test.py assume r4parentuser <REDACTED_USER_SECRET> $INV/policies/r4sessionpolicy.json
 ```
 
 ```
 ASSUMEROLE_HTTP    = 200
 TEMP_ACCESSKEYID   = MYLCK9PTJE73DS0ADU0Y
 TEMP_SECRETKEY     = <redacted — ephemeral 900s secret, torn down>
-TEMP_SESSIONTOKEN  = eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJNWUxDSzlQVEpFNzNEUzBBRFUwWSIsImV4cCI6MTc4NDA2NDk0NCwicGFyZW50IjoicjRwYXJlbnR1c2VyIiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWwwc0lsSmxjMjkxY21ObElqcGJJbUZ5YmpwaGQzTTZjek02T2pweU5HSjFZMnRsZEM4cUlsMTlYWDA9In0.QOjOdc8JyL8KLrO6FL4ALJIdukEB4Nn0ikx7PSzbZT8Ij-wANmTJJa_NQN8mqpxwX5gPf9pcqq5d1by4tKVgRg
+TEMP_SESSIONTOKEN  = <REDACTED_SESSION_TOKEN_JWT>
 JWT_ACCESSKEY_CLAIM= MYLCK9PTJE73DS0ADU0Y
 JWT_PARENT_CLAIM   = r4parentuser
 JWT_EXP            = 1784064944
@@ -1984,7 +1984,7 @@ Complete `s3.GetObject` trace — note `Credential=MYLCK9PTJE73DS0ADU0Y…` and 
 127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=MYLCK9PTJE73DS0ADU0Y/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=c496220c971fb453911aa555b7d7e937bda59c566a982e5e86f917c4cd06ce9e
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/N,b,D,Z,e cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 X-Amz-Date: 20260714T212116Z
-127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJNWUxDSzlQVEpFNzNEUzBBRFUwWSIsImV4cCI6MTc4NDA2NDk0NCwicGFyZW50IjoicjRwYXJlbnR1c2VyIiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWwwc0lsSmxjMjkxY21ObElqcGJJbUZ5YmpwaGQzTTZjek02T2pweU5HSjFZMnRsZEM4cUlsMTlYWDA9In0.QOjOdc8JyL8KLrO6FL4ALJIdukEB4Nn0ikx7PSzbZT8Ij-wANmTJJa_NQN8mqpxwX5gPf9pcqq5d1by4tKVgRg
+127.0.0.1:9000 X-Amz-Security-Token: <REDACTED_SESSION_TOKEN_JWT>
 127.0.0.1:9000 <BLOB>
 127.0.0.1:9000 [RESPONSE] [2026-07-14T21:21:16.678] [ Duration 916µs TTFB 873.205µs ↑ 172 B  ↓ 19 B ]
 127.0.0.1:9000 200 OK
@@ -2024,7 +2024,7 @@ Complete `s3.PutObject` trace — the **same** `Credential=MYLCK9PTJE73DS0ADU0Y�
 127.0.0.1:9000 Host: 127.0.0.1:9000
 127.0.0.1:9000 X-Amz-Date: 20260714T212121Z
 127.0.0.1:9000 X-Amz-Sdk-Checksum-Algorithm: CRC32
-127.0.0.1:9000 X-Amz-Security-Token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJNWUxDSzlQVEpFNzNEUzBBRFUwWSIsImV4cCI6MTc4NDA2NDk0NCwicGFyZW50IjoicjRwYXJlbnR1c2VyIiwic2Vzc2lvblBvbGljeSI6ImV5SldaWEp6YVc5dUlqb2lNakF4TWkweE1DMHhOeUlzSWxOMFlYUmxiV1Z1ZENJNlczc2lSV1ptWldOMElqb2lRV3hzYjNjaUxDSkJZM1JwYjI0aU9sc2ljek02UjJWMFQySnFaV04wSWwwc0lsSmxjMjkxY21ObElqcGJJbUZ5YmpwaGQzTTZjek02T2pweU5HSjFZMnRsZEM4cUlsMTlYWDA9In0.QOjOdc8JyL8KLrO6FL4ALJIdukEB4Nn0ikx7PSzbZT8Ij-wANmTJJa_NQN8mqpxwX5gPf9pcqq5d1by4tKVgRg
+127.0.0.1:9000 X-Amz-Security-Token: <REDACTED_SESSION_TOKEN_JWT>
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 2a139e36-bc60-437f-80ac-2edfb296dba7
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
@@ -2066,7 +2066,7 @@ Complete `s3.PutObject` trace — the **same** `Credential=MYLCK9PTJE73DS0ADU0Y�
 **Inline session-policy size cap (2,048 bytes). [Observed]** An inline policy of 2,230 bytes is rejected at `AssumeRole`:
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py assume_toobig r4parentuser r4parentSECRET123
+python3 $INV/scripts/r4_sts_test.py assume_toobig r4parentuser <REDACTED_USER_SECRET>
 ```
 
 ```
@@ -2618,13 +2618,13 @@ Every named item and variant across R1–R5 was exercised at runtime through the
 | R2 | Governance bypass header + permission lacking | PASS | Observed | `403 AccessDenied` (`errAuthentication` → `ErrAccessDenied`) |
 | R2 | Log surfaces: server trace + audit-log JSON | PASS | Observed | `s3.DeleteObject … 400`; audit `api.name=DeleteObject, statusCode=400` |
 | R3 | 4-drive heal-on-read GET after shard corruption | PASS | Observed | `200`, sha256 == original; `heal.Object` event |
-| R3 | Byte-sensitive hash verification | PASS | Observed | Healed body hash `e1c53465…` == original; corrupt shard `dcb97c55…` differs |
+| R3 | Byte-sensitive hash verification | PASS | Observed | Healed body hash `ef3488fc…` == original; corrupt shard `3d056c7e…` differs |
 | R3 | Stability ≥2 runs | PASS | Observed | 4 runs; each `200` + correct hash + 1 heal event (~285–299µs) |
 | R3 | Single-drive (no parity) unrecoverable variant | PASS | Observed | `503 SlowDownRead` |
 | R3 | `errFileCorrupt` surfaced to `mc admin logs` console | PARTIAL | [INFERRED] | No `mc admin logs` line for the corruption; inferred internal/by-design (heal path handles it; console log not emitted) |
 | R4 | Baseline parent `PutObject` (long-term creds) | PASS | Observed | `200` (parent allows Put) |
 | R4 | `AssumeRole` with narrow inline session policy | PASS | Observed | `200`; single temp cred + SessionToken issued (`MYLCK9PTJE73DS0ADU0Y`, secret redacted) |
-| R4 | Temp-cred `GetObject` (session allows) | PASS | Observed | `200`, body `hello-r4-object-content` |
+| R4 | Temp-cred `GetObject` (session allows) | PASS | Observed | `200`, body `r4-seed-object-body` |
 | R4 | Temp-cred `PutObject` (parent allows, session omits) | PASS | Observed | `403 AccessDenied` (intersection proven; same key end-to-end) |
 | R4 | Inline session-policy size cap (2,048 bytes) | PASS | Observed + Source-grounded | 2,230-byte policy → `400 InvalidParameterValue` "Session policy should not exceed 2048 characters" (`sts-handlers.go:89`,`:123-124`) |
 | R5 | Self-attach `consoleAdmin` via `SetPolicyForUserOrGroup` | PASS | Observed | `403 AccessDenied`; authenticated audit `accessKey=r5basic` (reached `IsAllowed`) |
@@ -2654,7 +2654,10 @@ $ ps -eo pid,args | grep -E "minio-bin|audit_receiver.py" | grep -v grep
 ```
 
 ```bash
-$ for p in 9000 9001 9100 9101 9999; do awk ... /proc/net/tcp   # any LISTEN on port p
+$ for p in 9000 9001 9100 9101 9999; do
+    hp=$(printf '%04X' "$p")   # local port as uppercase hex, as encoded in /proc/net/tcp{,6}
+    awk -v p="$p" -v hp="$hp" '$4=="0A"{n=split($2,a,":"); if(a[n]==hp) f=1} END{printf "port %s: %s\n", p, (f ? "listening" : "not listening")}' /proc/net/tcp /proc/net/tcp6
+  done   # state 0A = LISTEN; scan IPv4 + IPv6 tables (the console port binds IPv6-only)
 port 9000: not listening
 port 9001: not listening
 port 9100: not listening
