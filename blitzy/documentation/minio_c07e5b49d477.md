@@ -4,9 +4,12 @@
 > `c07e5b49d477b0774f23db3b290745aef8c01bd2` (the parent of branch `minio_c07e5b49d477`). The server was
 > compiled and executed as an unprivileged user over four local directories; the default storage class
 > yields **EC:2** (2 data + 2 parity). Every **behavioral** claim below is shown next to the **actual,
-> unedited output** that produced it (the exact command, its full stdout/stderr, and its exit status);
-> every **code** claim carries an exact `file:line` citation verified against this source. Statements that
-> could not be surfaced at runtime are explicitly labeled **(inferred, from code)**.
+> unedited output** that produced it — the command that produced it (or, where a step aggregates several
+> commands, a clearly-labeled descriptive capture of that step), its output (shown in full, or as a
+> clearly-labeled representative excerpt or derived count when the raw output is long or repetitive), and its
+> exit status where applicable; every **code** claim carries an exact `file:line` citation verified against
+> this source. Statements that could not be surfaced at runtime are explicitly labeled **(inferred, from
+> code)**.
 
 > **Provenance note on the version banner (read this before §6.0).** The server was compiled from the
 > **investigated MinIO source** `c07e5b49d477b0774f23db3b290745aef8c01bd2` with the canonical build flags
@@ -42,11 +45,11 @@ four-directory, default-parity topology.
 | # | Question | One-line answer | Decisive observed evidence | Primary `file:line` |
 |---|----------|-----------------|----------------------------|---------------------|
 | **Q1** | Health decision & disk assumptions | The deployment is "healthy" only if **every** erasure set has `online ≥ write quorum`; for 4-dir EC:2 the write quorum is **3** (read quorum 2). `Health()` derives the thresholds itself from `BackendInfo()`. | `GET /minio/health/cluster` → **200** with `X-Minio-Write-Quorum: 3` | `Health()` [cmd/erasure-server-pool.go:L2679]; quorum calc [L2719-L2727] |
-| **Q2** | Live permission-loss behavior | It **keeps serving writes** while still at/above write quorum, and **refuses writes** the moment it drops below it (reads continue while read quorum holds). | 3 online → PUT exit 0; 2 online → PUT exit 1 `SlowDownWrite` | PUT quorum check [cmd/erasure-object.go:L1305-L1308] |
-| **Q3** | Above vs below threshold | **Above** (3 online): `/cluster` 200, writes succeed. **Below** (2 online): `/cluster` 503, writes refused, **reads still succeed**. | §6.2 vs §6.3 + `FatalKind` log | `Health()` [cmd/erasure-server-pool.go:L2791,L2794] |
+| **Q2** | Live permission-loss behavior | It **keeps serving writes** while still at/above write quorum, and **refuses writes** the moment it drops below it (reads continue while read quorum holds). | 3 online → PUT exit 0; 2 online → PUT exit 1 `SlowDownWrite` | PUT quorum check [cmd/erasure-object.go:L1304-L1308] |
+| **Q3** | Above vs below threshold | **Above** (3 online): `/cluster` 200, writes succeed. **Below** (2 online): `/cluster` 503, writes refused, **reads still succeed**. | §6.2 vs §6.3 + `FatalKind` log | `Health()` [cmd/erasure-server-pool.go:L2791,L2794-L2795] |
 | **Q4** | Path-named logs & live recovery | **Yes**, the disk is named by its exact path. For a *permission* fault the disk is excluded through the **DiskInfo/Healing** path; the dedicated `monitorDiskWritable` offline/online lines do **not** fire (observed count = 0). | `endpoint="/tmp/ec/data1"`; `.healing.bin … permission denied`; offline/online counts = **0** | runtime perm map [cmd/xl-storage.go:L802-L826]; offline log [cmd/xl-storage-disk-id-check.go:L1015] |
 | **Q5** | Self-detection of restored dir | **Automatic**, reflected on the **next health probe** (observed **~11–15 ms** in a tight poll) — **no restart, no external push**. Driven by the on-demand DiskInfo re-read (1 s cache), not the 5/10/15 s pollers. | poll shows `/cluster` 200 + 4 online on the first 5 s poll, stable through t+45s; same server PID | DiskInfo cache [cmd/xl-storage.go:L326] |
-| **Q6** | Repair of objects written during outage | The shard missing on the down disk was **not** restored automatically within the observed window; a **manual `mc admin heal`** restored it (`Yellow → Green`). Background heal is conditional. | shard MISSING → after heal RESTORED; `Healed: 2/3 objects` | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] (conditional) |
+| **Q6** | Repair of objects written during outage | **Timing-dependent.** If the drive returns within the ~1 s MRF retry window the missing shard is rebuilt **automatically** (short outage); if it returns later the single retry is spent and the shard stays missing until a heal — an on-demand `mc admin heal` or the slower scanner (long outage). Readable throughout. | short: shard auto-restored ~t+1–2 s (3/3); long: still missing at t+45 s (3/3) → `mc admin heal` `Yellow→Green` | MRF `healRoutine()` [cmd/mrf.go:L220-L254]; `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] |
 | **Q7** | Location of the quorum decision | Cluster health computes quorum in `Health()` via `BackendInfo()`; the **object write path** uses `defaultWQuorum()`/per-object `FileInfo.WriteQuorum()`. Both apply a **+1 split-brain guard** when `data == parity`. | `X-Minio-Write-Quorum: 3`; `expected write quorum: 3` log | quorum calc [cmd/erasure-server-pool.go:L2722-L2727]; `defaultWQuorum()` [cmd/erasure.go:L85] |
 | **Q8** | Grounding | Every behavioral conclusion is paired with a health-endpoint status/headers **and** a real S3 write/read result from the running server. | all §6 evidence blocks | `ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] |
 
@@ -231,7 +234,9 @@ evidence below uses the default (non-maintenance) probe, so that branch is not e
 ## 6. Evidence (Verbatim Captured Output)
 
 Each block below is the **actual, unedited** output captured from the running server, shown **before** its
-explanation, with the exact command and its exit status. States are ordered: Baseline → One-down (above
+explanation. A block shows either the literal command or a clearly-labeled descriptive capture of the step;
+long or repetitive output is shown as a clearly-labeled representative excerpt or a derived count (with the
+total stated), and exit status is included where applicable. States are ordered: Baseline → One-down (above
 threshold) → Two-down (below threshold) → Q4 logs → Restored → Healed → Repository pristine.
 
 ### 6.0 Non-root identity, build, version, and commit provenance
@@ -516,8 +521,8 @@ The object written during the one-down window has parity `EcM=2, EcN=2` — **no
 expected: MinIO's availability-optimized PUT path does increment parity per offline drive, but caps parity
 at half the set (`len/2 = 2`) [cmd/erasure-object.go:L1311-L1313]; since the default parity is already 2,
 four-drive EC:2 is already at **maximum** parity and cannot be upgraded further. Its shard is *missing on the
-down disk* `data1` (present on the other three); that missing-shard fact is shown verbatim, inspected on the
-recovered disk, in §6.6 (`obj-1down` absent on `data1` after restore, until healed).
+down disk* `data1` (present on the other three) — the degraded-redundancy state whose repair, and its
+timing dependence on how quickly the drive returns, is demonstrated end-to-end in §6.6.
 
 ### 6.3 Below threshold — additionally `chmod 000 /tmp/ec/data2` (2 online)
 
@@ -611,7 +616,9 @@ above-threshold-content[cat-exit=0]
 ```
 
 Server log — the exact `logger.FatalKind` line emitted by `Health()` (recurs once per health poll; this run
-logged it **6** times, a run-dependent count that scales with how many polls occur during the outage window):
+logged it **6** times, a run-dependent count that scales with how many polls occur during the outage window).
+Because every occurrence is byte-identical, **three representative lines are shown, followed by the full
+occurrence count**:
 
 ```
 Error: Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2 (*errors.errorString)
@@ -634,8 +641,9 @@ client-side local file read; the write itself is the `status:error` object that 
 
 ### 6.4 Path-named log evidence + the detection nuance (Q4)
 
-Over the full server log, the two dedicated `monitorDiskWritable`/`monitorDiskStatus` path-named lines
-appeared **zero** times, while the two permission-path lines appeared and named the disk by path:
+The following block reports counts taken over the **full** server log for four log-line families — the two
+dedicated `monitorDiskWritable`/`monitorDiskStatus` lines and the two permission-path lines (each `grep`'s
+own exit status is shown, where exit 1 means "no match"):
 
 ```
 ### 'taking drive offline' (monitorDiskWritable) ###
@@ -654,7 +662,8 @@ count=54
 
 The two dedicated monitor lines are absent (`grep-exit=1` = no match). Instead, the permission fault named
 the failing disk **by its filesystem path** through two live code paths. First, the set-level reconnect
-(`connectDisks`) logs the endpoint by path — one block per failed disk (`data2` and `data1`):
+(`connectDisks`) logs the endpoint by path — **both occurrences (`count=2`) are shown in full**, one per
+failed disk (`data2` and `data1`):
 
 ```
 Error: drive access denied (cmd.StorageErr)
@@ -673,7 +682,8 @@ Error: drive access denied (cmd.StorageErr)
 ```
 
 Second, the DiskInfo/Healing probe (the path `Health()` consults) names the exact file, with the full
-runtime stack:
+runtime stack — **one representative occurrence is shown in full** (this run logged 54 such lines; the total
+and its run-dependence are noted below):
 
 ```
 Error: unable to read /tmp/ec/data1/.minio.sys/buckets/.healing.bin: open /tmp/ec/data1/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
@@ -742,49 +752,150 @@ re-detected.
 
 ### 6.6 Repair of objects written during the outage (Q6)
 
-**Background auto-heal did not fire within the observed window.** Immediately after restore — and again
-after waiting 20 s (which spans the 10-second background heal interval) — the shard for `obj-1down` was
-**still missing** on `data1`, and no healing marker existed:
+Whether an object written while a drive was down is repaired **automatically** turns out to depend on
+**timing**, so this question was isolated in a dedicated experiment on the **same canonical build**
+(`DEVELOPMENT.2026-07-13T21-56-03Z`, `go1.23.12`) over the **same four-directory `/tmp/ec` layout**, run as
+the same unprivileged `tester` (uid 1001). This experiment uses a **fresh server instance** — noted here
+because it post-dates the main §6.1–§6.5 run — whose PID is recorded and which is stopped by that exact PID
+with its scratch removed at cleanup (§6.7). Each branch was run **three times** to confirm the result is
+stable, not a one-off. For every trial the drive was first **confirmed offline** (`3 drives online` on the
+health-derived `mc admin info`) *before* the write — so the write genuinely skipped `data1` and enqueued a
+repair entry — and the only variable was how quickly `data1` was restored **after** the PUT.
+
+> **Why the pre-PUT offline check matters (observed, then reasoned).** MinIO holds an open descriptor to
+> each drive root and issues I/O with `openat` relative to it, so a bare `chmod 000` on the drive root does
+> **not** instantly stop the running server from writing there; the drive is only skipped once MinIO's own
+> health monitor has marked it offline. Unless that offline state is confirmed first, a PUT can still land
+> the shard directly on `data1` and no repair entry is queued. Each trial below therefore waits for
+> `3 drives online` before writing.
+
+**Branch A — short outage (drive restored <1 s after the write): the shard is repaired automatically.**
+The complete transcript (per trial: confirmed-offline pre-PUT state, the write and its exit, the on-disk
+shard at t=0, the immediate restore, the polled on-disk result, and a read-back):
 
 ```
-### obj-1down shard on data1 right after restore ###
-ls: cannot access '/tmp/ec/data1/testbucket/obj-1down.txt/': No such file or directory
-### wait 20s (spans 10s background heal interval) then re-check ###
-ls: cannot access '/tmp/ec/data1/testbucket/obj-1down.txt/': No such file or directory
-### .healing.bin marker on data1? ###
-ls: cannot access '/tmp/ec/data1/.minio.sys/buckets/.healing.bin': No such file or directory
+==================== SHORT-OUTAGE (restore <1s after PUT) ====================
+----- trial 1 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-short-1.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+$ chmod 755 /tmp/ec/data1        -> restored immediately (t=0)
+RESULT: data1 shard AUTO-RESTORED at ~t+1s (425 B xl.meta) via MRF — NO manual heal
+$ mc cat eclab/testbucket/obj-short-1.txt -> short-outage-1 [exit=0]
+
+----- trial 2 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-short-2.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+$ chmod 755 /tmp/ec/data1        -> restored immediately (t=0)
+RESULT: data1 shard AUTO-RESTORED at ~t+1s (425 B xl.meta) via MRF — NO manual heal
+$ mc cat eclab/testbucket/obj-short-2.txt -> short-outage-2 [exit=0]
+
+----- trial 3 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-short-3.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+$ chmod 755 /tmp/ec/data1        -> restored immediately (t=0)
+RESULT: data1 shard AUTO-RESTORED at ~t+2s (425 B xl.meta) via MRF — NO manual heal
+$ mc cat eclab/testbucket/obj-short-3.txt -> short-outage-3 [exit=0]
 ```
 
-**A manual `mc admin heal` restored the shard** (`Yellow → Green` for the objects written during the
-outage):
+In all three trials the shard was **absent** on `data1` at t=0 (the write skipped the down drive) and then
+**reappeared on its own within ~1–2 s** with no `mc admin heal` ever issued. This is the most-recent-failure
+(MRF) path: the PUT recorded the skipped drive and enqueued the object, and the MRF consumer re-attempted the
+write ~1 s later — by which time `data1` was back — reconstructing the missing shard automatically.
+
+**Branch B — long outage (drive held down 20 s after the write): the shard is NOT repaired automatically.**
+Identical steps, but `data1` is held down for 20 s after the PUT before being restored, then polled for 45 s:
 
 ```
------ mc admin heal -r --force eclab/testbucket -----
+==================== LONG-OUTAGE (hold 20s down after PUT) ====================
+----- trial 1 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-long-1.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+... holding data1 DOWN 20s (MRF ~1s retry fires while disk still offline -> single retry consumed) ...
+$ chmod 755 /tmp/ec/data1        -> restored after 20s outage (t=0)
+RESULT: data1 shard STILL ABSENT through t+45s — MRF did NOT auto-restore (manual heal required)
+
+----- trial 2 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-long-2.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+... holding data1 DOWN 20s (MRF ~1s retry fires while disk still offline -> single retry consumed) ...
+$ chmod 755 /tmp/ec/data1        -> restored after 20s outage (t=0)
+RESULT: data1 shard STILL ABSENT through t+45s — MRF did NOT auto-restore (manual heal required)
+
+----- trial 3 -----
+$ mc admin info eclab            -> data1 offline (3 drives online) [pre-PUT]
+$ mc cp obj-long-3.txt eclab/testbucket/  -> [exit=0]
+t=0 data1 shard: ABSENT (skipped at PUT; MRF entry queued)
+... holding data1 DOWN 20s (MRF ~1s retry fires while disk still offline -> single retry consumed) ...
+$ chmod 755 /tmp/ec/data1        -> restored after 20s outage (t=0)
+RESULT: data1 shard STILL ABSENT through t+45s — MRF did NOT auto-restore (manual heal required)
+```
+
+In all three trials the shard was **still missing** on `data1` 45 s after restore. The single MRF retry had
+already been spent ~1 s after the PUT — while `data1` was still down — so it was consumed with nothing to
+write, and no background poller re-queued a drive whose permissions were merely restored (there was no
+unformatted drive and no `.healing.bin` tracker; see the detection nuance in §6.4/§7 Q5). The on-disk shard
+census across the four data roots confirms the split — short-outage objects present on **all four** drives,
+long-outage objects missing their `data1` shard (derived from `ls` on each `data{1..4}/testbucket/<obj>/`;
+`Y` = `xl.meta` present, `-` = absent):
+
+```
+$ for o in obj-short-{1,2,3} obj-long-{1,2,3}; do printf '%-14s ' "$o:"; \
+    for d in 1 2 3 4; do [ -f /tmp/ec/data$d/testbucket/$o.txt/xl.meta ] && printf "data$d=Y " || printf "data$d=- "; done; echo; done
+obj-short-1:   data1=Y data2=Y data3=Y data4=Y
+obj-short-2:   data1=Y data2=Y data3=Y data4=Y
+obj-short-3:   data1=Y data2=Y data3=Y data4=Y
+obj-long-1:    data1=- data2=Y data3=Y data4=Y
+obj-long-2:    data1=- data2=Y data3=Y data4=Y
+obj-long-3:    data1=- data2=Y data3=Y data4=Y
+```
+
+**A manual `mc admin heal` repairs the long-outage objects** (`Yellow → Green`), while the already-repaired
+short-outage objects and the fully-healthy baseline are reported `Green → Green` — one transcript that shows
+both branches at once:
+
+```
+$ mc admin heal -r --force eclab/testbucket
 [Green  ->  Green] testbucket/
-[Yellow ->  Green] testbucket/obj-1down-b.txt
-[Yellow ->  Green] testbucket/obj-1down.txt
 [Green  ->  Green] testbucket/obj-baseline.txt
-Healed:	2/3 objects; 64 B in 1s
+[Yellow ->  Green] testbucket/obj-long-1.txt
+[Yellow ->  Green] testbucket/obj-long-2.txt
+[Yellow ->  Green] testbucket/obj-long-3.txt
+[Green  ->  Green] testbucket/obj-short-1.txt
+[Green  ->  Green] testbucket/obj-short-2.txt
+[Green  ->  Green] testbucket/obj-short-3.txt
+Healed:	3/7 objects; 97 B in 1s
 [heal-exit=0]
 ```
 
+After the heal, every long-outage object has its `data1` shard back, byte-sized identically to the surviving
+shards, and the reconstructed shard decodes to the same EC:2 geometry (`EcM=2` data, `EcN=2` parity):
+
 ```
-### obj-1down shard on data1 AFTER heal ###
-total 12
-drwxr-xr-x 2 tester tester 4096 Jul 13 19:18 .
-drwxr-xr-x 5 tester tester 4096 Jul 13 19:18 ..
--rw-r--r-- 1 tester tester  430 Jul 13 19:18 xl.meta
-### read obj-1down after heal ###
-above-threshold-content[cat-exit=0]
+$ ls -l /tmp/ec/data1/testbucket/obj-long-1.txt/
+total 4
+-rw-r--r-- 1 tester tester 425 Jul 14 00:28 xl.meta
+
+$ xl-meta /tmp/ec/data1/testbucket/obj-long-1.txt/xl.meta | grep -E '"Ec[MN]"|"EcAlgo"|"EcBSize"|"EcIndex"'
+        "EcM": 2,
+        "EcN": 2,
+          "EcAlgo": 1,
+          "EcBSize": 1048576,
+          "EcIndex": 3,
 ```
 
-An object written while a disk was offline is missing its shard on that disk. When the disk's permissions
-are restored, the disk is re-counted as online for the health endpoint, but the **missing shard is not
-automatically reconstructed** merely by the disk returning — within the observed window the background
-`healFreshDisk` path did not queue it (there was no unformatted disk and no `.healing.bin` tracker). The
-`Yellow → Green` transitions from the manual `mc admin heal` show the degraded objects being repaired: the
-missing shard is reconstructed from the surviving ones and written back to `data1`, and the object is
-readable throughout.
+Throughout **both** branches the object stayed **readable** — it was always reconstructable from the
+surviving `data2`/`data3`/`data4` shards (read quorum 2). What differs is only *when full redundancy on
+`data1` is restored*. If the drive is back within the ~1 s MRF window, the missing shard is rebuilt
+**automatically** (short outage, Branch A); otherwise the single MRF retry is consumed with the drive still
+offline and the shard stays missing until a heal runs — an on-demand `mc admin heal` (Branch B), or, more
+slowly, the periodic data scanner. Because the drive here was only *permission-restored* (not reformatted and
+carrying no `.healing.bin` tracker), the dedicated fresh-disk heal poller did not adopt it, which is why the
+long-outage shard persisted until the manual heal.
 
 ### 6.7 Cleanup and repository left pristine
 
@@ -816,8 +927,13 @@ binary built by `make build` (`xl-meta`, `s3-check-md5`, `healing-bin`, `reorder
 other change; the MinIO source tree is untouched. The remaining transient artifacts kept only to author this
 document — the isolated `mc` config, the ephemeral credentials, the run-local `mc` copy, the captured
 evidence files, and scratch logs (all under a tester-owned scratch directory outside the repository) — are
-deleted at the very end of the investigation. The pre-provisioned `mc` (see §3 provenance) is
-environment-supplied tooling, is not part of the repository, and does not affect repository cleanliness.
+deleted at the very end of the investigation. The **dedicated Q6 timing experiment (§6.6)** was run
+afterward on a second, equally short-lived server instance over the same `/tmp/ec` layout as the same
+`tester` user; it created **no** repository files (every artifact lived under `/tmp`), and that instance was
+likewise stopped by its **exact PID** and its scratch (`/tmp/ec`, its run/log directory, and its isolated
+`mc` config) removed — so the final `git status --porcelain` still shows only this document. The
+pre-provisioned `mc` (see §3 provenance) is environment-supplied tooling, is not part of the repository, and
+does not affect repository cleanliness.
 
 
 ## 7. Per-Question Answers (Q1–Q8)
@@ -861,7 +977,7 @@ write quorum, MinIO **refuses writes** (reads continue while read quorum still h
 
 **Code (the actual PUT path).** In `putObject` [cmd/erasure-object.go:L1245], the availability-optimized
 block counts offline drives and, if `offlineDrives ≥ (len(storageDisks)+1)/2`, returns immediately with
-`toObjectErr(errErasureWriteQuorum, …)` [cmd/erasure-object.go:L1305-L1308] — with two of four offline,
+`toObjectErr(errErasureWriteQuorum, …)` [cmd/erasure-object.go:L1304-L1308] — with two of four offline,
 `2 ≥ (4+1)/2 = 2`, so this is the branch that fires. Otherwise the write proceeds with
 `writeQuorum = dataDrives (+1 when dataDrives == parityDrives)` [cmd/erasure-object.go:L1322-L1326] and
 `erasure.Encode(…, writeQuorum)` [cmd/erasure-object.go:L1425]; inside `multiWriter.Write`, if fewer than
@@ -887,7 +1003,7 @@ writing to protect durability.
 real GET of `obj-1down` succeeding during the two-down state.
 
 **Code.** The per-set decision and both log lines are in `Health()`: write-quorum failure is checked at
-[cmd/erasure-server-pool.go:L2791] and logged with `logger.FatalKind` [cmd/erasure-server-pool.go:L2794];
+[cmd/erasure-server-pool.go:L2791] and logged with `logger.FatalKind` [cmd/erasure-server-pool.go:L2794-L2795];
 read-quorum health is checked at [cmd/erasure-server-pool.go:L2799] and logged at
 [cmd/erasure-server-pool.go:L2802]. The read path returns data while `online ≥ read quorum`
 (read quorum = data blocks = 2) [cmd/erasure-server-pool.go:L2723], [cmd/storage-datatypes.go:L310-L316].
@@ -965,7 +1081,7 @@ interval.
 | Poller | Interval | Eligibility / role | Source |
 |--------|----------|--------------------|--------|
 | DiskInfo cache re-read | ≤ 1 s | Re-probes disk state on each `Health`/`StorageInfo` call; **this is what flipped the endpoint back to 200** | [cmd/xl-storage.go:L326-L359] |
-| `monitorDiskStatus` | 5 s | Re-probes a drive and brings it online — **but only starts after `goOffline`**, which the permission fault never triggered (§Q4); therefore **not** the mechanism here | [cmd/xl-storage-disk-id-check.go:L930] |
+| `monitorDiskStatus` | 5 s | Re-probes a drive and brings it online — **but only starts after `goOffline`**, which the permission fault never triggered (§Q4); therefore **not** the mechanism here | [cmd/xl-storage-disk-id-check.go:L930-L931] |
 | `monitorLocalDisksAndHeal` | 10 s | Heals **only** disks queued in the heal state — i.e. unformatted disks or disks with a `.healing.bin` tracker (`getLocalDisksToHeal`); a permission-restored disk is neither | [cmd/background-newdisks-heal-ops.go:L40,L563], [cmd/background-newdisks-heal-ops.go:L393-L406] |
 | `monitorAndConnectEndpoints` | 15 s | Calls `connectDisks` to reconnect disconnected set endpoints | [cmd/erasure-sets.go:L348,L283], [cmd/erasure-sets.go:L194] |
 
@@ -980,36 +1096,48 @@ and the endpoint flips back to 200 without operator intervention.
 
 ### Q6 — Repair of objects written during the outage
 
-**Answer.** An object written while a disk was down is **missing its shard on that disk**. In the observed
-run, the disk returning to "online" did **not** by itself reconstruct the shard within the observed window;
-a **manual `mc admin heal`** restored it. The object stayed readable throughout (reconstructed from the
-surviving shards).
+**Answer.** An object written while a drive was down is **missing its shard on that drive**, and whether it
+is repaired **automatically** depends on **how quickly the drive returns** relative to the ~1 s
+most-recent-failure (MRF) retry window. If the drive is back within ~1 s of the write (**short outage**), the
+MRF retry rebuilds the missing shard **automatically** — no operator action. If the drive stays down past
+that window (**long outage**), the single MRF retry is consumed while the drive is still offline and the
+shard remains missing until a heal runs — an on-demand `mc admin heal` or, more slowly, the periodic data
+scanner. The object stays **readable** the whole time (reconstructed from the surviving shards).
 
-**Observed (§6.6).** Right after restore and again after 20 s, `obj-1down` still had no shard on `data1` and
-there was no `.healing.bin` tracker. `mc admin heal -r --force` then reported `Yellow → Green` for
-`obj-1down.txt` (and `obj-1down-b.txt`), `Healed: 2/3 objects; 64 B in 1s`; afterwards the `data1` shard
-(`xl.meta`) was present and the object read back `above-threshold-content`.
+**Observed (§6.6, 3 trials each).** *Short outage* — the shard was **absent** on `data1` at t=0 and
+**reappeared on its own within ~1–2 s** (425 B `xl.meta`) with no heal issued, so all three `obj-short-*`
+ended up present on all four drives. *Long outage* — after holding `data1` down 20 s, the shard was **still
+missing 45 s after restore** for all three `obj-long-*`. A single `mc admin heal -r --force` then reported
+`Yellow → Green` for the three long-outage objects and `Green → Green` for the already-repaired short-outage
+objects (`Healed: 3/7 objects; 97 B in 1s`); afterwards each long-outage `data1` shard was present (425 B)
+and decoded to `EcM=2, EcN=2`.
 
-**Code.** The background fresh-disk heal `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419] is
-scheduled by `monitorLocalDisksAndHeal()` [cmd/background-newdisks-heal-ops.go:L563], but it acts **only** on
-disks queued by `getLocalDisksToHeal()`, which requires an **unformatted** disk or a disk carrying an
-unfinished `.healing.bin` tracker [cmd/background-newdisks-heal-ops.go:L393-L406] — neither is true for a
-disk that merely had its permissions restored, which is why no automatic heal occurred in the window.
-Objects whose write saw an offline drive are enqueued for most-recent-failure (MRF) repair at PUT time
-(`er.addPartial` / `globalMRFState.addPartialOp`) [cmd/erasure-object.go:L1566-L1585], consumed by the MRF
-`healRoutine()` [cmd/mrf.go:L220]; the on-demand admin heal is `HealHandler`
-[cmd/admin-handlers.go:L1308] (`mc admin heal`). The data scanner provides an additional, slower background
+**Code.** Objects whose write saw an offline drive are enqueued for most-recent-failure (MRF) repair at PUT
+time (`er.addPartial` / `globalMRFState.addPartialOp`) [cmd/erasure-object.go:L1566-L1585], and the MRF
+consumer `healRoutine()` [cmd/mrf.go:L220] drains the queue: it waits ~1 s after the entry was queued
+[cmd/mrf.go:L250-L254] (the comment notes this is to *"let recently failed networks reconnect"*) and then
+calls `healObject` [cmd/mrf.go:L276] — this is what rebuilds the shard automatically in the short-outage
+case, when `data1` is back in time. The background fresh-disk heal `healFreshDisk()`
+[cmd/background-newdisks-heal-ops.go:L419], scheduled by `monitorLocalDisksAndHeal()`
+[cmd/background-newdisks-heal-ops.go:L563], acts **only** on disks queued by `getLocalDisksToHeal()`, which
+requires an **unformatted** disk or one carrying an unfinished `.healing.bin` tracker
+[cmd/background-newdisks-heal-ops.go:L393-L406] — neither is true for a drive that merely had its permissions
+restored, which is why the long-outage shard is not auto-adopted for healing (the single MRF retry having
+already fired while the drive was still down). The on-demand admin heal is `HealHandler`
+[cmd/admin-handlers.go:L1308] (`mc admin heal`); the data scanner provides an additional, slower background
 heal path **(inferred, from code — not separately observed in this run)**.
 
-**Parity note (observed).** `obj-1down` remained `EcM=2, EcN=2` both during the outage and after healing.
-This is expected, not an anomaly: the availability-optimized PUT increments parity per offline drive but
-caps it at half the set (`len/2 = 2`) [cmd/erasure-object.go:L1291-L1316]; four-drive EC:2 is already at
-**maximum** parity, so there is no headroom to upgrade.
+**Parity note (observed).** The healed shards remained `EcM=2, EcN=2` (§6.6 `xl-meta` decode). This is
+expected, not an anomaly: the availability-optimized PUT increments parity per offline drive but caps it at
+half the set (`len/2 = 2`) [cmd/erasure-object.go:L1291-L1316]; four-drive EC:2 is already at **maximum**
+parity, so there is no headroom to upgrade.
 
 **Cause → effect.** Erasure coding meant the object was **reconstructable** while `data1` was down (2 data +
-2 parity, 3 of 4 shards present), so reads never failed. But its **redundancy was degraded** (a shard was
-missing). Full redundancy is restored by the heal step — here a manual `mc admin heal` — which rebuilds the
-missing shard from the survivors and writes it back to the recovered disk, returning the object to `Green`.
+2 parity, 3 of 4 shards present), so reads never failed. Its **redundancy was degraded** (a shard was
+missing) until a heal rebuilt it. The MRF retry closes that gap **automatically within ~1 s when the drive
+returns quickly** (short outage); when the drive returns later, full redundancy is restored by the next heal
+— an on-demand `mc admin heal` here — which rebuilds the missing shard from the survivors and writes it back
+to the recovered drive, returning the object to `Green`.
 
 ### Q7 — Location of the quorum decision in code
 
@@ -1033,7 +1161,7 @@ Both apply the **+1 split-brain guard**: write quorum = data blocks, **plus one*
    `StandardSCParity = 2` [cmd/erasure-server-pool.go:L700]; then `poolReadQuorums = 2` and
    `poolWriteQuorums = 2 (+1 because data == parity) = 3` [cmd/erasure-server-pool.go:L2720-L2727]. The
    per-set test `online ≥ poolWriteQuorums` [cmd/erasure-server-pool.go:L2791] logs failures with
-   `logger.FatalKind` [cmd/erasure-server-pool.go:L2794].
+   `logger.FatalKind` [cmd/erasure-server-pool.go:L2794-L2795].
 3. **Object-write site:** `defaultRQuorum()` returns `2` [cmd/erasure.go:L94-L96]; `defaultWQuorum()` returns
    `dataCount + 1 = 3` because `dataCount == defaultParityCount` [cmd/erasure.go:L85-L91]; the per-object
    rule mirrors it (`if DataBlocks == ParityBlocks { quorum++ }`) [cmd/storage-datatypes.go:L298-L308].
@@ -1091,7 +1219,7 @@ returns). Line numbers are verified against the investigated source.
                                          │                                      return errErasureWriteQuorum ── :L1308
      count online (DriveStateOk only)── :L2707-L2709                          else writeQuorum = data(+1)=3  ── :L1322-L1326
      healthy := online >= WQuorum   ── :L2791                                 erasure.Encode(..., writeQuorum) ── :L1425
-     if !healthy: log FatalKind     ── :L2794                                   multiWriter.Write:
+     if !healthy: log FatalKind     ── :L2794-L2795                             multiWriter.Write:
      "expected write quorum: 3,                                                  nilCount < wq -> reduceWriteQuorumErrs
       drives-online: 2"                                                          -> errErasureWriteQuorum
                                          │                                        ── cmd/erasure-encode.go:L61-L65
@@ -1121,25 +1249,25 @@ no +1: read quorum 2, surfaced as `InsufficientReadQuorum` [cmd/object-api-error
 | Objective / mechanism | Value | `file:line` | Evidence | Rationale |
 |-----------------------|-------|-------------|----------|-----------|
 | **Q1** health/quorum decision | healthy ⇔ every set `online ≥ 3` | `Health()` [cmd/erasure-server-pool.go:L2679]; quorum calc [L2719-L2727] | §6.1 (200, `X-Minio-Write-Quorum: 3`) | §7 Q1 |
-| **Q2** live permission-loss | keep writing (3 online) vs refuse (2 online) | PUT quorum check [cmd/erasure-object.go:L1305-L1308] | §6.2 / §6.3 | §7 Q2 |
-| **Q3** above vs below threshold | 200/PUT-ok vs 503/`SlowDownWrite`/GET-ok | `Health()` [cmd/erasure-server-pool.go:L2791,L2794] | §6.2 / §6.3 + `FatalKind` | §7 Q3 |
+| **Q2** live permission-loss | keep writing (3 online) vs refuse (2 online) | PUT quorum check [cmd/erasure-object.go:L1304-L1308] | §6.2 / §6.3 | §7 Q2 |
+| **Q3** above vs below threshold | 200/PUT-ok vs 503/`SlowDownWrite`/GET-ok | `Health()` [cmd/erasure-server-pool.go:L2791,L2794-L2795] | §6.2 / §6.3 + `FatalKind` | §7 Q3 |
 | **Q4** path-named logs & live recovery | disk named by path; offline/online monitor lines = 0 for permission fault | runtime perm map [cmd/xl-storage.go:L802-L826]; offline log [cmd/xl-storage-disk-id-check.go:L1015]; goOffline branches [L1034-L1052] | §6.4 (`endpoint="/tmp/ec/data1"`, `.healing.bin`, counts 0) | §7 Q4 — I/O/timeout route **(inferred, from code)** |
-| **Q5** self-detection | automatic; next probe (~11–15 ms), no restart/push | DiskInfo cache [cmd/xl-storage.go:L326-L359]; pollers [cmd/xl-storage-disk-id-check.go:L930], [cmd/background-newdisks-heal-ops.go:L40,L563], [cmd/erasure-sets.go:L348] | §6.5 (first 5 s poll → 200/4-online, stable through t+45s, same PID; 12/13/11 ms, prior 15/14/14, re-verify 13/13/14) | §7 Q5 — poller isolation **(inferred, from code)** |
-| **Q6** repair of outage writes | shard restored by **manual** heal; background heal conditional | `healFreshDisk()` [cmd/background-newdisks-heal-ops.go:L419]; `getLocalDisksToHeal` [L393-L406]; MRF enqueue [cmd/erasure-object.go:L1566-L1585]; `healRoutine()` [cmd/mrf.go:L220] | §6.6 (MISSING after 20s → restored by `mc admin heal`) | §7 Q6 — scanner path **(inferred, from code)** |
+| **Q5** self-detection | automatic; next probe (~11–15 ms), no restart/push | DiskInfo cache [cmd/xl-storage.go:L326-L359]; pollers [cmd/xl-storage-disk-id-check.go:L930-L931], [cmd/background-newdisks-heal-ops.go:L40,L563], [cmd/erasure-sets.go:L348] | §6.5 (first 5 s poll → 200/4-online, stable through t+45s, same PID; 12/13/11 ms, prior 15/14/14, re-verify 13/13/14) | §7 Q5 — poller isolation **(inferred, from code)** |
+| **Q6** repair of outage writes | **timing-dependent**: MRF auto-repairs if the drive returns <~1 s (short); otherwise manual/scanner heal (long) | MRF enqueue [cmd/erasure-object.go:L1566-L1585]; `healRoutine()` + ~1 s retry [cmd/mrf.go:L220-L254]; `healFreshDisk()`/`getLocalDisksToHeal` [cmd/background-newdisks-heal-ops.go:L419,L393-L406] | §6.6 (short: auto ~t+1–2 s, 3/3; long: missing t+45 s, 3/3 → `mc admin heal` `Yellow→Green`) | §7 Q6 — scanner path **(inferred, from code)** |
 | **Q7** quorum decision location | cluster: `BackendInfo`; object: `defaultWQuorum`; both +1 → 3 | quorum calc [cmd/erasure-server-pool.go:L2722-L2727]; `defaultWQuorum()` [cmd/erasure.go:L85]; `FileInfo.WriteQuorum` [cmd/storage-datatypes.go:L298-L308] | §6.1 header, §6.3 log | §7 Q7 / §8 |
 | **Q8** grounding | endpoint code/headers + real write/read at every state | `ClusterCheckHandler` [cmd/healthcheck-handler.go:L56] | §6.1–§6.6, §7 Q8 table | §7 Q8 |
 | **quorum decision** | 3 / 2 | cluster [cmd/erasure-server-pool.go:L2722-L2727]; object [cmd/erasure.go:L85-L96] | §4, §6.1 | §7 Q7 |
 | **health endpoint** | 200 / 503 / 412 + quorum headers; pre-quorum 503 branches | [cmd/healthcheck-handler.go:L32-L89], [cmd/healthcheck-router.go:L30-L44] | §5, §6.1–§6.3 | §5 |
 | **path-named logs** | disk named by path | connectDisks [cmd/erasure-sets.go:L230]; Healing [cmd/xl-storage.go:L436]; offline/online [cmd/xl-storage-disk-id-check.go:L1015,L956] | §6.4 | §7 Q4 |
-| **polling (1 s / 5 s / 10 s / 15 s)** | DiskInfo cache 1 s; 5/10/15 s pollers | [cmd/xl-storage.go:L326]; [cmd/xl-storage-disk-id-check.go:L930]; [cmd/background-newdisks-heal-ops.go:L40]; [cmd/erasure-sets.go:L348] | §6.5 | §7 Q5 |
-| **healing (`healFreshDisk`)** | conditional; shard re-created by manual heal | [cmd/background-newdisks-heal-ops.go:L419] | §6.6 | §7 Q6 |
-| **MRF** | most-recent-failure repair | enqueue [cmd/erasure-object.go:L1566-L1585]; consumer [cmd/mrf.go:L220] | §6.6 | §7 Q6 |
+| **polling (1 s / 5 s / 10 s / 15 s)** | DiskInfo cache 1 s; 5/10/15 s pollers | [cmd/xl-storage.go:L326]; [cmd/xl-storage-disk-id-check.go:L930-L931]; [cmd/background-newdisks-heal-ops.go:L40]; [cmd/erasure-sets.go:L348] | §6.5 | §7 Q5 |
+| **healing (`healFreshDisk`)** | conditional (unformatted or `.healing.bin` only); long-outage shard re-created by manual heal | [cmd/background-newdisks-heal-ops.go:L419]; gate [L393-L406] | §6.6 | §7 Q6 |
+| **MRF** | most-recent-failure repair; ~1 s retry auto-heals the short outage | enqueue [cmd/erasure-object.go:L1566-L1585]; consumer + ~1 s wait [cmd/mrf.go:L220-L254] | §6.6 (short 3/3 auto) | §7 Q6 |
 
 **Labeling summary.** Behavioral claims are backed by the observed output in §6. The statements explicitly
 labeled **(inferred, from code)** are: the `errFaultyDisk`/timeout `goOffline` route in **Q4** (only a
 permission fault, not an I/O/timeout fault, was injected); the precise per-poller re-inclusion instant in
 **Q5** (only the on-demand DiskInfo re-read was directly timed); and the background data-scanner heal path in
-**Q6** (only the manual `mc admin heal` was observed to repair the shard).
+**Q6** (both the MRF auto-repair and the manual `mc admin heal` were directly observed; only the slower background data-scanner heal path was not).
 
 ---
 
