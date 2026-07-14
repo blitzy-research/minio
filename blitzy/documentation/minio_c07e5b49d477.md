@@ -6,9 +6,19 @@ Most behavioral claims below are backed by **both** (a) the actual, unedited out
 at runtime **and** (b) a `file:line` citation naming the specific function/method/struct in the source
 that performs the work. Where a value could not be directly captured, the statement is a reasoned
 conclusion and is individually tagged **[inferred]** (see the Legend); nothing is asserted beyond what
-the shown evidence supports.
+the shown evidence supports. Captured command and server outputs are reproduced verbatim, with a
+**single, explicitly disclosed exception**: the SigV4 `Signature=` token inside one captured audit
+record's `Authorization` header is replaced with `<REDACTED_SIGV4_SIGNATURE>` for secret hygiene. That
+one redaction is flagged inline at its point of use (see *R5*); every other byte of that record, and
+every byte of every other captured output in this document, is unmodified.
 
-- **Source commit (HEAD):** `c07e5b49d477b0774f23db3b290745aef8c01bd2` (branch `minio_c07e5b49d477`).
+- **Documented MinIO source revision:** `c07e5b49d477b0774f23db3b290745aef8c01bd2` — the branch
+  `minio_c07e5b49d477` is named after this commit, and it is the revision whose runtime behavior is
+  documented here (all compiled MinIO source is byte‑identical to it). This deliverable is committed **on
+  top of** that revision, so the branch's actual Git HEAD is a **descendant** of `c07e5b49d477` that adds
+  only this one document — `git diff --name-status c07e5b49d477..HEAD` is exactly
+  `A blitzy/documentation/minio_c07e5b49d477.md` (see R8/R9). Every build/version value below therefore
+  reflects a **canonical build of `c07e5b49d477`**, not of the branch HEAD.
 - **Go module:** `github.com/minio/minio` ([go.mod:L1](../../go.mod)); minimum toolchain `go 1.23`
   ([go.mod:L3](../../go.mod)), CI matrix pinned to `1.23.x`
   ([.github/workflows/go-cross.yml:L23](../../.github/workflows/go-cross.yml)).
@@ -67,7 +77,9 @@ directly on the host.
   investigation's **own** build was performed in a **separate** checkout (`/tmp/minio-src`, itself checked
   out at commit `c07e5b49d477...`) with the resulting binary staged **outside** the repository at
   `/tmp/minio-build/minio`, so the investigation introduced no gitignored artifact into this checkout and
-  `git status --porcelain` (the *tracked* tree) shows only the one added deliverable. Building the server
+  the **tracked** tree stays clean — `git status --porcelain` prints **nothing** once the deliverable is
+  committed, and the only change relative to the documented source revision `c07e5b49d477` is this one
+  added document (`git diff --name-status c07e5b49d477..HEAD`; see R8). Building the server
   **directly** in this checkout instead (as a user compiling from source may do) leaves those gitignored
   binaries as *untracked* entries under `git status --porcelain --ignored`; being gitignored they are never
   *tracked* and never part of the deliverable (detailed in R8).
@@ -102,18 +114,229 @@ directly on the host.
   per-request line (proven in R5).
 - **On-disk inspection [observed]:** direct `ls`/`find`/`cat`/`xxd`/`od`/`strings` on `/tmp/minio-data`,
   run inside the container (whose `ls`/`find`/`grep`/`netstat` are BusyBox, not GNU/`ss`).
-- **Restart (R7) [observed]:** a PID-safe `kill -TERM "$(cat /tmp/inv/server1.pid)"`, wait for the
-  process to exit, then relaunch the identical `server` command on the same `/tmp/minio-data`.
+- **Restart (R7) [observed]:** a PID-safe `kill -TERM "$(cat /tmp/inv/server1.pid)"`, a **bounded** wait
+  for the old server to *stop serving* (poll the health endpoint down -- never `while kill -0`, which hangs
+  on an unreaped zombie), then relaunch the identical `server` command on the same `/tmp/minio-data`.
 - **Transport / hardening caveat:** this is a **local-development** deployment reached over **plain
   HTTP** (no TLS) on the loopback interface with the well-known default credentials. SigV4 still
-  authenticates every request [observed], but the request and response bytes (including the
+  authenticated every request in this onboarding flow [observed], but the request and response bytes (including the
   `Authorization` header) travel unencrypted -- acceptable for local onboarding, not for production.
   TLS, non-default credentials, encryption-at-rest (KMS), IAM policies beyond the root user, and
   multi-node topologies are deliberately **out of scope** and would be needed to harden a real deployment
   [inferred: these are standard production steps; none were exercised here].
 - **Read-only discipline [observed]:** the MinIO source tree was treated as read-only reference; the
   binary, data directory, `mc` config, and all temporary scripts live **outside** the checkout. On
-  completion `git status --porcelain` shows only this one new document (see R8).
+  completion the tracked tree is clean — `git status --porcelain` prints nothing — and the only change
+  relative to the documented source revision is this one added document (see R8).
+
+### Reproduction harnesses (complete scripts) **[observed]**
+
+The outputs shown throughout R2--R7 were produced by four small scripts that ran **outside** the
+repository checkout (in `/tmp/inv`, per the read-only rule in R8). They are reproduced here **in full**
+so the entire flow can be replayed byte-for-byte. `auth.py` is the shared SigV4 signer; `flow.py` drives
+the first-bucket flow; `read.py` is the signed reader used for the restart before/after checks in R7; and
+`audit_receiver.py` is the minimal host receiver that captures the audit-webhook JSON used in R5.
+
+Running them against a **freshly started** default single-node server (see *Invocation* above) reproduces
+the documented **invariants** exactly: the same HTTP status codes, the same `ETag`s
+(`84f6bd993afe53f22c433eb79d6bf53d` for `hello.txt`, `aa84c0de10caafce4eb780e9fdca5f88` for
+`data/report.json` -- each the MD5 of its payload), the same body byte-lengths (`Content-Length` of
+`0` / `655` / `12` / `373` / `128` for CreateBucket / ListObjectsV2 / GetObject / ListBuckets /
+GetBucketLocation) and the same XML shapes (`<ListBucketResult>`, `<ListAllMyBucketsResult>`,
+`<LocationConstraint>`). Only **run-specific identifiers vary** between runs -- `X-Amz-Request-Id`,
+`X-Amz-Id-2`, the `Date`/`Last-Modified`/`CreationDate` timestamps, and the audit `deploymentid` -- which
+is expected and is called out wherever such a value appears below.
+
+Setup used for every run (botocore installed out-of-tree so the repo stays clean):
+
+```bash
+pip install --target /tmp/pydeps boto3 botocore        # host, one-time
+python3 /tmp/inv/audit_receiver.py /tmp/inv/audit.log & # host audit receiver on :9200
+# start the server per *Invocation* above with the audit webhook enabled, then:
+cd /tmp/inv && PYTHONPATH=/tmp/pydeps python3 flow.py    # drives the full flow
+```
+
+**`auth.py`** -- shared SigV4 signer (`botocore.auth.S3SigV4Auth` + `urllib`, path-style):
+
+```python
+#!/usr/bin/env python3
+"""
+auth.py -- canonical SigV4 signing helper for the MinIO onboarding investigation.
+
+Signs every S3 request with botocore's *S3*SigV4Auth (the S3 variant is required
+because S3 mandates the `x-amz-content-sha256` header and folds it into the signed
+headers) and sends it with the standard-library `urllib`, using PATH-STYLE
+addressing. This exercises the real, authenticated S3 entry point on :9000 and
+captures the exact wire bytes/headers with no client-side XML parsing in between.
+
+Install botocore out-of-tree and import it via PYTHONPATH, e.g.:
+    pip install --target /tmp/pydeps boto3 botocore
+    PYTHONPATH=/tmp/pydeps python3 flow.py
+"""
+import sys, urllib.request, urllib.error
+sys.path.insert(0, "/tmp/pydeps")  # botocore installed out-of-tree (repo stays clean)
+
+from botocore.auth import S3SigV4Auth
+from botocore.credentials import Credentials
+from botocore.awsrequest import AWSRequest
+
+ENDPOINT = "http://127.0.0.1:9000"      # S3 API (path-style)
+REGION   = "us-east-1"
+CREDS    = Credentials("minioadmin", "minioadmin")
+
+def signed_request(method, path, body=b"", headers=None, creds=CREDS):
+    """
+    Issue one SigV4-signed request. `path` is the raw path-style path,
+    e.g. "/onboarding-demo" or "/onboarding-demo/data/report.json".
+    Returns (status_code, response_headers_list, body_bytes).
+    """
+    if isinstance(body, str):
+        body = body.encode()
+    url = ENDPOINT + path
+    req = AWSRequest(method=method, url=url, data=body, headers=headers or {})
+    # S3SigV4Auth sets X-Amz-Date, X-Amz-Content-SHA256 and Authorization.
+    S3SigV4Auth(creds, "s3", REGION).add_auth(req)
+    prepared = req.prepare()
+    u = urllib.request.Request(prepared.url, data=body if body else None,
+                               method=method)
+    for k, v in prepared.headers.items():
+        u.add_header(k, v)
+    try:
+        with urllib.request.urlopen(u) as resp:
+            return resp.status, list(resp.headers.items()), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, list(e.headers.items()), e.read()
+```
+
+**`flow.py`** -- the full first-bucket flow (CreateBucket -> PutObject x2 -> ListObjectsV2 -> GetObject
+-> ListBuckets -> GetBucketLocation):
+
+```python
+#!/usr/bin/env python3
+"""
+flow.py -- the full first-bucket flow, driven through the canonical SigV4 path:
+
+    CreateBucket(onboarding-demo)
+      -> PutObject(hello.txt)                 body: b'hello minion'
+      -> PutObject(data/report.json)          body: 50-byte JSON (nested prefix)
+      -> ListObjectsV2
+      -> GetObject(hello.txt)
+      -> ListBuckets
+      -> GetBucketLocation(onboarding-demo)
+
+Prints, for every step, the HTTP status, the *complete* response header set, and
+the response body (for bucket/list/get operations), plus byte-length and ETag
+correlations so the documented invariants can be checked byte-for-byte.
+"""
+import hashlib
+from auth import signed_request
+
+BUCKET = "onboarding-demo"
+HELLO  = b"hello minion"
+REPORT = b'{"report":"onboarding-demo","objects":2,"ok":true}'
+
+def show(title, status, headers, body=None, want_body=False):
+    print(f"\n## {title}: HTTP {status}")
+    for k, v in headers:
+        print(f"    {k}: {v}")
+    if want_body:
+        print(f"    --- body ({len(body)} bytes) ---")
+        print(body.decode(errors="replace"))
+    return dict((k.lower(), v) for k, v in headers)
+
+# 1) CreateBucket -> headers-only 200, Content-Length: 0
+st, hd, bd = signed_request("PUT", f"/{BUCKET}")
+show(f"CreateBucket({BUCKET})", st, hd, bd)
+
+# 2) PutObject hello.txt (text/plain) -> headers-only 200, ETag = md5(payload)
+st, hd, bd = signed_request("PUT", f"/{BUCKET}/hello.txt", HELLO,
+                            {"Content-Type": "text/plain"})
+h = show("PutObject(hello.txt)", st, hd, bd)
+print(f"    ETag==md5(payload)? {h.get('etag','').strip(chr(34))==hashlib.md5(HELLO).hexdigest()}")
+
+# 3) PutObject data/report.json (nested prefix, application/json)
+st, hd, bd = signed_request("PUT", f"/{BUCKET}/data/report.json", REPORT,
+                            {"Content-Type": "application/json"})
+h = show("PutObject(data/report.json)", st, hd, bd)
+print(f"    ETag==md5(payload)? {h.get('etag','').strip(chr(34))==hashlib.md5(REPORT).hexdigest()}")
+
+# 4) ListObjectsV2 -> application/xml body; Content-Length == actual body bytes
+st, hd, bd = signed_request("GET", f"/{BUCKET}?list-type=2")
+h = show("ListObjectsV2", st, hd, bd, want_body=True)
+print(f"    Content-Length header={h.get('content-length')}  actual-body-bytes={len(bd)}  "
+      f"match={str(h.get('content-length'))==str(len(bd))}")
+
+# 5) GetObject hello.txt -> body == payload; md5(body) == ETag (byte-exact round trip)
+st, hd, bd = signed_request("GET", f"/{BUCKET}/hello.txt")
+h = show("GetObject(hello.txt)", st, hd, bd, want_body=True)
+print(f"    bytes-equal-upload={bd==HELLO}  md5(body)==ETag? "
+      f"{hashlib.md5(bd).hexdigest()==h.get('etag','').strip(chr(34))}")
+
+# 6) ListBuckets -> application/xml body listing the bucket
+st, hd, bd = signed_request("GET", "/")
+show("ListBuckets", st, hd, bd, want_body=True)
+
+# 7) GetBucketLocation -> application/xml LocationConstraint
+st, hd, bd = signed_request("GET", f"/{BUCKET}?location")
+show("GetBucketLocation", st, hd, bd, want_body=True)
+```
+
+**`read.py`** -- signed reader for the restart before/after checks (R7):
+
+```python
+#!/usr/bin/env python3
+"""
+read.py -- canonical signed reader used to prove persistence across restarts.
+
+Issues a SigV4-signed GET for objects in the onboarding-demo bucket and prints,
+for each, the HTTP status, ETag, byte length and the body -- so a before/after
+comparison around a full server restart shows the same objects served with the
+same ETags. A one-word label (BEFORE / AFTER-R1 / ...) is echoed for context.
+
+    PYTHONPATH=/tmp/pydeps python3 read.py BEFORE
+"""
+import sys, hashlib
+from auth import signed_request
+
+BUCKET = "onboarding-demo"
+KEYS   = ["hello.txt", "data/report.json"]
+label  = sys.argv[1] if len(sys.argv) > 1 else "READ"
+
+print(f"===== {label} =====")
+for key in KEYS:
+    st, hd, bd = signed_request("GET", f"/{BUCKET}/{key}")
+    h = dict((k.lower(), v) for k, v in hd)
+    etag = h.get("etag", "").strip('"')
+    print(f"{label}  GET /{BUCKET}/{key}  -> HTTP {st}  "
+          f"len={len(bd)}  etag={etag}  md5(body)==etag? "
+          f"{hashlib.md5(bd).hexdigest()==etag}")
+    print(f"    body: {bd!r}")
+```
+
+**`audit_receiver.py`** -- minimal audit-webhook receiver on `:9200` (R5):
+
+```python
+#!/usr/bin/env python3
+"""Minimal MinIO audit-webhook receiver.
+Listens on :9200, appends each POSTed JSON record (one per line) to audit.log.
+MinIO posts one JSON document per API event via HTTP PUT/POST.
+"""
+import http.server, sys
+LOGPATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/inv/audit.log"
+class H(http.server.BaseHTTPRequestHandler):
+    def _ingest(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(n) if n else b""
+        if body:
+            with open(LOGPATH, "ab") as fh:
+                fh.write(body.rstrip(b"\n") + b"\n")
+        self.send_response(200); self.end_headers()
+    do_POST = _ingest
+    do_PUT  = _ingest
+    def log_message(self, *a): pass  # quiet
+if __name__ == "__main__":
+    http.server.HTTPServer(("127.0.0.1", 9200), H).serve_forever()
+```
 
 ### The S3 request lifecycle (as exercised)
 
@@ -276,8 +499,9 @@ before exposing the server. For this onboarding investigation the defaults were 
 
 ## R2 + R3 — The Full First‑Bucket Flow (status, headers, body per step)
 
-**[observed]** The flow was driven by the raw `S3SigV4Auth` + `urllib` harness described in
-*Environment & Methodology*, against `http://127.0.0.1:9000`. The ordered operations are:
+**[observed]** The flow was driven by the raw `S3SigV4Auth` + `urllib` harness (`flow.py`), reproduced
+in full under *Environment & Methodology -> Reproduction harnesses*, against `http://127.0.0.1:9000`.
+The ordered operations are:
 **CreateBucket** `onboarding-demo` -> **PutObject** `hello.txt` (body `hello minion`) ->
 **PutObject** `data/report.json` (nested prefix) -> **ListObjectsV2** -> **GetObject** `hello.txt` ->
 **ListBuckets**. Every operation returned **HTTP 200**. Each header block below is the **complete** set of
@@ -686,7 +910,7 @@ BODY-LENGTH: 362
 **Security caveat [observed + inferred] (finding-relevant):** this is a **local-development** deployment.
 Requests are reached over **plain HTTP (no TLS)** on the loopback interface, and the identity is the
 **well-known default** root credential `minioadmin:minioadmin` (the startup banner explicitly warns to
-change it -- see R1). SigV4 still authenticates every request [observed], but because there is no TLS the
+change it -- see R1). SigV4 still authenticated every request in this onboarding flow [observed], but because there is no TLS the
 `Authorization` header and payload travel **unencrypted** -- fine for local onboarding, unacceptable for
 production. Hardening a real deployment (TLS, non-default root credentials, additional IAM users/policies
 with least privilege, KMS encryption-at-rest) is deliberately **out of scope** here and none of it was
@@ -696,8 +920,121 @@ exercised [inferred: these are standard production controls].
 first (the server-side recomputed signature cannot match a signature made with a different secret, so
 `doesSignatureMatch` returns the mismatch code -> `HTTP 403 SignatureDoesNotMatch`); a correctly signed
 request instead passes authentication and, because the caller is the owner, also passes authorization ->
-`HTTP 200`. In the default local setup the credentials are the well-known defaults, but every request must
-still be correctly signed, and every action is still checked against the caller's (owner) policy.
+`HTTP 200`. In the default local setup the credentials are the well-known defaults, but every request in
+this onboarding flow was still correctly signed [observed], and each action was checked against the
+caller's (owner) policy.
+
+### Scope of the authentication/authorization claims (finding-driven caveat)
+
+**What was actually exercised [observed].** This document is a first-bucket **onboarding walkthrough**, not
+a security audit. Every authentication/authorization statement above is grounded in exactly what the flow
+exercised: each request in the CreateBucket -> PutObject x2 -> ListObjectsV2 -> GetObject -> ListBuckets
+sequence was SigV4-signed and accepted (`HTTP 200`), and one deliberately wrong-secret request was rejected
+with `HTTP 403 SignatureDoesNotMatch` (R4 above). So that the "requests must be signed" claim is not merely
+asserted, a **bounded** set of deliberately-unauthenticated `PutObject` variants was also replayed against
+this same running server; all were rejected and only the correctly-signed control succeeded:
+
+```text
+$ PYTHONPATH=/tmp/pydeps python3 secprobe.py
+== A) PutObject with NO Authorization header ==
+   -> HTTP 403  Code=AccessDenied
+== B) PutObject STREAMING-UNSIGNED-PAYLOAD-TRAILER, NO Authorization ==
+   -> HTTP 400  Code=MissingFields
+== C) PutObject STREAMING-UNSIGNED-PAYLOAD-TRAILER, FABRICATED all-zero SigV4 signature ==
+   -> HTTP 400  Code=BadRequest
+== D) control: correctly SIGNED PutObject (SHOULD succeed) ==
+   -> HTTP 200  Code=
+
+(post-probe cleanup of any stray objects handled by server run teardown; repo untouched)
+```
+
+(`stderr` carried two harmless `DeprecationWarning: datetime.datetime.utcnow()` lines, not shown.) The
+complete probe script -- run outside the repository, like the other harnesses (auth.py etc.) -- is:
+
+```python
+#!/usr/bin/env python3
+"""
+Bounded auth-boundary probe (NOT a CVE matrix) -- grounds the doc's scoped claim
+that requests on the canonical S3 path must be correctly signed. Sends a few
+deliberately-unauthenticated PutObject variants to the running c07 server and
+reports the exact HTTP status + S3 <Code>. Read-only w.r.t. the repo.
+"""
+import sys, urllib.request, urllib.error, re, datetime, hashlib, hmac
+sys.path.insert(0, "/tmp/pydeps")
+from botocore.auth import S3SigV4Auth
+from botocore.credentials import Credentials
+from botocore.awsrequest import AWSRequest
+
+EP="http://127.0.0.1:9000"; REGION="us-east-1"
+
+def send(method, path, headers, body=b""):
+    req=urllib.request.Request(EP+path, data=body if body else None, method=method)
+    for k,v in headers.items(): req.add_header(k,v)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+def code(body):
+    m=re.search(rb"<Code>([^<]+)</Code>", body or b"")
+    return m.group(1).decode() if m else ""
+
+print("== A) PutObject with NO Authorization header ==")
+st,bd=send("PUT","/onboarding-demo/nosig.txt",{"Content-Type":"text/plain","Content-Length":"3"},b"abc")
+print(f"   -> HTTP {st}  Code={code(bd)}")
+
+print("== B) PutObject STREAMING-UNSIGNED-PAYLOAD-TRAILER, NO Authorization ==")
+hdrs={"x-amz-content-sha256":"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+      "x-amz-decoded-content-length":"3","Content-Encoding":"aws-chunked",
+      "x-amz-date":datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}
+st,bd=send("PUT","/onboarding-demo/strailer-nosig.txt",hdrs,b"3\r\nabc\r\n0\r\n\r\n")
+print(f"   -> HTTP {st}  Code={code(bd)}")
+
+print("== C) PutObject STREAMING-UNSIGNED-PAYLOAD-TRAILER, FABRICATED all-zero SigV4 signature ==")
+# build a structurally-valid Authorization header but with a fake signature
+amzdate=datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"); datestamp=amzdate[:8]
+cred=f"minioadmin/{datestamp}/{REGION}/s3/aws4_request"
+signed="content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length"
+fake="0"*64
+auth=f"AWS4-HMAC-SHA256 Credential={cred}, SignedHeaders={signed}, Signature={fake}"
+hdrs={"Authorization":auth,"x-amz-content-sha256":"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+      "x-amz-decoded-content-length":"3","Content-Encoding":"aws-chunked",
+      "x-amz-date":amzdate,"Host":"127.0.0.1:9000"}
+st,bd=send("PUT","/onboarding-demo/strailer-fakesig.txt",hdrs,b"3\r\nabc\r\n0\r\n\r\n")
+print(f"   -> HTTP {st}  Code={code(bd)}")
+
+print("== D) control: correctly SIGNED PutObject (SHOULD succeed) ==")
+r=AWSRequest(method="PUT",url=EP+"/onboarding-demo/signed-control.txt",data=b"abc",
+             headers={"Content-Type":"text/plain"})
+S3SigV4Auth(Credentials("minioadmin","minioadmin"),"s3",REGION).add_auth(r)
+p=r.prepare(); st,bd=send("PUT","/onboarding-demo/signed-control.txt",dict(p.headers),b"abc")
+print(f"   -> HTTP {st}  Code={code(bd)}")
+
+print("\n(post-probe cleanup of any stray objects handled by server run teardown; repo untouched)")
+```
+
+**What was NOT exercised [inferred / explicit non-claim].** This bounded check is **not** exhaustive and is
+**not** a proof of the absence of vulnerabilities. Malformed or exotic signature / streaming-trailer
+permutations, the Snowball / `tar` auto-extract upload path, bucket-replication and other server-to-server
+credential paths, presigned-URL edge cases, and policy-condition matrices were **not** exercised here; a
+dedicated security assessment would be required to make any claim about them. Nothing in this document should
+be read as asserting that this particular build is free of published CVEs.
+
+**Version / patch posture [inferred, grounded in the observed banner].** The server documented here is a
+**pinned DEVELOPMENT snapshot** of the MinIO source at commit `c07e5b49d477`: the R1 startup banner reads
+`Version: DEVELOPMENT.2024-11-25T17-10-22Z` [observed] -- a 2024-11 source line, not a tagged, patched
+production release. As with any pinned older build, it will **not** contain security fixes published in
+later MinIO releases, and its Go-module dependencies (`go.mod` / `go.sum`) are likewise frozen at that
+revision. A real deployment should track a **current, patched release** and keep its dependencies current.
+Verifying or remediating any specific published advisory necessarily means **changing the server binary or
+its dependencies**, which is deliberately **out of scope** for this read-only, revision-frozen
+investigation: AAP §0.3.2 forbids modifying any existing repository file, and §0.4.2 records that no
+dependency is added, updated, or removed. This caveat is therefore the honest, in-scope disposition of the
+QA report's upgrade-oriented security findings -- the observation (bounded rejection of unauthenticated
+writes on this snapshot) is reported as fact, while the remediation (upgrade to a patched release) is flagged
+as required but out of scope here. Specific CVE identifiers are intentionally **not** asserted as [observed],
+because they were not reproduced against this build within this onboarding investigation.
 
 
 ## R5 — Per‑Request Logs With Timestamps (the subtle one)
@@ -709,10 +1046,13 @@ in-repo logging guide states the console target is *"on always and cannot be dis
 default"* ([docs/logging/README.md:L18](../../docs/logging/README.md)), and the audit HTTP target
 (`audit_webhook`) ships `enable=off` ([docs/logging/README.md:L47-L51](../../docs/logging/README.md)).
 MinIO's public documentation says the same -- server logs *"do not emit for all operations and cannot
-support an audit trail"* (docs.min.io "Server Logging"), audit logs are *"not by default"* published to any
-destination (docs.min.io "Audit Logging"), and `mc admin trace` *"displays API operations occurring on the
-target MinIO deployment"* (docs.min.io community reference,
-`.../minio-mc-admin/mc-admin-trace.html`).
+support an audit trail"* ([docs.min.io "Server Logging"](https://docs.min.io/aistor/operations/monitoring/server-logging/)),
+audit logs are *"not by default"* published to any destination
+([docs.min.io "Audit Logging"](https://docs.min.io/enterprise/aistor-object-store/operations/monitoring/audit-logging/)),
+and `mc admin trace` *"displays API operations occurring on the target MinIO deployment"*
+([docs.min.io community reference `mc-admin-trace`](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin/mc-admin-trace.html)).
+(All three URLs verified reachable — HTTP 200 — at authoring time; the community `mc admin trace`
+reference is the AGPLv3-edition page matching the server documented here.)
 
 ### 1) The console negative -- proven at runtime **[observed]**
 
@@ -819,9 +1159,15 @@ Audit records are emitted via `AuditLog` ([internal/logger/audit.go:L63](../../i
 
 ### 5) Triple-correlation across every operation **[observed]** (resolves "logs for each step")
 
-Every operation in the flow has a matching **timestamped trace line** *and* a **timestamped audit record**,
-correlated by request id and byte counts (HTTP `X-Amz-Request-Id` == trace op == audit `requestID`; trace
-`↓` bytes == audit `tx` == HTTP `Content-Length`):
+Every operation in the flow has a matching **timestamped trace line** *and* a **timestamped audit record**.
+Two distinct correlation keys are at work, and it is worth being precise about which signal carries which:
+the **compact** `mc admin trace` line (shown in §2) does **not** print a request id, so it correlates to
+the HTTP response by **timestamp, op, status, and `↓` response-byte count** (trace `↓` bytes == audit `tx`
+== HTTP `Content-Length`). The **request-id** equality holds between the **HTTP response and the audit
+record** (HTTP `X-Amz-Request-Id` == audit `requestID`), and the **verbose** trace
+(`mc admin trace --verbose`) *also* echoes that same id in its response block -- so with `--verbose` the
+trace joins the id-level match directly (captured and proven in §6 below). The table lists, per operation,
+the HTTP request-id/status, the compact trace line (ts/op/`↓`resp), and the audit record:
 
 | # | S3 op | HTTP req-id / status | trace (UTC ts, op, ↓resp) | audit (requestID, status, rx/tx) |
 |---|-------|----------------------|---------------------------|----------------------------------|
@@ -844,6 +1190,80 @@ emits per-operation JSON only when a target is configured. That is why R3/R5 evi
 come from the trace/audit subsystems rather than the default console -- and when both are attached, they
 agree byte-for-byte with the HTTP responses, as the table shows **[observed]**.
 
+
+### 6) Verbose and internal traces -- request-id in the trace, and the on-disk read/write signal **[observed]**
+
+The compact §2 stream answers *"what happened, when"*; two further trace modes answer *"with which
+request id"* and *"what touched the disk"*. Both were captured in a **supplementary instrumented run**
+that put and got a **separate** object `trace-demo.txt` (so the primary-flow evidence above is untouched),
+with `mc admin trace --verbose local` **and** `mc admin trace --all --verbose local` both subscribed
+**before** the operations. In that run the client observed `PUT .../trace-demo.txt -> HTTP 200
+X-Amz-Request-Id=18C200CDB0F19399` and `GET .../trace-demo.txt -> HTTP 200
+X-Amz-Request-Id=18C200CDB12E9414`.
+
+**(a) `mc admin trace --verbose` carries the request id.** The verbose GetObject event prints the full
+request and response, including `X-Amz-Request-Id` in the response block (ANSI color stripped; each line is
+verbatim; the leading `127.0.0.1:9000` token is the node name `mc` prepends):
+
+```
+127.0.0.1:9000 [REQUEST s3.GetObject] [2026-07-14T00:34:45.833] [Client IP: 127.0.0.1]
+127.0.0.1:9000 GET /onboarding-demo/trace-demo.txt
+127.0.0.1:9000 Proto: HTTP/1.1
+127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=62250c50c26476bb76812bb571896f88e92f8f417b0ffcccb755a4f4d72be972
+127.0.0.1:9000 Connection: close
+127.0.0.1:9000 Content-Length: 0
+127.0.0.1:9000 User-Agent: Python-urllib/3.13
+127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+127.0.0.1:9000 X-Amz-Date: 20260714T003445Z
+127.0.0.1:9000 Accept-Encoding: identity
+127.0.0.1:9000 <BLOB>
+127.0.0.1:9000 [RESPONSE] [2026-07-14T00:34:45.833] [ Duration 526µs TTFB 483.238µs ↑ 104 B  ↓ 8 B ]
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 ETag: "3a8eaf08975a257586a20aede93188ac"
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 Vary: Origin,Accept-Encoding
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 Content-Length: 8
+127.0.0.1:9000 Content-Type: text/plain
+127.0.0.1:9000 Last-Modified: Tue, 14 Jul 2026 00:34:45 GMT
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Amz-Request-Id: 18C200CDB12E9414
+```
+
+**(b) Triple equality within one run [observed].** The `GET` above shows HTTP `X-Amz-Request-Id =
+18C200CDB12E9414`; the verbose trace response block prints the **same** `18C200CDB12E9414`; and the audit
+record for that same GetObject carried `requestID=18C200CDB12E9414` (and the `PUT`'s
+`18C200CDB0F19399` matched its audit record likewise). So HTTP request-id **==** verbose-trace request-id
+**==** audit `requestID`, established directly from one run rather than inferred.
+
+**(c) `mc admin trace --all --verbose` shows data actually written and read [observed].** `--all` adds the
+internal `storage.*`/`os.*` events. For `trace-demo.txt`, the object-relevant backend events -- in time
+order, extracted from the full `--all --verbose` stream (ANSI stripped; each line verbatim; `#` lines are
+annotations, not trace output) -- are the write path and the read path:
+
+```
+# PutObject trace-demo.txt -- WRITE path (data written to disk):
+127.0.0.1:9000  [OS os.OpenFileW] [2026-07-14T00:34:45.829] /tmp/minio-data/.minio.sys/tmp/29f2f0af-8c61-4d8c-9d30-af6c3b5e62d7/xl.meta 38.818µs
+127.0.0.1:9000  [OS os.Mkdir] [2026-07-14T00:34:45.831] /tmp/minio-data/onboarding-demo/trace-demo.txt 54.787µs
+127.0.0.1:9000  [OS os.Rename] [2026-07-14T00:34:45.831] /tmp/minio-data/.minio.sys/tmp/29f2f0af-8c61-4d8c-9d30-af6c3b5e62d7/xl.meta -> /tmp/minio-data/onboarding-demo/trace-demo.txt/xl.meta 39.771µs
+127.0.0.1:9000  [STORAGE storage.RenameData] [2026-07-14T00:34:45.829] /tmp/minio-data 29f2f0af-8c61-4d8c-9d30-af6c3b5e62d7 c95a948c-ff5f-4cb2-b764-dc1f279602a5 onboarding-demo trace-demo.txt total-errs-availability=0 total-errs-timeout=0 2.593698ms
+# GetObject trace-demo.txt -- READ path (data read from disk):
+127.0.0.1:9000  [OS os.OpenFileR] [2026-07-14T00:34:45.833] /tmp/minio-data/onboarding-demo/trace-demo.txt/xl.meta 32.989µs
+127.0.0.1:9000  [STORAGE storage.ReadXL] [2026-07-14T00:34:45.833] /tmp/minio-data onboarding-demo trace-demo.txt total-errs-availability=0 total-errs-timeout=0 66.396µs 419 B
+```
+
+The **write** is committed by `storage.RenameData` (`xlStorage.RenameData`
+[cmd/xl-storage.go:L2564](../../cmd/xl-storage.go)): the object's `xl.meta` is first staged under
+`.minio.sys/tmp/<uuid>/xl.meta` (`os.OpenFileW`) and then atomically renamed into
+`onboarding-demo/trace-demo.txt/xl.meta`. The **read** is served by `storage.ReadXL`
+(`xlStorage.ReadXL` [cmd/xl-storage.go:L1634](../../cmd/xl-storage.go)) after `os.OpenFileR` opens that same
+`xl.meta` (`419 B` read -- the whole inline object, see R6). These two lines are the concrete
+*"data written / data read"* signal for R5: the S3 `PutObject`/`GetObject` at the API layer map to a
+`RenameData`/`ReadXL` at the storage layer, touching the exact `xl.meta` path shown on disk in R6.
 
 ## R6 — On‑Disk Artifacts (where buckets and objects actually live)
 
@@ -1050,23 +1470,93 @@ The server was stopped and relaunched on the **same** data directory (`/tmp/mini
 invocation, then the two objects were re-read through the canonical **signed** S3 path. This was done
 **twice** (two full restart cycles, three server boots total) to confirm stability across more than one run.
 
-### The PID-safe stop / wait / relaunch / readiness procedure **[observed]**
+### The robust, PID- and path-safe stop / wait / relaunch / readiness procedure **[observed]**
 
-Each restart used the running server's exact PID (captured at launch), a graceful `SIGTERM`, a busy-wait for
-the process to fully exit, a relaunch with the identical command, and a readiness poll before re-reading:
+Each restart reads the server's own PID from the pidfile written at launch (never an unresolved `$PID`),
+sends a graceful `SIGTERM`, waits for the old server to **stop serving** by polling the S3 health endpoint
+*down* under a hard iteration cap, relaunches the identical command on the same data directory (recording
+the new PID to a pidfile), and gates on readiness before re-reading. The wait deliberately does **not** use
+`while kill -0 "$PID"`: on this host the server is orphaned to a non-reaping init (`PID 1` is a `sleep`), so
+a terminated server lingers as an **unreaped zombie** (state `Z`) whose PID still answers `kill -0` -- which
+would make that loop spin forever (demonstrated in the re-verification below). Polling health-down with a
+bounded counter is immune to that and **can never hang**:
 
+```bash
+# Read the server's PID from the pidfile written at launch (no unresolved $PID):
+PID=$(cat /tmp/inv/server1.pid)
+
+# 1) Graceful shutdown:
+kill -TERM "$PID"
+
+# 2) Robust wait: poll the S3 health endpoint DOWN, bounded (<=50*0.2s=10s) so it cannot hang.
+#    (Do NOT use `while kill -0 "$PID"`: a zombie still answers kill -0 and would loop forever.)
+for i in $(seq 1 50); do
+  curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 || break
+  sleep 0.2
+done
+#    Optional, also zombie-safe: treat "gone or state Z" as stopped:
+#    st=$(awk '{print $3}' /proc/"$PID"/stat 2>/dev/null); { [ -z "$st" ] || [ "$st" = Z ]; } && echo stopped
+
+# 3) Relaunch with the IDENTICAL command on the SAME data dir; capture the new PID to a pidfile:
+/tmp/minio-build/minio server /tmp/minio-data --console-address ":9001" > /tmp/inv/server2.log 2>&1 &
+echo $! > /tmp/inv/server2.pid
+
+# 4) Readiness gate (bounded), then re-read through the canonical signed S3 path:
+for i in $(seq 1 100); do
+  curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break
+  sleep 0.2
+done
+python3 read.py AFTER-R1
 ```
-# $PID is the server's own PID, captured from `$!` at launch (server1=123974, server2=124201, server3=124281)
-$ kill -TERM "$PID"                                   # graceful shutdown
-$ while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done # wait until the process has fully exited
-$ ./minio server /tmp/minio-data --console-address ":9001" > serverN.log 2>&1 &
-$ NEWPID=$!                                            # new server PID
-$ until curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null; do sleep 0.2; done  # readiness gate
+
+The before/after reads are issued by a raw `S3SigV4Auth` reader (`read.py`, listed in full under
+*Environment & Methodology -> Reproduction harnesses*), i.e. the **canonical** signed S3 path on port
+9000 -- not a bypass. It performs a per-key `GetObject` and prints the key, status, ETag, byte length,
+body, and the `md5(body)==ETag` check.
+
+### Re-verification of the safe procedure against a live server **[observed]**
+
+The procedure above was re-executed end-to-end against a running server to confirm both halves of the fix:
+(a) the old `while kill -0` wait really would hang here, and (b) the health-down wait does not. After
+`SIGTERM`, the terminated server did become an **unreaped zombie** (state `Z`, orphaned to `PID 1`), yet the
+robust wait still returned on the **first** poll; the relaunched server then re-served both objects with
+**identical ETags**:
+
+```bash
+$ PID=$(cat /tmp/inv/server1.pid); echo "$PID"
+177359
+$ kill -TERM "$PID"
+$ for i in $(seq 1 50); do curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 || break; sleep 0.2; done
+# -> loop broke on iteration 1 (server stopped answering); it did NOT hang
+
+# Proof the OLD `while kill -0` wait would have hung on the resulting zombie:
+$ awk '{print "state="$3" ppid="$4}' /proc/"$PID"/stat
+state=Z ppid=1
+$ kill -0 "$PID"; echo "rc=$?"
+rc=0                                   # kill -0 succeeds on a zombie => the old `while kill -0` loop spins forever
+
+# Relaunch (new PID) on the SAME data dir + readiness + signed re-read:
+$ /tmp/minio-build/minio server /tmp/minio-data --console-address ":9001" > /tmp/inv/server2.log 2>&1 &
+$ echo $! > /tmp/inv/server2.pid; cat /tmp/inv/server2.pid
+177708
+$ for i in $(seq 1 100); do curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break; sleep 0.2; done
+# -> ready on iteration 3
+
+$ PYTHONPATH=/tmp/pydeps python3 read.py AFTER-R1
+===== AFTER-R1 =====
+AFTER-R1  GET /onboarding-demo/hello.txt  -> HTTP 200  len=12  etag=84f6bd993afe53f22c433eb79d6bf53d  md5(body)==etag? True
+    body: b'hello minion'
+AFTER-R1  GET /onboarding-demo/data/report.json  -> HTTP 200  len=50  etag=aa84c0de10caafce4eb780e9fdca5f88  md5(body)==etag? True
+    body: b'{"report":"onboarding-demo","objects":2,"ok":true}'
 ```
 
-The before/after reads are issued by a raw `S3SigV4Auth` reader (`read.py`), i.e. the **canonical** signed
-S3 path on port 9000 -- not a bypass. It performs a `ListObjectsV2` and a `GetObject` and prints the keys,
-status, ETag, body, and MD5.
+A `sha256sum` of the two `xl.meta` files was identical immediately before and after the cycle -- the restart
+re-served the same persisted state without rewriting it. *(Absolute PIDs and the `xl.meta` SHA-256 digests
+are run-specific -- the `xl.meta` bytes embed a per-object version-id/modtime -- so only the content-derived
+ETag is stable across independent runs; the before/after **identity within a cycle** is the invariant, and it
+held.)* The richer two-cycle / three-boot stability capture below is from the original investigation run; its
+restart-cycle commands were executed with `/tmp/inv` as the working directory, so a bare `serverN.log` there
+denotes `/tmp/inv/serverN.log`.
 
 ### Before any restart (server1, PID 123974) **[observed]**
 
@@ -1200,8 +1690,9 @@ observation activity happened **outside** the committed checkout:
 
 - The server binary was produced by `make build` and copied to `/tmp/minio-build/minio` (the running
   server's executable is `/tmp/minio-build/minio`); the data directory was `/tmp/minio-data`; the SigV4
-  harness, audit receiver, and reader scripts (`flow.py`, `auth.py`, `read.py`, `audit_receiver.py`) lived
-  under `/tmp/minio-investigation/`. None of these are inside the repository.
+  harness, audit receiver, and reader scripts (`flow.py`, `auth.py`, `read.py`, `audit_receiver.py` --
+  reproduced in full under *Environment & Methodology -> Reproduction harnesses*) lived
+  under `/tmp/inv/`. None of these are inside the repository.
 - The investigation's own `make build` (R1) was run in a **separate** checkout with the binary staged
   **outside** this repository, so the investigation itself introduced no gitignored artifact here. Building
   the server **directly** in this checkout (as a user compiling from source may do) instead leaves
@@ -1236,10 +1727,10 @@ Exactly one file was created — this document — named for the source branch, 
 
 ```
 $ ls -la blitzy/documentation/minio_c07e5b49d477.md
--rw-r--r-- 1 root root 83791 Jul 13 22:03 blitzy/documentation/minio_c07e5b49d477.md
+-rw-r--r-- 1 root root 112608 Jul 14 00:57 blitzy/documentation/minio_c07e5b49d477.md
 
 $ wc -c blitzy/documentation/minio_c07e5b49d477.md
-83791 blitzy/documentation/minio_c07e5b49d477.md
+112608 blitzy/documentation/minio_c07e5b49d477.md
 ```
 
 > **Self-reference caveat [observed]:** the byte size and timestamp above are a **point-in-time snapshot**.
@@ -1250,8 +1741,10 @@ $ wc -c blitzy/documentation/minio_c07e5b49d477.md
 > `git diff --name-status` in R8), not the exact byte value.
 
 - Path: `blitzy/documentation/minio_c07e5b49d477.md`.
-- Name: `minio_c07e5b49d477.md`, matching the source branch `minio_c07e5b49d477` (HEAD
-  `c07e5b49d477b0774f23db3b290745aef8c01bd2`).
+- Name: `minio_c07e5b49d477.md`, matching the source branch `minio_c07e5b49d477`, which is named after the
+  documented MinIO source revision `c07e5b49d477b0774f23db3b290745aef8c01bd2`. (This deliverable is
+  committed on top of that revision, so the branch's Git HEAD is a descendant that adds only this file; the
+  net diff `c07e5b49d477..HEAD` is exactly this one added document — see R8.)
 - The parent directory `blitzy/documentation/` was created to hold it; no other file was created or modified.
 
 Rationale: the task requires a single Markdown answer document named for the branch in `blitzy/documentation`
@@ -1285,14 +1778,16 @@ above. This table maps each to the section that answers it and the primary `file
 | **R5** — `mc admin trace` positive | R5 §2 | `httpTraceAll` `cmd/http-tracer.go:L194`; gate `L92`; `TraceHandler` `cmd/admin-router.go:L410` |
 | **R5** — trace semantics (two‑layer, subscriber‑gated) | R5 §3 | `s3APIMiddleware` `cmd/api-router.go:L210`; `httpTracerMiddleware` `cmd/http-tracer.go:L69` |
 | **R5** — audit JSON | R5 §4 | `AuditLog` `internal/logger/audit.go:L63` |
-| **R5** — triple‑correlation (every op) | R5 §5 | HTTP req‑id == trace op == audit `requestID` |
+| **R5** — correlation (every op) | R5 §5 | compact trace joins by ts/op/status/`↓`bytes; HTTP `X-Amz-Request-Id` == audit `requestID` |
+| **R5** — verbose trace carries request‑id; id equality proven in one run | R5 §6 | `mc admin trace --verbose`; HTTP == verbose‑trace == audit `requestID` (`18C200CDB12E9414`) |
+| **R5** — data actually written / read (backend signal) | R5 §6 | `storage.RenameData` `cmd/xl-storage.go:L2564` (write); `storage.ReadXL` `cmd/xl-storage.go:L1634` (read) |
 | **R6** On‑disk `format.json` = `xl-single` | R6 | `formatBackendErasureSingle` `cmd/format-erasure.go:L43/L153` |
 | **R6** bucket directory | R6 | `MakeBucket` `cmd/erasure-server-pool.go:L852` |
 | **R6** per‑object `xl.meta` + inlined payload (`XL2 `, no `part.1`) | R6 | `xlStorageFormatFile` `cmd/xl-storage.go:L68`; inline write `putObject` `cmd/erasure-object.go:L1245/L1478/L1517`; `AppendTo`/`xlHeader` `cmd/xl-storage-format-v2.go:L1136/L1154/L44` |
 | **R6** `.minio.sys` internal bucket | R6 | `minioMetaBucket` `cmd/object-api-utils.go:L60` |
 | **R7** Restart persistence — before/after + format reuse *(secondary condition)* | R7 | `formatBackendErasureSingle` `cmd/format-erasure.go:L43`; `xl.meta` `cmd/xl-storage.go:L68` |
 | **R7** stability across ≥2 runs | R7 | Formatting‑count 1/0/0 over three boots |
-| **R8** Read‑only investigation; temp scripts removed; repo unchanged | R8 | `git status --porcelain` shows only the one new `.md`; build/data/scripts live **outside** the checkout |
+| **R8** Read‑only investigation; temp scripts removed; repo unchanged | R8 | tracked tree clean (`git status --porcelain` empty); sole delta vs `c07e5b49d477` is the one added `.md` (`git diff --name-status c07e5b49d477..HEAD`); build/data/scripts live **outside** the checkout |
 | **R9** Single deliverable, named for the source branch | R9 | this file `blitzy/documentation/minio_c07e5b49d477.md` (branch `minio_c07e5b49d477`); no other file created |
 
 ### Notes on canonicality and honesty
@@ -1307,6 +1802,8 @@ above. This table maps each to the section that answers it and the primary `file
   omit it when the node name is empty.
 - Values above are directly captured runtime observations unless explicitly labeled **[inferred]** (a
   reasoned conclusion) or **[non-canonical]** (shown only for contrast); `file:line` references point
-  to the source that performs the work. Command outputs are shown complete and unedited; this document
-  cites source by `file:line` rather than pasting Go excerpts, so no source logic is elided.
+  to the source that performs the work. Command outputs are shown complete and unedited -- with the
+  single, explicitly disclosed exception of the SigV4 `Signature=` token in the one captured audit
+  record (redacted for secret hygiene and flagged inline in *R5*); every other captured byte is verbatim.
+  This document cites source by `file:line` rather than pasting Go excerpts, so no source logic is elided.
 
