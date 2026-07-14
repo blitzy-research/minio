@@ -8,7 +8,7 @@ This document answers, with live runtime evidence and exact `file:line` code ref
 
 **Headline finding:** MinIO does **not** silently degrade — it enforces a **hard erasure-coding quorum**. For a 2-data/2-parity 4-drive set the thresholds are **write quorum = 3** and **read quorum = 2**. With **3 of 4** drives online (one drive lost) MinIO **quietly adapts and keeps writing** (health `200`, `PUT` succeeds). Dropping to **2 of 4** drives online (a second drive lost) crosses below write quorum: the `/minio/health/cluster` endpoint returns **HTTP 503** and S3 `PUT` is refused with **`SlowDownWrite`** ("Resource requested is unwritable, please reduce your request rate"), **while reads still succeed** because 2 online still satisfies read quorum 2. When permissions are restored, the drive is detected **automatically** by background polling (no manual push required), and objects written during the outage are **reconstructed onto the returned drive** by the heal process (Reed-Solomon rebuild from the surviving data + parity shards).
 
-> **Grounding & scope.** Every behavioral claim below is paired with the *actual, unedited* output captured from the running server; every code claim carries an exact `file:line` and names the responsible function/struct. Statements derived only from reading code (not observed at runtime) are explicitly labeled **[inferred]**. The authoritative source for this document is *this open-source checkout's code plus the observed runtime output*; commercial MinIO **AIStor** behavior (e.g., a "48-hour offline" heal rule) is called out as a caveat and is **not** asserted for this build. This was a read-only investigation: all build/run/data artifacts lived outside the checkout and were removed afterward — the repository is left byte-for-byte unchanged except for this document.
+> **Grounding & scope.** Every behavioral claim below is paired with the *actual* output captured from the running server — shown **verbatim** where a block is labeled *unedited*/*verbatim*, or **lightly annotated/summarized** for readability where the block's label says so; every code claim carries an exact `file:line` and names the responsible function/struct. Statements derived only from reading code (not observed at runtime) are explicitly labeled **[inferred]**. The authoritative source for this document is *this open-source checkout's code plus the observed runtime output*; commercial MinIO **AIStor** behavior (e.g., a "48-hour offline" heal rule) is called out as a caveat and is **not** asserted for this build. This was a read-only investigation: all build/run/data artifacts lived outside the checkout and were removed afterward — the repository is left byte-for-byte unchanged except for this document.
 
 ## TL;DR — direct answers
 
@@ -56,7 +56,7 @@ The binary is invoked by its **absolute path** (`/tmp/minio_bin`), so the build 
 
 ### Deployment shape
 
-A single-node **4-drive erasure set** over four temporary directories located **outside** the repository checkout. The unedited startup log confirmed the layout:
+A single-node **4-drive erasure set** over four temporary directories located **outside** the repository checkout. The startup log confirmed the layout (relevant lines):
 
 ```
 INFO: Formatting 1st pool, 1 set(s), 4 drives per set.
@@ -93,7 +93,7 @@ All build, run, and data artifacts (the binary at `/tmp/minio_bin`, the data dir
 
 ## Observed scenario matrix (S0-S3)
 
-All values were captured from the running non-root server via the HTTP health endpoints (`curl`) and `boto3` `PUT`/`GET`/`LIST`. The full, unedited transcript for each state follows the table.
+All values were captured from the running non-root server via the HTTP health endpoints (`curl`) and `boto3` `PUT`/`GET`/`LIST`. A representative, lightly annotated transcript for each state follows the table — health-endpoint responses are grouped under `#` labels rather than repeating each full `curl` invocation, and intermediate poll lines are elided where marked. (The fully raw, `$ curl …`-prefixed capture is shown for **S0** and in **Q1**.)
 
 | Scenario | Drives online | `/minio/health/cluster` | `/minio/health/cluster/read` | S3 `PUT` |
 |----------|---------------|-------------------------|------------------------------|----------|
@@ -120,7 +120,7 @@ X-Minio-Storage-Class-Defaults: false
 [put_object] OK key=obj-S0 ETag="b9d876737c5acc8aa111c1e1282be1cd" status=200
 ```
 
-### S1 — Lose 1 drive (`chmod 000 /tmp/minio_data/d4`, 3 / 4 online) — observed output (unedited)
+### S1 — Lose 1 drive (`chmod 000 /tmp/minio_data/d4`, 3 / 4 online) — observed output (annotated)
 
 ```
 $ chmod 000 /tmp/minio_data/d4
@@ -137,7 +137,7 @@ HTTP 200
 
 With one drive revoked, **3 of 4** drives remain online. `3 ≥ write quorum 3`, so the cluster stays writable-healthy (`200`) and the `PUT` of `obj-S1` succeeds. MinIO **quietly adapts and keeps writing**.
 
-### S2 — Lose a 2nd drive (`chmod 000 /tmp/minio_data/d3`, 2 / 4 online) — observed output (unedited)
+### S2 — Lose a 2nd drive (`chmod 000 /tmp/minio_data/d3`, 2 / 4 online) — observed output (annotated)
 
 ```
 $ chmod 000 /tmp/minio_data/d3
@@ -161,14 +161,14 @@ This is the crux of the "hard line" behavior. With a **second** drive revoked, o
 - **Reads survive.** `2 ≥ read quorum 2`, so `/minio/health/cluster/read` stays `200`, and both `GET obj-S0` and `LIST` still succeed.
 - Note that `obj-S2` is **absent** from the listing (`['obj-S0', 'obj-S1']`) precisely because its `PUT` was rejected — the failure is real, not cosmetic.
 
-### S3 — Restore (`chmod 755`, 4 / 4 online) — observed output (unedited)
+### S3 — Restore (`chmod 755`, 4 / 4 online) — observed output (annotated; intermediate poll lines elided)
 
 ```
 $ chmod 755 /tmp/minio_data/d3 /tmp/minio_data/d4
 # t+1s and continuously through t+24s, with NO manual push (no 'mc admin heal'):
 cluster HTTP 200
 t+3s  /minio/health/cluster => HTTP 200
-...
+# … intermediate polls between t+3s and t+24s elided — every one returned HTTP 200 …
 t+24s /minio/health/cluster => HTTP 200
 # headers after restore:
 HTTP/1.1 200 OK
@@ -219,7 +219,7 @@ The HTTP handlers translate the result:
 
 **Direct answer.** It **quietly adapts and keeps writing.** With 3 of 4 drives online (still ≥ write quorum 3), the cluster stays writable-healthy and writes succeed — there is no error and no manual intervention.
 
-**Observed evidence (unedited).** The S1 transcript, immediately after revoking one drive:
+**Observed evidence (annotated).** The S1 transcript, immediately after revoking one drive:
 
 ```
 $ chmod 000 /tmp/minio_data/d4
@@ -244,7 +244,7 @@ HTTP 200
 
 **Direct answer.** **Above threshold (3 online): writes continue** (`/cluster` `200`, `PUT` OK). **Below threshold (2 online): writes are refused** — `/cluster` returns **503** and the S3 `PUT` fails with **`SlowDownWrite`** — **while reads still succeed** (`/cluster/read` `200`, `GET`/`LIST` OK).
 
-**Observed evidence (unedited).** S1 (above, 3/4) versus S2 (below, 2/4), side by side:
+**Observed evidence (annotated).** S1 (above, 3/4) versus S2 (below, 2/4), side by side:
 
 *Above threshold — S1 (3/4 online):*
 
@@ -312,14 +312,14 @@ The message names the drive by its **full path** (`/tmp/minio_data/d4/.minio.sys
 
 **Direct answer.** **It is detected automatically, by background polling — no manual push is required.** A background monitor periodically re-probes endpoints and **reconnects** the ones that come back (reloading their `format.json` and re-placing the live disk); a separate background loop then **heals** any disk that reconnection flagged as fresh/unformatted. `mc admin heal` exists only as an *optional accelerator*, not as a prerequisite for detection.
 
-**Observed evidence (unedited).** After `chmod 755` restored the two drives, the cluster returned to healthy on its own, with **no** `mc admin heal` or any other manual action:
+**Observed evidence (annotated; intermediate poll lines elided).** After `chmod 755` restored the two drives, the cluster returned to healthy on its own, with **no** `mc admin heal` or any other manual action:
 
 ```
 $ chmod 755 /tmp/minio_data/d3 /tmp/minio_data/d4
 # t+1s and continuously through t+24s, with NO manual push (no 'mc admin heal'):
 cluster HTTP 200
 t+3s  /minio/health/cluster => HTTP 200
-...
+# … intermediate polls between t+3s and t+24s elided — every one returned HTTP 200 …
 t+24s /minio/health/cluster => HTTP 200
 ```
 
@@ -340,7 +340,7 @@ In short, the two form a **producer → consumer pipeline**: the 15 s monitor *d
 
 **Direct answer.** They are **reconstructed onto the returned drive by the heal process** — a Reed-Solomon rebuild of the missing shard from the surviving data + parity shards. The background heal is slow; `mc admin heal` (or its admin API equivalent) accelerates it. This was **observed end-to-end**: the object written while `d4` was offline was later present on all four drives, with its `d4` shard reconstructed.
 
-**Observed evidence (unedited).** `obj-S1` was `PUT` during S1 while `d4` was revoked, and initially existed only on `d1`/`d2`/`d3` (missing on `d4`) — confirmed on disk several minutes after `d4` was restored (the slow background heal had not yet caught up). Triggering an explicit heal (the canonical `mc admin heal` equivalent) completed the reconstruction:
+**Observed evidence (heal summary — distilled from the admin heal-status API response; `clientToken` abbreviated).** `obj-S1` was `PUT` during S1 while `d4` was revoked, and initially existed only on `d1`/`d2`/`d3` (missing on `d4`) — confirmed on disk several minutes after `d4` was restored (the slow background heal had not yet caught up). Triggering an explicit heal (the canonical `mc admin heal` equivalent) completed the reconstruction:
 
 ```
 $ # canonical 'mc admin heal' equivalent via the admin API:
@@ -402,7 +402,7 @@ The same arithmetic governs the health verdict inside `Health()`: `poolWriteQuor
 - **Automatic detection** was demonstrated by `/cluster` recovering to 200 within ~1 s of `chmod 755` with no manual command. Detection is driven by the live per-request health re-evaluation plus the 15 s endpoint-reconnect monitor `monitorAndConnectEndpoints()`/`connectDisks()` [`cmd/erasure-sets.go:283,194`]; the separate 10 s `monitorLocalDisksAndHeal()` [`cmd/background-newdisks-heal-ops.go:563`] heals already-queued fresh/unformatted disks (see **Q5**).
 - **Outage-era repair** was demonstrated by `obj-S1` being reconstructed onto `d4` after heal (before/after on-disk table in **Q6** / **Appendix A4**).
 
-The complete scenario matrix (S0-S3) and the raw log/command transcripts in the **Appendix** are the primary evidence; the code citations explain *why* each observation occurred.
+The complete scenario matrix (S0-S3) and the log/command transcripts in the **Appendix** (raw for A1-A3; distilled/annotated for A4-A5) are the primary evidence; the code citations explain *why* each observation occurred.
 
 
 ---
@@ -440,7 +440,9 @@ MinIO's public `docs.min.io` pages document the commercial **AIStor** product, i
 
 ---
 
-## Appendix: raw captured output (unedited)
+## Appendix: captured output (raw logs A1–A3; distilled/annotated summaries A4–A5)
+
+Blocks **A1–A3** are raw, verbatim log/command captures (the lines shown are unaltered). Blocks **A4–A5** are **distilled or annotated summaries** — labeled as such in place — not byte-for-byte tool output.
 
 ### A1 — Startup log (deployment shape + version)
 
@@ -458,7 +460,7 @@ version DEVELOPMENT.GOGET
 
 The on-disk `format.json` showed `"format":"xl"`, one set listing 4 drive UUIDs, and `"distributionAlgo":"SIPMOD+PARITY"`.
 
-### A2 — By-path permission-denied block (API: SYSTEM.internal), verbatim
+### A2 — By-path permission-denied block (emitted via `internalLogIf`), verbatim (leading `API:` header line omitted)
 
 ```
 Time: 18:28:27 UTC 07/14/2026
@@ -495,7 +497,7 @@ Error: Write quorum could not be established on pool: 0, set: 0, expected write 
 
 The same error also appeared with the frame `cmd/healthcheck-handler.go:108:cmd.ClusterReadCheckHandler()` — `Health()` logs the write-quorum failure regardless of the calling handler, yet the read handler still returned `200` because the read-quorum field (`HealthyRead`) was satisfied at 2 online drives.
 
-### A4 — Q6 heal transcript + before/after on-disk distribution
+### A4 — Q6 heal summary (distilled from the admin heal-status API response; `clientToken` abbreviated) + before/after on-disk distribution
 
 ```
 $ # canonical 'mc admin heal' equivalent via the admin API:
@@ -518,7 +520,8 @@ Before/after on-disk distribution (one `xl.meta` per shard location):
 
 ```
 $ whoami
-root (uid=0)
+root
+# process uid = 0 (root) — POSIX permission bits are bypassed
 $ chmod 000 /tmp/minio_data_root/d3 /tmp/minio_data_root/d4    # revoke TWO drives
 $ curl -s -D - -o /dev/null http://127.0.0.1:9010/minio/health/cluster
 HTTP/1.1 200 OK
