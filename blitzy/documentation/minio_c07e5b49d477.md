@@ -481,12 +481,13 @@ This confirms the state split (`corrupt` for `xl.meta` corruption vs `missing` f
 **Heal item — the object is reported gone** (run 1, `run_id 7561fcbd-fb2f-493d-94ca-0916bf82dda9`) [OBSERVED]:
 
 ```json
-{ "resultId": 2, "type": "object", "bucket": "vbucket", "object": "e2_run1",
-  "versionId": "5d27daa0-80d9-47e3-8369-6199cf292c44",
+{ "resultId": 2, "type": "object", "bucket": "", "object": "", "versionId": "",
   "detail": "Version not found: vbucket/e2_run1(5d27daa0-80d9-47e3-8369-6199cf292c44)",
-  "parityBlocks": 0, "dataBlocks": 0, "diskCount": 4,
+  "diskCount": 0, "setCount": 0,
   "before": { "drives": null }, "after": { "drives": null }, "objectSize": 0 }
 ```
+
+> **Why this heal item is a *zero‑value* record (identity fields empty).** The purge decision is taken by the **set‑level** `healObject`, which returns a fully‑populated `defaultHealResult` alongside `errFileVersionNotFound`. But the **server‑pool wrapper** `erasureServerPools.HealObject` sees every pool report a *version‑not‑found* result and, on that branch, returns a **bare** `madmin.HealResultItem{}` together with `VersionNotFound{Bucket, Object, VersionID}` [`cmd/erasure-server-pool.go:2597-2606`] — the set‑level fields are discarded. `queueHealTask` then stamps only `Type = "object"` and `Detail = err.Error()` onto that zero value [`cmd/admin-heal-ops.go:789-791`]. That is exactly why `bucket`/`object`/`versionId` are empty, `diskCount` is `0`, `parityBlocks`/`dataBlocks` are omitted (`omitempty`), and both drive arrays are `null`. The decision‑bearing evidence for this outcome is therefore the `detail` string and the `DeleteDanglingObject` audit event below — **not** the item's identity fields. (Contrast the reconstruct path in §6 c1 and the quorum‑error‑retain path in §6 c3, whose heal items *are* populated because they come straight from `defaultHealResult`, not through this not‑found wrapper branch.)
 
 **`DeleteDanglingObject` audit event — complete raw record** (run 1) [OBSERVED]:
 
