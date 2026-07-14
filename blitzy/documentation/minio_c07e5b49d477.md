@@ -1236,15 +1236,20 @@ s3
 $ rm -rf /tmp/minio-investigation
 ```
 
-Final repository state (`[OBSERVED]`) — the **only** change versus the baseline is this single documentation file; no source file was modified, added, or deleted:
+Final repository state (`[OBSERVED]`). Committing this file necessarily moves the branch tip (see **Git context** above), so the net effect is stated against the **immutable investigated base commit** `c07e5b49d477` rather than a volatile branch-tip hash. Versus that base, the **only** change is this single, newly **added** documentation file — purely additive, with no source file modified or deleted and no dependency change:
 
 ```
-$ git status --porcelain
- M blitzy/documentation/minio_c07e5b49d477.md
+# exactly one path differs from the investigated base commit — a single ADDED file, nothing else
+$ git diff --name-status c07e5b49d477b0774f23db3b290745aef8c01bd2
+A	blitzy/documentation/minio_c07e5b49d477.md
 
-$ git diff --stat -- blitzy/documentation/minio_c07e5b49d477.md
- blitzy/documentation/minio_c07e5b49d477.md | 1422 +++++++++++++++-------------
- 1 file changed, 781 insertions(+), 641 deletions(-)
+# that file did not exist at the base, so the diff is purely additive: insertions only, zero deletions
+$ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2 -- blitzy/documentation/minio_c07e5b49d477.md
+ blitzy/documentation/minio_c07e5b49d477.md | 1255 ++++++++++++++++++++++++++++
+ 1 file changed, 1255 insertions(+)
+
+# the dependency manifests are byte-for-byte unchanged — this command prints nothing
+$ git diff --stat c07e5b49d477b0774f23db3b290745aef8c01bd2 -- go.mod go.sum
 ```
 
 All temporary scripts, fixtures, credentials, corrupted shards, and server data directories have been removed; fixture-user secrets are redacted throughout this document; and the repository is left byte-for-byte unchanged except for this answer file.
