@@ -840,13 +840,21 @@ delete markers by `!latestMeta.Deleted`, §3.2).
 **DEL-A — DM on the majority (3 of 4; d4 reverted to `[V1]`) → object stays DELETED:**
 
 The recursive deep heal below is the identical command for every DEL cell (it enumerates the
-DM by its version-id, per the mechanism noted above); only the on-disk pre-state differs. Full,
-unedited `mc` stream — one `object` record for the DM version, one for V1, then the `summary`:
+DM by its version-id, per the mechanism noted above); only the on-disk pre-state differs. Each
+stream opens with the leading green→green `type":"bucket"` no-op record (the bucket itself is
+healthy on all four drives, `size:0`), followed by the per-version `object` record(s) — the DM
+version and/or V1, depending on placement — then the `summary`. The number of item records
+shown therefore equals `items_scanned` in the summary (bucket + object-versions). (The per-drive
+`drives[]` array *order* within any single record is an unordered set observed to vary
+run-to-run; the leading bucket record's drive order shown below is therefore representative,
+while its per-drive `state` values, counts, `color`, and `size:0` are byte-stable every run.)
+Full, unedited `mc` stream:
 
 ```console
 # DURING on-disk (368B = [V1] only; 477B = [DM,V1]) — DM kept on d1,d2,d3; d4 reverted:
 #   d1 xl.meta=477B [DM,V1]   d2 xl.meta=477B [DM,V1]   d3 xl.meta=477B [DM,V1]   d4 xl.meta=368B [V1]
 $ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"bucket","name":"verbkt/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"missing"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
 {"status":"success","type":"summary","objects_scanned":2,"objects_healed":1,"items_scanned":3,"items_healed":1,"size":1048576,"duration":1}
@@ -878,6 +886,7 @@ This is the boundary case the earlier draft omitted. It proves the purge test is
 # DURING on-disk — DM kept on d1,d2; d3,d4 reverted to [V1]-only:
 #   d1 xl.meta=477B [DM,V1]   d2 xl.meta=477B [DM,V1]   d3 xl.meta=368B [V1]   d4 xl.meta=368B [V1]
 $ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"bucket","name":"verbkt/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"red","offline":0,"online":2,"missing":2,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"missing"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"missing"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
 {"status":"success","type":"summary","objects_scanned":2,"objects_healed":1,"items_scanned":3,"items_healed":1,"size":1048576,"duration":1}
@@ -917,6 +926,7 @@ and is readable. Representative capture, **DM-on-d1**:
 # DURING on-disk — DM kept on d1; d2,d3,d4 reverted to [V1]-only:
 #   d1 xl.meta=477B [DM,V1]   d2 xl.meta=368B [V1]   d3 xl.meta=368B [V1]   d4 xl.meta=368B [V1]
 $ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"bucket","name":"verbkt/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0","detail":"Version not found: verbkt/dobj(4f4d5601-16ce-4fb6-92f8-5aef051e4a20)","type":"object","name":"/","before":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"after":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
 {"status":"success","type":"summary","objects_scanned":2,"objects_healed":0,"items_scanned":3,"items_healed":0,"size":1048576,"duration":1}
@@ -956,6 +966,7 @@ is physically reconciled depends on which drive held it:
 ```console
 # DM-on-d4 — same recursive deep heal; note objects_scanned:1 and NO DM record:
 $ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"bucket","name":"verbkt/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
 {"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
 {"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":1048576,"duration":1}
 # AFTER on-disk (DM-on-d4): d1,d2,d3 = 368B [V1];  d4 = 477B [DM,V1]  ← stale orphan
@@ -1492,15 +1503,70 @@ reconstruct that the write-back trace (§4.10) exercised.
 > development revision** (`c07e5b49d477`, banner `DEVELOPMENT.2024-11-25T17-10-22Z`, Go 1.23.2)
 > solely to reproduce the exact server under test, bound to **loopback** (`127.0.0.1:19000`) with
 > **disposable default credentials** (`minioadmin:minioadmin`). This build is **not** security-patched
-> to current levels: an official `govulncheck` run against the canonical c07 binary reports **82
-> vulnerable-symbol findings** across **eight modules and the Go standard library**, and MinIO has
-> since published **nine advisories whose affected ranges include or conditionally include this
-> commit (1 Critical, 6 High, 2 Medium)** — most lie outside the erasure-healing path exercised
-> here, but the runnable historical build as a whole is not production-safe. Do **not** expose it to
+> to current levels: an official `govulncheck ./...` run against the canonical c07 source
+> (govulncheck **v1.6.0**, Go vuln-DB snapshot **2026-07-08**) reports, verbatim, **"Your code is
+> affected by 57 vulnerabilities from 7 modules and the Go standard library"** (raw command and
+> full summary are shown immediately below). These are **pre-existing upstream and standard-library
+> CVEs** accrued against this 2024-era revision since it was cut; crucially, **none is reachable
+> from the erasure-healing / reconstruction path** exercised here — no healing symbol (`healObject`,
+> `isObjectDangling`, `Erasure.Heal`/`Erasure.Decode`, `reedsolomon`, `highwayhash`) appears in any
+> govulncheck call trace — but the runnable historical build as a whole is not production-safe. Do
+> **not** expose it to
 > a network, and do **not** reuse these credentials outside a disposable local sandbox. For any
 > production or internet-facing deployment, install a **current, supported, patched MinIO release**
 > from the official channel (<https://min.io/download>) instead. No source file or dependency was
 > modified to produce this build (the read-only constraint is preserved via a detached `git worktree`).
+
+**Vulnerability-scan evidence (reproducible as of the stated DB snapshot).** *Counting unit:*
+"vulnerabilities" is govulncheck's **affected / called** set — one entry per advisory `GO-…` ID
+that the built binary actually reaches. The run enumerated **57** such entries (`Vulnerability #1
+… #57`, i.e. 57 unique `GO-…` IDs) spanning the Go standard library plus **7** third-party modules
+(`golang.org/x/crypto`, `golang.org/x/net`, `github.com/prometheus/prometheus`,
+`go.opentelemetry.io/otel/sdk`, `github.com/golang-jwt/jwt/v4`, `github.com/go-jose/go-jose/v4`,
+`github.com/eclipse/paho.mqtt.golang`) — exactly the headline's "7 modules and the Go standard
+library". Every call trace lands in TLS / x509 / HTTP / JWT / SFTP / KMS / metrics code; none
+references the erasure-healing or reconstruction path (a grep of all 57 traces for
+`erasure-healing`, `erasure-decode`, `erasure-coding`, `reedsolomon`, `highwayhash`, `healObject`,
+`isObjectDangling` returned nothing). The scan separately reports 17 imported-but-uncalled and 17
+required-but-uncalled advisories that do not affect this binary. Raw command and verbatim summary:
+
+```console
+$ cd /tmp/minio-c07-src            # detached checkout of c07e5b49d477 (read-only worktree)
+$ govulncheck -version
+Go: go1.23.2
+Scanner: govulncheck@v1.6.0
+DB: https://vuln.go.dev
+DB updated: 2026-07-08 17:05:00 +0000 UTC
+$ govulncheck ./...
+=== Symbol Results ===
+
+Vulnerability #1: GO-2026-5856
+  ...
+[ the 57 numbered "Vulnerability #N: GO-…" blocks with call traces are omitted for length; a
+  representative final block follows, showing the trace lands outside the healing path (SFTP): ]
+
+Vulnerability #57: GO-2024-3321
+    Misuse of connection.serverAuthenticate may cause authorization bypass in
+    golang.org/x/crypto
+  More info: https://pkg.go.dev/vuln/GO-2024-3321
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.29.0
+    Fixed in: golang.org/x/crypto@v0.31.0
+    Example traces found:
+      #1: cmd/sftp-server.go:509:25: cmd.startSFTPServer calls sftp.Server.Listen, which eventually calls ssh.NewServerConn
+
+Your code is affected by 57 vulnerabilities from 7 modules and the Go standard library.
+This scan also found 17 vulnerabilities in packages you import and 17
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+Use '-show verbose' for more details.
+```
+
+Because the Go vulnerability database grows over time, this count is a **function of the DB
+snapshot date** stated above; re-running against a later DB will typically report a higher number.
+Both `govulncheck ./...` runs on this host produced the identical headline (57 vulnerabilities / 7
+modules), and an independent QA run reported the same 57 — the figure is stable for the stated
+snapshot.
 
 **The checkout must be at commit `c07e5b49d477` before building.** `gen-ldflags.go` derives
 `Version`, `ReleaseTag`, and `CommitID` from the *currently checked-out commit* (via `git`), so
