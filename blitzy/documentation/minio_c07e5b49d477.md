@@ -34,7 +34,16 @@ The three independent evidence streams captured for every result are:
 
 > **Batch-delete nuance (F-note, expanded in §5.4).** `DeleteObjects` (multi-delete) is *transport-level* `HTTP 200` and produces a **single** audit event `api.name=DeleteMultipleObjects statusCode=200`; the per-object `AccessDenied` denials appear **inside** the `<DeleteResult>` XML body, not as separate `403` audit events. The wire trace and the body are therefore both required to see the denial.
 
-**Information-disclosure nuance (answered in full in §6):** listing and HEAD are *read* surfaces the read-only identity legitimately holds. `HeadObject`/`GetObject` inside the prefix succeed and disclose size, ETag, content-type and timestamp; outside the prefix they are `403`. Crucially, `s3:ListBucket` here is **bucket-scoped** (no `s3:prefix` condition), so `ListObjectsV2`/`ListObjectsV1` **without a prefix** (or with a prefix outside the grant) **do disclose keys outside the granted prefix** — including `private/secret.txt`, which the same identity **cannot** `GetObject`. `ListMultipartUploads` is itself **denied** (it needs `ListBucketMultipartUploadsAction`, which `readonly-bp` does not grant).
+**Information-disclosure nuance (answered in full in §6):** listing and HEAD are *read* surfaces the read-only identity legitimately holds. `HeadObject`/`GetObject` inside the prefix succeed and disclose size, ETag, content-type and timestamp; outside the prefix they are `403`. Crucially, `s3:ListBucket` here is **bucket-scoped** (no `s3:prefix` condition), so `ListObjectsV2`/`ListObjectsV1` **without a prefix** (or with a prefix outside the grant) **do disclose keys outside the granted prefix** — including `private/secret.txt`, which the same identity **cannot** `GetObject`. This is bounded by adding an `s3:prefix` `Condition` to the `s3:ListBucket` grant (§6.3). `ListMultipartUploads` is itself **denied** (it needs `ListBucketMultipartUploadsAction`, which `readonly-bp` does not grant).
+
+**Adjacent behaviors surfaced by exhaustive probing (full detail in §5–§7; catalogued in §8.4; scoped in §9).** Driving *every* named operation to its limit also surfaced several MinIO behaviors worth an operator's attention. **None of them lets the read-only identity mutate data or read object content it lacks, so none changes the verdict above** — each is disclosed for completeness, and remediation of each is out of scope for this read-only investigation (plan §0.3.2):
+
+- **API-1** — a malformed/non-XML `PutObjectTagging` (and `PutObjectRetention`) body returns `HTTP 500 InternalError` *before* the IAM check runs, because the body is parsed first (`ParseObjectXML` [cmd/object-handlers.go:L3141] precedes the `PutObjectTaggingAction` gate [cmd/object-handlers.go:L3151]; §5.3). It affects **any** principal and **writes nothing**.
+- **API-2** — on the `DeleteObjects` and `PutObjectRetention` write paths the `Content-Md5` header's **presence** is checked but its **value** is not verified, so a wrong digest still succeeds (§5.4). This is on the **authorized-writer/root** path; the read-only identity is still `403`.
+- **API-3** — when an object's key is exactly a prefix stem (e.g. an object `coll` alongside `coll/child.txt`), `ListObjectsV1/V2` **omit the `coll/` sub-tree** while the stem object exists, and it reappears once the stem is deleted (§6.3). A listing/enumeration-completeness quirk, not a read of denied content.
+- **API-4 / STORAGE-1** — `ListMultipartUploads` matches `?prefix=` as an **exact key** rather than a true prefix, and empty-prefix in-progress-upload discovery is **lost across a server restart** (an in-memory cache; §6.4). The read-only identity is denied `ListMultipartUploads` outright regardless.
+- **OBS-1** — the audit sink records a presigned URL's `X-Amz-Signature` verbatim, so a reader of the audit stream can **replay** the exact presigned request within its expiry window (§7.2). This is an **audit-sink confidentiality** concern, not an S3 authorization bypass: replay yields only what the presigning principal was already authorized to do, and expiry still bounds the window.
+- **DEP-1 / DOC-1** — the repository's **baseline dependency/advisory posture** (a real `govulncheck` run; **no** dependency introduced by this task, `go.mod`/`go.sum` byte-for-byte unchanged) is recorded in **§9.1**, and the audit-census helper used in §4 was hardened against a null-`statusCode` edge case (**§4**).
 
 The remainder of this document proves each of these claims with complete, unedited runtime output.
 
@@ -209,7 +218,8 @@ for line in open('/tmp/audit.log'):
     c[(a.get('name'), a.get('statusCode'), e.get('accessKey'))]+=1
 print("TOTAL audit events:",tot)
 for (n,code,ak),cnt in sorted(c.items(), key=lambda x:(str(x[0][2]),str(x[0][0]))):
-    print(f"{n:28} {code:<6} {str(ak):12} {cnt}")
+    code_s = '-' if code is None else str(code)   # statusCode is `omitempty` in the audit schema; an absent value decodes to None
+    print(f"{str(n):28} {code_s:<6} {str(ak):12} {cnt}")
 PY
 ```
 
@@ -243,6 +253,25 @@ PutObjectTagging             403    rouser       2
 - **46 root reads** (`accessKey=minioadmin`: 23 `HeadObject` + 23 `GetObjectTagging`) — the storage/semantic verification the harness performs as **root** after each probe to prove no mutation; excluded from the denial tally.
 
 So **20 read-only probe attempts** (18 attributed to `rouser` + 2 logged with `accessKey=None`) produced **0 successes** and **0 storage side effects**, and the anonymous `ListBuckets` denial from the §2 baseline is the only other denial in the session.
+
+**Census-script robustness (DOC-1).** The counting command above normalizes a **missing** `statusCode` to `-` before formatting (`code_s = '-' if code is None else str(code)`). This matters because the audit schema declares the field as `StatusCode int` with the struct tag `json:"statusCode,omitempty"` [pkg/v3@v3.0.22/logger/message/audit/entry.go:L47], so the key is **omitted entirely** whenever the recorded value is `0`. That value arises when a request reaches audit logging without a trace context: `internal/logger/audit.go` copies the status only when the `TraceCtxt` is present (`tc, ok := r.Context().Value(...)` then `if ok { statusCode = tc.ResponseRecorder.StatusCode }` [internal/logger/audit.go:L97-L99], followed by `entry.API.Status = http.StatusText(statusCode)` and `entry.API.StatusCode = statusCode` [internal/logger/audit.go:L119-L120]); the recorder otherwise initializes to `http.StatusOK` [internal/http/response-recorder.go:L84], so an absent `statusCode` (paired with an empty `status`, since `http.StatusText(0) == ""`) appears precisely when that context is absent. A naive formatter that writes `f"{code:<6}"` with `code=None` aborts with `TypeError: unsupported format string passed to NoneType.__format__`. Demonstrated on a real captured event re-rendered in that exact absent-`statusCode` form:
+
+```
+# naive `{code:<6}` variant, one null-statusCode event present:
+TOTAL audit events: 2
+Traceback (most recent call last):
+  File "<stdin>", line 11, in <module>
+    print(f"{n:28} {code:<6} {str(ak):12} {cnt}")
+                   ^^^^^^^^^
+TypeError: unsupported format string passed to NoneType.__format__      # exit 1
+
+# null-safe variant (as printed above), same input:
+TOTAL audit events: 2
+GetBucketLocation            -      minioadmin   1
+GetObject                    200    rouser       1                       # exit 0
+```
+
+On the null-free 66-event census log used above, the two variants print **identical** output (that run contained no absent-`statusCode` events), so the census counts are unaffected; the null-safe form simply prevents the crash on any audit stream that does contain such an event. Hardening the census script is a reporting-tool nicety and involves no product code (AAP §0.3.2).
 
 
 ## 5. Per-operation results (multipart, copy, metadata changes, deletes)
@@ -430,6 +459,28 @@ Wire: `HTTP/1.1 403 Forbidden` · `X-Amz-Request-Id: 18C1EBD7A5FF7937`
 Audit: `api.name=PutObjectTagging status=Forbidden statusCode=403 accessKey=rouser bucket=testbucket object=shared/a.txt requestID=18C1EBD7A5FF7937`
 Mutation-sensitive check on `shared/a.txt` after the denial: `xl.meta` SHA-256 = `a94e32448b495287c314a6f50b9d9780aab9766196d9f6ad40bf102e4714b8bd` (unchanged); root `StatObject` ETag = `78d1f9238908e7d0b0558499b3341189` (unchanged); root `GetObjectTagging` tag-count = `0` (unchanged) ⇒ **MUTATED=false**.
 
+**Malformed / non-XML `PutObjectTagging` body — the body parse runs *before* the IAM check, so the status reflects the parse failure (`500`/`400`), not `403`.** `PutObjectTaggingHandler` parses the request body with `tags.ParseObjectXML(io.LimitReader(r.Body, 1<<20))` [cmd/object-handlers.go:L3141] and returns on any parse error [cmd/object-handlers.go:L3142-L3144] **before** it reaches the `PutObjectTaggingAction` authorization gate [cmd/object-handlers.go:L3151] (the intervening line even sets the `x-amz-object-tagging` header from the parsed tags [cmd/object-handlers.go:L3148]). A request whose body is not well-formed tagging XML is therefore rejected at parse time, and the HTTP status reflects the *parse* failure rather than the authorization decision. Observed directly — all four events are audit-logged with `accessKey=None` (no principal attached yet), confirming the failure precedes IAM:
+
+- **1-byte non-XML body, `rouser`** → `HTTP/1.1 500 Internal Server Error` · `X-Amz-Request-Id: 18C20CF990AC4003`.
+- **1-byte non-XML body, root (`minioadmin`)** → `HTTP 500` — identical shape, confirming the defect is principal-independent:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InternalError</Code><Message>We encountered an internal error, please try again.: cause(EOF)</Message><Key>shared/a.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/shared/a.txt</Resource><RequestId>18C20CF9911F5126</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+- **Empty body, root** → `HTTP 500` `InternalError` `cause(EOF)` · `RequestId 18C20CF991861723` (an entirely non-XML or empty body surfaces the decoder's `EOF` as `InternalError`).
+- **Truncated-but-XML-shaped body `<Tagging><TagSet>`, root** → `HTTP 400 MalformedXML` (a body that starts as valid XML but ends early is mapped to the client-error `MalformedXML` instead):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema. (XML syntax error on line 1: unexpected EOF)</Message><Key>shared/a.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/shared/a.txt</Resource><RequestId>18C20CF991E6B977</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Audit (all four, principal not yet attached): `api.name=PutObjectTagging accessKey=None` with `statusCode=500 status=Internal Server Error` (×3) and `statusCode=400 status=Bad Request` (×1).
+
+**Scope — this does *not* breach the read-only mutation boundary.** The parse-before-authz ordering means a read-only principal (indeed any principal) sending a malformed tagging body receives `500`/`400` instead of `403`, but **no tags are written**: after all four attempts, root `GetObjectTagging` on `shared/a.txt` still returns an empty `<Tagging><TagSet></TagSet></Tagging>` and the object body is intact (`GET` → `shared object a: hello`). A *well-formed* read-only `PutObjectTagging` is still denied `403 AccessDenied` (the trace immediately above). The exposure is therefore (a) a robustness gap — a malformed body surfaces as `500 InternalError` rather than a purely client-side `400`-class error — and (b) a minor pre-authorization processing quirk: the handler decodes the caller's body (and, for well-formed XML, sets the tagging header) before it authorizes. It changes **no** object state and grants **no** write capability. Product remediation (parsing after authorization, or returning `400` for the non-XML case) is outside this documentation-only task's scope (AAP §0.3.2).
+
 **`DeleteObjectTagging`** — `DeleteObjectTaggingHandler` [cmd/object-handlers.go:L3235] → `DeleteObjectTaggingAction` [cmd/object-handlers.go:L3301]:
 
 ```
@@ -490,7 +541,24 @@ Wire: `HTTP/1.1 400 Bad Request` · `X-Amz-Request-Id: 18C1EBD7E574EB6A`
 <Error><Code>InvalidRequest</Code><Message>Bucket is missing ObjectLockConfiguration</Message><Key>shared/a.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/shared/a.txt</Resource><RequestId>18C1EBD7E574EB6A</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
 ```
 
-Audit: `api.name=PutObjectRetention status=Bad Request statusCode=400 accessKey=<nil> requestID=18C1EBD7E574EB6A` — note `accessKey` is `<nil>`: the request is rejected at the pre-authorization configuration check, before the principal is attached to the audit record. Mutation-sensitive check on `shared/a.txt`: `xl.meta` SHA-256 `a94e32448b495287c314a6f50b9d9780aab9766196d9f6ad40bf102e4714b8bd`, ETag `78d1f9238908e7d0b0558499b3341189`, tag-count `0` — unchanged ⇒ **MUTATED=false**. The clean read-only **authorization** denial for retention (`403 AccessDenied`) is reached only on a **lock-enabled** bucket, where this configuration precheck passes and the request proceeds past it: the deferred `PutObjectRetentionAction` check — evaluated inside the `EvalMetadataFn` callback [cmd/object-handlers.go:L2912] via `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913] — denies a read-only principal. That lock-enabled `403` was **not** separately captured as a `rouser` `PutObjectRetention` wire trace in this run; it is established by the call-ordering analysis in **§8.3** (`PutObjectMetadata` → namespace lock → `readAllXL` → `EvalMetadataFn` → `IAMSys.IsAllowed(PutObjectRetentionAction)` → `errAuthentication` → `ErrAccessDenied`) and is labeled **inferred** there. §7.5 does **not** exercise `PutObjectRetention`; what it *demonstrates* on a real object-lock bucket is the **independence of the IAM and object-lock gates for the *delete* path** — a read-only DELETE is stopped at the first `DeleteObjectAction` gate [cmd/object-handlers.go:L2528] (Case 1, object layer never reached), while the distinct `BypassGovernanceRetentionAction` gate [cmd/bucket-object-lock.go:L153] is exercised in Cases 3–4.
+Audit: `api.name=PutObjectRetention status=Bad Request statusCode=400 accessKey=<nil> requestID=18C1EBD7E574EB6A` — note `accessKey` is `<nil>`: the request is rejected at the pre-authorization configuration check, before the principal is attached to the audit record. Mutation-sensitive check on `shared/a.txt`: `xl.meta` SHA-256 `a94e32448b495287c314a6f50b9d9780aab9766196d9f6ad40bf102e4714b8bd`, ETag `78d1f9238908e7d0b0558499b3341189`, tag-count `0` — unchanged ⇒ **MUTATED=false**. The clean read-only **authorization** denial for retention (`403 AccessDenied`) is reached only on a **lock-enabled** bucket, where this configuration precheck passes and the request proceeds past it: the deferred `PutObjectRetentionAction` check — evaluated inside the `EvalMetadataFn` callback [cmd/object-handlers.go:L2912] via `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913] — denies a read-only principal. That lock-enabled `403` is now **directly observed** (it was previously labeled *inferred*; this run captures it). Repeating the retention probe as `rouser` against the **lock-enabled** `wormbucket`, carrying a valid `Content-Md5` (`/YIC7M3yXxiVZayGzKajyw==`) so the request clears the signature, bucket-info, `Content-Md5`-presence, and object-lock-configuration prechecks and reaches the deferred `PutObjectRetentionAction` decision inside the `EvalMetadataFn` callback [cmd/object-handlers.go:L2912] via `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913], yields the clean authorization denial:
+
+```
+PUT /wormbucket/rt.txt?retention=
+Authorization: AWS4-HMAC-SHA256 Credential=rouser/20260714/us-east-1/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=...
+Content-Md5: /YIC7M3yXxiVZayGzKajyw==
+
+<Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>
+```
+
+Wire: `HTTP/1.1 403 Forbidden` · `X-Amz-Request-Id: 18C20C03A02283AB`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><Key>rt.txt</Key><BucketName>wormbucket</BucketName><Resource>/wormbucket/rt.txt</Resource><RequestId>18C20C03A02283AB</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Audit: `api.name=PutObjectRetention statusCode=403 status=Forbidden accessKey=None object=rt.txt` — `accessKey` is `None` because the IAM decision is evaluated *inside* the object-layer metadata callback rather than at a top-level `checkRequestAuthType`, so the principal is not attached to the audit record (the same deferred-authz signature seen on the `400` above and on the malformed-tagging `500`s in this section). The call-ordering derivation is retained in **§8.3** (`PutObjectMetadata` → namespace lock → `readAllXL` → `EvalMetadataFn` → `IAMSys.IsAllowed(PutObjectRetentionAction)` → `errAuthentication` → `ErrAccessDenied`); it is now **corroborated by this wire+audit capture** rather than left inferred. The read-only principal thus cannot set retention on either bucket: `400` (config precheck) on the non-lock `testbucket`, `403 AccessDenied` (IAM) on the lock-enabled `wormbucket`. §7.5 does **not** exercise `PutObjectRetention`; what it *demonstrates* on a real object-lock bucket is the **independence of the IAM and object-lock gates for the *delete* path** — a read-only DELETE is stopped at the first `DeleteObjectAction` gate [cmd/object-handlers.go:L2528] (Case 1, object layer never reached), while the distinct `BypassGovernanceRetentionAction` gate [cmd/bucket-object-lock.go:L153] is exercised in Cases 3–4.
 
 ### 5.4 Deletes — single (`DeleteObject`) vs batch (`DeleteObjects`)
 
@@ -564,6 +632,28 @@ Wire: `HTTP/1.1 400 Bad Request` · `X-Amz-Request-Id: 18C1ECAB8FC6B077`
 ```
 
 Audit: `api.name=PutObjectRetention status=Bad Request statusCode=400 accessKey=None requestID=18C1ECAB8FC6B077`. This is a request-validation error, **not** the authorization decision; the probes above send a valid `Content-Md5` to reach the true decision.
+
+**`Content-Md5` *value* is not validated — only its *presence* (API-2).** The precondition just checked verifies that the header **exists**, not that it matches the body. For batch delete the test is `if _, ok := r.Header[xhttp.ContentMD5]; !ok { … ErrMissingContentMD5 }` [cmd/bucket-handlers.go:L432]; the retention path uses the `hasContentMD5(r.Header)` helper [cmd/object-handlers.go:L2885], which is simply `_, ok := h[xhttp.ContentMD5]; return ok` [cmd/utils.go:L258-L261]. Neither recomputes or compares the digest, so a **wrong** `Content-Md5` value is accepted and the operation proceeds. This surfaces on the **write-capable path** (root / `readwrite`), where the caller is already authorized; it is **not** a read-only bypass — a read-only principal is still stopped by IAM (`400`/`403`, §5.3 and above). It is disclosed here because it is a correctness gap on the very header the denial-shape discussion relies on. Observed with a deliberately wrong digest `Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==` (the correct value shown for contrast):
+
+- **Batch `DeleteObjects` as root** — body `<Delete><Object><Key>disp/one.txt</Key></Object></Delete>` (correct MD5 `vzdFh6u+URCrfJAUr8t/6g==`), sent with the wrong MD5. Before: `HEAD disp/one.txt` → `200`.
+
+Wire: `HTTP/1.1 200 OK` · `X-Amz-Request-Id: 18C20D1E3BBCED11`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>disp/one.txt</Key></Deleted></DeleteResult>
+```
+
+After: `HEAD disp/one.txt` → `404` — the object was **really deleted** despite the mismatched digest. Audit: `api.name=DeleteMultipleObjects statusCode=200 accessKey=minioadmin object=disp/one.txt`.
+
+- **`PutObjectRetention` as `wormuser` on the lock-enabled `wormbucket`** — sets `GOVERNANCE` until `2031-06-01` (correct MD5 `CP2CdwR0g76py4eozOcbvw==`), sent with the wrong MD5. Before: `GET rt2.txt?retention` → `400` (no retention set). Result: `HTTP/1.1 200 OK`. After: `GET rt2.txt?retention` → `200`, retention now **persisted**:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>GOVERNANCE</Mode><RetainUntilDate>2031-06-01T00:00:00.000Z</RetainUntilDate></Retention>
+```
+
+Audit: `api.name=PutObjectRetention statusCode=200 accessKey=None object=rt2.txt` (`accessKey=None`: retention authorization runs in the deferred metadata callback, as in §5.3). So an authorized writer supplying *any* present `Content-Md5` — even a wrong one — completes the mutation; the header is a presence gate, not an integrity check. **The read-only principal remains denied**, so this is a write-path correctness gap, not a boundary breach. Product remediation (verifying the digest) is outside this documentation-only task (AAP §0.3.2).
 
 **Storage side-effect (single & batch).** After the denied single delete **and** the batch denial, both keys are intact on disk, verified by `xl.meta` SHA-256 and a root `StatObject`:
 
@@ -771,7 +861,59 @@ V1 uses `<Marker></Marker>` for pagination (vs. V2's `NextContinuationToken`) an
 | HEAD object (inside grant) | `Content-Length`, `Content-Type`, `ETag`, `Last-Modified`, `Accept-Ranges` | object bytes; (here) no `x-amz-meta-*` since none set |
 | HEAD bucket | bucket existence, region | any object listing |
 
-The disclosure is **bucket-wide** because the `ListBucket` grant lacks an `s3:prefix` condition — `rouser` can enumerate `private/` and `load/` metadata despite having no read grant there. The standard mitigation is to attach an `s3:prefix` `Condition` to the `ListBucket` statement so listing is confined to `shared/*` (documented in `docs/multi-user/README.md`).
+The disclosure is **bucket-wide** because the `ListBucket` grant lacks an `s3:prefix` condition — `rouser` can enumerate `private/` and `load/` metadata despite having no read grant there. The standard mitigation is to attach an `s3:prefix` `Condition` to the `ListBucket` statement so listing is confined to `shared/*` (documented in `docs/multi-user/README.md`); this mitigation is **demonstrated at runtime** immediately below.
+
+**Runtime demonstration of the `s3:prefix` mitigation.** To confirm the bound holds in practice — not merely in principle — a second read-only identity `rouserp` was provisioned through the **canonical admin path** (`madmin` `AddCannedPolicy` → `AddUser` → `SetPolicy`) with policy `readonly-bp-prefixed`, identical to `readonly-bp` except its `s3:ListBucket` grant carries an `s3:prefix` condition:
+
+```json
+{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::testbucket"],
+ "Condition":{"StringLike":{"s3:prefix":["shared/*"]}}}
+```
+
+The same three listing requests that leak the namespace for the un-conditioned `rouser` now behave differently for `rouserp` (raw SigV4, complete bodies):
+
+**(a) `ListObjectsV2 prefix=shared/` — within the condition → `HTTP 200`, `KeyCount=3`:**
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>testbucket</Name><Prefix>shared/</Prefix><KeyCount>3</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>shared/a.txt</Key><LastModified>2026-07-14T03:58:33.815Z</LastModified><ETag>&#34;617a30921a7c30f7335a447b320265a9&#34;</ETag><Size>22</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>shared/b.txt</Key><LastModified>2026-07-14T03:58:33.818Z</LastModified><ETag>&#34;b52cca3797ab68a27a17459296f82e3b&#34;</ETag><Size>22</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>shared/sub/c.txt</Key><LastModified>2026-07-14T03:58:33.820Z</LastModified><ETag>&#34;6f79664f9e09f184bd063385e39a2136&#34;</ETag><Size>29</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>
+```
+
+**(b) `ListObjectsV2 prefix=private/` — outside the condition → `HTTP 403 AccessDenied`** (the metadata that leaked to `rouser` above is now denied):
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>testbucket</BucketName><Resource>/testbucket</Resource><RequestId>18C20F90C2C3B900</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+**(c) `ListObjectsV2` no prefix — empty `s3:prefix`, which does not match `shared/*` → `HTTP 403 AccessDenied`:**
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>testbucket</BucketName><Resource>/testbucket</Resource><RequestId>18C20F90C346AF7C</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+Correlated audit: `api.name=ListObjectsV2 statusCode=200 status=OK accessKey=rouserp` for the in-prefix list, and `statusCode=403 status=Forbidden accessKey=rouserp` for **both** the `private/` (`requestID=18C20F90C2C3B900`) and the no-prefix (`requestID=18C20F90C346AF7C`) attempts. Note these `ListBucket` denials carry `accessKey=rouserp` — unlike the deferred-authz metadata operations of §5.3 (which log `accessKey=None`) — because `ListObjectsV2Handler` authorizes at the top-level `checkRequestAuthType(... ListBucketAction ...)` gate [cmd/bucket-listobjects-handlers.go:L172] where the principal is already attached, and MinIO evaluates the `s3:prefix` request condition against that gate. With the condition attached, the principal can list **only** within `shared/`; the bucket-wide over-disclosure of §6.3 is closed. Remediation of the *default* (un-conditioned) grant in any given deployment is an operator policy choice and is outside this documentation-only task (plan §0.3.2).
+
+**Listing correctness caveat — an exact prefix-*stem* object hides its "directory" descendants (API-3).** Distinct from the *over*-disclosure above, listing can also *under*-report. When an object's key is exactly a path stem (e.g. `coll`) **and** other objects live beneath it (e.g. `coll/child.txt`), MinIO's list-merge collapses the name collision by **dropping the synthesized directory entry**. In `mergeEntryChannels`, when `path.Clean(best.name) == path.Clean(other.name)` [cmd/metacache-entries.go:L738] and one side is an object while the other is the directory of the same name, the code "will drop the directory entry" per its own comment [cmd/metacache-entries.go:L739-L741], discarding the directory when an equally-named object exists [cmd/metacache-entries.go:L751-L763]. The descendant objects then vanish from *both* delimited and flat listings while the stem object exists. Observed as `rouser` (who can list `testbucket`) after seeding an object `coll` (26 bytes) alongside `coll/child.txt` (19 bytes):
+
+- **`ListObjectsV2 prefix=coll&delimiter=/`** → `HTTP 200`, `KeyCount=1`, only the stem object; **no** `CommonPrefixes` for `coll/`:
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>testbucket</Name><Prefix>coll</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><Delimiter>/</Delimiter><IsTruncated>false</IsTruncated><Contents><Key>coll</Key><LastModified>2026-07-14T04:22:18.803Z</LastModified><ETag>&#34;b3f9a2dc44b021b32706f6b1cf4d0108&#34;</ETag><Size>26</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>
+```
+
+- **`ListObjectsV2 prefix=coll` (flat, no delimiter)** → `HTTP 200`, `KeyCount=1` — the flat form *also* omits `coll/child.txt`, returning only `coll` (identical body minus `<Delimiter>`). `ListObjectsV1` behaves the same way.
+
+Yet `coll/child.txt` genuinely exists and is directly addressable: root `HEAD coll/child.txt` → `HTTP 200`, `Content-Length: 19`, `ETag "6905a6d74e838f0a49d96ca6b69d53c4"`; `GET` → `I am coll/child.txt`. The masking is purely a listing artifact and reverses the instant the stem object is removed — after `DELETE coll` (root, `204`), the same query re-exposes the directory:
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>testbucket</Name><Prefix>coll</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><Delimiter>/</Delimiter><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>coll/</Prefix></CommonPrefixes></ListBucketResult>
+```
+
+**Security framing.** This grants a read-only principal no extra access — it can already enumerate and `GetObject` within its grant, and the shadowed descendant is reachable by its exact key regardless. The relevance is to *auditing via listing*: an operator or read-only auditor enumerating a bucket to inventory its contents can **miss** objects shadowed by an equally-named stem object, so a listing-based inventory is not a reliable census of what exists. It changes no object state. Product remediation is outside this documentation-only task (AAP §0.3.2).
 
 ### 6.4 List multipart uploads → denied
 
@@ -783,6 +925,51 @@ The disclosure is **bucket-wide** because the `ListBucket` grant lacks an `s3:pr
 ```
 
 `ListMultipartUploadsHandler` [cmd/bucket-handlers.go:L251] gates on `policy.ListBucketMultipartUploadsAction` [cmd/bucket-handlers.go:L265] — a **distinct** action from `ListBucketAction`. `rouser`'s policy grants `s3:ListBucket` but **not** `s3:ListBucketMultipartUploads`, so this returns 403. Consequently a read-only principal **cannot** enumerate the in-flight multipart uploads that the concurrent read-write writers may have open, even though it can list completed objects. This is a meaningful scoping boundary: object listing and multipart-upload listing are separately gated.
+
+**Authorized-principal behavior of `ListMultipartUploads` — `prefix` is matched as an *exact key*, not an S3 prefix (API-4).** The read-only denial above is correct; the two behaviors below were surfaced by driving the *same* API as an authorized principal (root) and are disclosed because they bear on multipart *discoverability*. MinIO deliberately does not implement prefix-based multipart listing — the comment "We do not support prefix based listing, this is a deliberate attempt towards simplification of multipart APIs" sits at [cmd/erasure-multipart.go:L254-L259]. The pool method `ListMultipartUploads` [cmd/erasure-server-pool.go:L1742-L1775] routes an **empty** prefix through the in-memory `mpCache` scan ("if no prefix provided, return the list from cache" [cmd/erasure-server-pool.go:L1753-L1759]), while a **non-empty** prefix is matched as an exact object name. With one active upload for key `shared/big.txt`:
+
+- **`?uploads&prefix=`** (empty) → `HTTP 200`, the upload **is** returned (cache scan):
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>testbucket</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker><Prefix></Prefix><MaxUploads>10000</MaxUploads><IsTruncated>false</IsTruncated><Upload><Key>shared/big.txt</Key><UploadId>NTY4YTU3MWItMWZjYi00YzhlLTkxZjItNzUyZTYxZjU1NDk5LmNlN2Y4MWExLWY3NDgtNDUxYS05MDkwLTM2OGI3ZmRmZGU3MXgxNzg0MDAzMDM4MDYzNjU1NTg4</UploadId><Initiator><ID></ID><DisplayName></DisplayName></Initiator><Owner><ID></ID><DisplayName></DisplayName></Owner><StorageClass></StorageClass><Initiated>2026-07-14T04:23:58.085Z</Initiated></Upload></ListMultipartUploadsResult>
+```
+
+- **`?uploads&prefix=shared/`** (a legitimate S3 prefix) → `HTTP 200` but **empty** — no `<Upload>` element, because `shared/` is matched as an exact key and nothing is named exactly `shared/`:
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>testbucket</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker><Prefix>shared/</Prefix><MaxUploads>10000</MaxUploads><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>
+```
+
+- **`?uploads&prefix=shared/big.txt`** (the exact full key) → `HTTP 200`, the upload **is** returned again (an `<Upload>` block identical to the empty-prefix case, differing only in the echoed `<Prefix>shared/big.txt</Prefix>`).
+
+So a client that scopes a multipart-uploads listing by a directory-style prefix (the natural S3 idiom) is silently told there are **zero** uploads even though one exists beneath that prefix; discovery requires an empty prefix or the exact object key.
+
+**In-progress multipart discovery via empty prefix is lost across a server restart (STORAGE-1).** The empty-prefix path reads the in-memory `mpCache` [cmd/erasure-server-pool.go:L68, initialized L223, populated on upload creation at L1796, read at L1759]; that map is **not** rehydrated from disk at startup, so a restart erases empty-prefix discoverability while the upload's bytes remain fully intact on disk. Captured across the documented single restart (server PID rotates), for the same active upload:
+
+| Probe | Before restart | After restart |
+|-------|----------------|---------------|
+| on-disk `…/multipart/…/xl.meta` | present | **present** (survives) |
+| `ListMultipartUploads prefix=` (empty) | upload returned | **empty — upload LOST from discovery** |
+| `ListMultipartUploads prefix=shared/big.txt` (exact) | upload returned | **upload returned** (read from disk) |
+| `ListParts` (exact upload id) | Part 1, `Size 5242880`, ETag `b8fc857a25e7958868c2f003d5e0952d` | **Part 1 identical** |
+
+After-restart empty-prefix body (discovery lost):
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>testbucket</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker><Prefix></Prefix><MaxUploads>10000</MaxUploads><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>
+```
+
+After-restart `ListParts` (intact, disk-backed):
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>testbucket</Bucket><Key>shared/big.txt</Key><UploadId>NTY4YTU3MWItMWZjYi00YzhlLTkxZjItNzUyZTYxZjU1NDk5LmNlN2Y4MWExLWY3NDgtNDUxYS05MDkwLTM2OGI3ZmRmZGU3MXgxNzg0MDAzMDM4MDYzNjU1NTg4</UploadId><Initiator><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</DisplayName></Initiator><Owner><ID>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</ID><DisplayName>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</DisplayName></Owner><StorageClass>STANDARD</StorageClass><PartNumberMarker>0</PartNumberMarker><NextPartNumberMarker>0</NextPartNumberMarker><MaxParts>10000</MaxParts><IsTruncated>false</IsTruncated><ChecksumAlgorithm></ChecksumAlgorithm><Part><PartNumber>1</PartNumber><LastModified>2026-07-14T04:23:58.164Z</LastModified><ETag>&#34;b8fc857a25e7958868c2f003d5e0952d&#34;</ETag><Size>5242880</Size></Part></ListPartsResult>
+```
+
+**Scope.** Neither behavior touches the read-only boundary: `rouser` is denied `ListMultipartUploads` outright (`403`, above) and holds no multipart write action. Both are multipart-*discovery* caveats for authorized clients — API-4 can hide active uploads from a prefix-scoped query, and STORAGE-1 means an orchestrator relying on empty-prefix enumeration to find stragglers will miss uploads created before a restart (they remain addressable by exact key / upload id, and their storage is reclaimed by the normal stale-multipart expiry). Product remediation is outside this documentation-only task (AAP §0.3.2).
 
 
 ---
@@ -884,6 +1071,59 @@ Correlated audit: `api.name=DeleteObject statusCode=403 accessKey=<nil> requestI
 **Reasoning.** The two presigned outcomes reveal two distinct rejection points on the request lifecycle:
 - A **valid** presigned URL is authenticated (the query signature resolves `accessKey=rouser`) and then denied at the `DeleteObjectAction` gate — identical authorization outcome to the header-signed delete of Section 5.4, just via the presigned code path. The `X-Amz-Signature-Age: 782` header shows the request was accepted within the 300 s window.
 - An **expired** presigned URL is rejected by the pre-authentication expiry check with `Message=Request has expired` and **no principal attached** (`accessKey=<nil>`) — a strictly earlier failure than the IAM decision. Either way, no delete occurs and the object is untouched.
+
+**Audit-log confidentiality — a captured presigned request is byte-for-byte replayable from the audit sink within its expiry window (OBS-1).** The presigned examples above expose a second, orthogonal concern that is about *confidentiality of the audit stream*, not about the S3 authorization decision. Because the audit entry's `requestQuery` echoes **every** SigV4 query parameter verbatim — including the `X-Amz-Signature` — anyone who can read the audit sink can reconstruct the full presigned URL and replay it until it expires, **without ever holding the principal's secret key**. The copy is unconditional: `ToEntry` [internal/logger/message/audit/entry.go:L44] builds `reqQuery` by iterating the raw query string and joining every value (`reqQuery[k] = strings.Join(v, ",")`, then `entry.ReqQuery = reqQuery` [internal/logger/message/audit/entry.go:L53-L58]) with **no** allow-list, deny-list, or redaction of signature material.
+
+Observed directly. A presigned **GET** was generated for `rouser` on `shared/a.txt` (which `rouser` *is* authorized to read) with `X-Amz-Expires=600`, used once (→ `HTTP 200`), then reconstructed **solely from the fields the audit sink recorded** and replayed from a client that never possessed `rouser`'s secret:
+
+```
+--- generated presigned GET (first use → HTTP 200 "shared object a: hello") ---
+http://127.0.0.1:9000/testbucket/shared/a.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=rouser%2F20260714%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260714T044223Z&X-Amz-Expires=600&X-Amz-SignedHeaders=host&X-Amz-Signature=15fc77d70c2bbbdbe81fa1605c0062b18a8ca33c4ac0adcca215ece02c614f1d
+```
+
+The audit sink captured the request with the signature intact — these are the replay-relevant fields of the recorded event (`X-Amz-Signature` is present in full):
+
+```json
+{
+  "accessKey": "rouser",
+  "api": { "bucket": "testbucket", "name": "GetObject", "object": "shared/a.txt", "status": "OK", "statusCode": 200 },
+  "deploymentid": "568a571b-1fcb-4c8e-91f2-752e61f55499",
+  "requestID": "18C20E50F4D613AE",
+  "requestPath": "/testbucket/shared/a.txt",
+  "requestQuery": {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": "rouser/20260714/us-east-1/s3/aws4_request",
+    "X-Amz-Date": "20260714T044223Z",
+    "X-Amz-Expires": "600",
+    "X-Amz-Signature": "15fc77d70c2bbbdbe81fa1605c0062b18a8ca33c4ac0adcca215ece02c614f1d",
+    "X-Amz-SignedHeaders": "host"
+  },
+  "time": "2026-07-14T04:42:23.260863964Z",
+  "trigger": "incoming",
+  "version": "1"
+}
+```
+
+Rebuilding the URL from *only* those `requestPath` + `requestQuery` fields (parameters re-emitted in sorted order — SigV4 presigned validity does not depend on query ordering) and replaying it returns the object:
+
+```
+--- replay of audit-reconstructed URL (no secret key held) → HTTP 200 ---
+http://127.0.0.1:9000/testbucket/shared/a.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=rouser%2F20260714%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260714T044223Z&X-Amz-Expires=600&X-Amz-Signature=15fc77d70c2bbbdbe81fa1605c0062b18a8ca33c4ac0adcca215ece02c614f1d&X-Amz-SignedHeaders=host
+→ "shared object a: hello"
+```
+
+That the replay is a genuine reuse of the captured signature — not some independent bypass — is confirmed by flipping a single hex digit of `X-Amz-Signature` (…`614f1d` → …`614f1a`), which is rejected:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message><Key>shared/a.txt</Key><BucketName>testbucket</BucketName><Resource>/testbucket/shared/a.txt</Resource><RequestId>18C20E5B9D749630</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+**Scope — this is an audit-sink *confidentiality* concern, not a read-only-boundary breach.** The replay grants exactly what the presigned URL already granted: here, a read `rouser` was authorized to perform anyway, so no privilege is gained over the read-only identity, and no *write* capability is conferred. The exposure is temporal and general: *any* presigned request captured in the audit stream — including a **write** presigned by a write-capable principal — is replayable by an audit-sink reader **until that URL's `X-Amz-Expires` window closes**, because the signature stays valid until then and the sink stores it verbatim. The expiry check still applies to the replay (an expired captured URL yields `Request has expired`, exactly as in the expired-DELETE case above), which bounds the window but does not eliminate it.
+
+**Operator guidance.** Treat the audit sink as **credential-bearing**: restrict read access to it as tightly as to the credentials themselves; prefer short `X-Amz-Expires` windows for presigned URLs; and, where feasible, redact or drop `X-Amz-Signature` (and `X-Amz-Credential`) from audit records at the sink/collector. A product-side default redaction of the signature query parameters inside `ToEntry` [internal/logger/message/audit/entry.go:L53-L58] would close this at the source, but changing product code is outside this documentation-only task per AAP §0.3.2.
+
+**Note on `deploymentid`.** The OBS-1 traces above were captured on this investigation's current canonical server bring-up, whose `deploymentid` is `568a571b-1fcb-4c8e-91f2-752e61f55499`; the earlier presigned-DELETE captures in this section were recorded on a prior bring-up (`584479d9-…`). Both report the same externally-visible `HostId` `dd9025…` because that value is `sha256(globalLocalNodeName)` — a hash of the node's bind address alone [cmd/server-main.go:L410-L412] — and is therefore independent of the per-format `deploymentid`; the provisioned identities (`rouser` et al.) and their policies are reproduced identically across bring-ups, so the authorization behavior is unchanged.
 
 ### 7.3 Single vs. batch delete
 
@@ -1131,7 +1371,7 @@ Every authenticated S3 request converges on one path:
 
 ### 8.3 Enforcement ordering and the read-before-authz exceptions
 
-For **most** write-adjacent handlers the action check runs at the top of the handler, **before** the object layer acquires a namespace lock or touches any shard. This is true for multipart (create/upload/copy-part/complete/abort), `CopyObject`, `PutObjectTagging`, legal-hold, and single/batch delete: each calls `checkRequestAuthType` (or `checkRequestAuthTypeWithVID`) as an early guard, so a denial returns at the handler boundary and the erasure backend is never entered. The runtime audit stream confirms this: on the `rouser` denial each of these events carries `tags=null` (no object-layer read occurred before the 403). The storage stream corroborates it: after these denials the multipart create targets are **absent**, `.minio.sys/multipart` holds **0** upload-id directories, and the pre-existing objects' `xl.meta` SHA-256 values are **unchanged** (§5 storage tables). The on-disk erasure layout used for these assertions (`<datadir>/<bucket>/<object>/xl.meta` + part files) matches the layout exercised by the repository's own tests (`cmd/erasure-object_test.go`, `cmd/erasure-healing_test.go`). **Two write-adjacent handlers are exceptions that read the object *before* the authorization decision — `DeleteObjectTagging` and `PutObjectRetention` — and both are treated below; in each, a *denied* request still mutates nothing.**
+For **most** write-adjacent handlers the action check runs at the top of the handler, **before** the object layer acquires a namespace lock or touches any shard. This is true for multipart (create/upload/copy-part/complete/abort), `CopyObject`, `PutObjectTagging`, legal-hold, and single/batch delete: each calls `checkRequestAuthType` (or `checkRequestAuthTypeWithVID`) as an early guard, so a denial returns at the handler boundary and the erasure backend is never entered. (One ordering nuance on `PutObjectTagging`: while its `PutObjectTaggingAction` check [cmd/object-handlers.go:L3151] does precede the object layer, the handler first *parses the request body* at [cmd/object-handlers.go:L3141] — earlier than that authz check — so a **malformed** tagging body is rejected with `500`/`400` *before* the authorization decision, still without entering the erasure backend; this is the API-1 disclosure characterized in §5.3, and it does not breach the read-only boundary because no tags are written.) The runtime audit stream confirms the authz ordering for well-formed requests: on the `rouser` denial each of these events carries `tags=null` (no object-layer read occurred before the 403). The storage stream corroborates it: after these denials the multipart create targets are **absent**, `.minio.sys/multipart` holds **0** upload-id directories, and the pre-existing objects' `xl.meta` SHA-256 values are **unchanged** (§5 storage tables). The on-disk erasure layout used for these assertions (`<datadir>/<bucket>/<object>/xl.meta` + part files) matches the layout exercised by the repository's own tests (`cmd/erasure-object_test.go`, `cmd/erasure-healing_test.go`). **Two write-adjacent handlers are exceptions that read the object *before* the authorization decision — `DeleteObjectTagging` and `PutObjectRetention` — and both are treated below; in each, a *denied* request still mutates nothing.**
 
 **`DeleteObjectTagging` is the first exception.** It differs from its sibling `PutObjectTagging`, whose handler runs `checkRequestAuthType(ctx, r, policy.PutObjectTaggingAction, …)` [cmd/object-handlers.go:L3151] **before** it ever calls `GetObjectInfo` [cmd/object-handlers.go:L3162] — so a denied `PutObjectTagging` never touches the backend (its audit event carries `tags=null`). `DeleteObjectTaggingHandler` [cmd/object-handlers.go:L3235] inverts that order: it first calls `objAPI.GetObjectInfo(ctx, bucket, object, opts)` [cmd/object-handlers.go:L3259] to load the object's *existing* tags — "Set this such that authorization policies can be applied on the object tags." [cmd/object-handlers.go:L3296-L3297] — and only **then** calls `checkRequestAuthType(ctx, r, policy.DeleteObjectTaggingAction, …)` [cmd/object-handlers.go:L3301]. Because `GetObjectInfo` reads `xl.meta` from the erasure backend (via `readAllXL`), a *denied* `DeleteObjectTagging` **does** enter the backend — for a read — before returning 403. The runtime audit stream shows exactly this asymmetry: on the `rouser` denial the `PutObjectTagging` event carries `tags=null`, whereas the `DeleteObjectTagging` event carries `tags={"GetObjectInfo":"name=shared/a.txt,pool=1,set=1"}` — the pre-auth read is recorded, the same "`tags` block present ⇒ object layer reached" signal used for the WORM deletes in §7.5. As with retention, this changes only *where* the decision is made, not *whether* a write occurs: the tag-**mutation** (`objAPI.DeleteObjectTags`) is reached only *after* the action is allowed, so a *denied* `DeleteObjectTagging` performs **no** metadata write — `shared/a.txt`'s `xl.meta` SHA-256 is **unchanged** across the denial (§5, §8.4), i.e. the zero-mutation-side-effect property still holds.
 
@@ -1143,7 +1383,7 @@ For **most** write-adjacent handlers the action check runs at the top of the han
 4. **Object-Lock configuration check** — on a bucket without Object-Lock this returns `ErrInvalidBucketObjectLockConfiguration` → HTTP **400 `InvalidRequest`** [cmd/object-handlers.go:L2891], which is exactly why `PutObjectRetention` on `testbucket` returns 400, not 403 (§5.3, §7.1);
 5. only on a lock-enabled bucket does it build `popts` with an `EvalMetadataFn` [cmd/object-handlers.go:L2912] wrapping `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913] and call `PutObjectMetadata` [cmd/object-handlers.go:L2933].
 
-Inside `erasureObjects.PutObjectMetadata` [cmd/erasure-object.go:L2121] the ordering is: acquire the namespace lock `NewNSLock` [cmd/erasure-object.go:L2124] → **read** existing metadata `readAllXL` [cmd/erasure-object.go:L2142] → run the callback `EvalMetadataFn` [cmd/erasure-object.go:L2182], where `enforceRetentionBypassForPut` → `isPutRetentionAllowed` calls `IAMSys.IsAllowed(PutObjectRetentionAction)`; if denied it returns `errAuthentication` [cmd/bucket-object-lock.go:L189/L206/L219/L230] → `ErrAccessDenied` (HTTP 403) [cmd/api-errors.go:L2176]. The actual write, `updateObjectMeta` [cmd/erasure-object.go:L2192], runs **only after** the callback allows. So for retention on a *lock-enabled* bucket the IAM decision happens **after** a lock + read but **before** any write — meaning even in this exception a *denied* retention change still performs **no** metadata write (zero side effect holds), it simply makes the decision one layer deeper. A read-only identity cannot reach a successful write here regardless, because it holds neither `PutObjectRetentionAction` nor the object-lock configuration to make the bucket eligible in the first place. This lock-enabled retention `403 AccessDenied` is **inferred** from the call ordering above (code-path reasoning); it was **not** captured as a `rouser` `PutObjectRetention` wire trace in this run — the only retention traces observed here are the `400`s on the non-lock `testbucket` (§5.3, §7.1), because `PutObjectRetentionHandler` reaches the deferred IAM decision only on a lock-enabled bucket. It nonetheless follows directly from deny-by-default (§8.1): `readonly-bp` grants no `PutObjectRetentionAction`, so `IAMSys.IsAllowed` returns false inside the callback. (Note that because this handler authenticates via `validateSignature` [cmd/object-handlers.go:L2874] rather than a top-level `checkRequestAuthType`, its audit record carries `accessKey` = `<nil>` even when the deferred check denies — the same principal-less audit shape seen for the non-lock `400` in §5.3.)
+Inside `erasureObjects.PutObjectMetadata` [cmd/erasure-object.go:L2121] the ordering is: acquire the namespace lock `NewNSLock` [cmd/erasure-object.go:L2124] → **read** existing metadata `readAllXL` [cmd/erasure-object.go:L2142] → run the callback `EvalMetadataFn` [cmd/erasure-object.go:L2182], where `enforceRetentionBypassForPut` → `isPutRetentionAllowed` calls `IAMSys.IsAllowed(PutObjectRetentionAction)`; if denied it returns `errAuthentication` [cmd/bucket-object-lock.go:L189/L206/L219/L230] → `ErrAccessDenied` (HTTP 403) [cmd/api-errors.go:L2176]. The actual write, `updateObjectMeta` [cmd/erasure-object.go:L2192], runs **only after** the callback allows. So for retention on a *lock-enabled* bucket the IAM decision happens **after** a lock + read but **before** any write — meaning even in this exception a *denied* retention change still performs **no** metadata write (zero side effect holds), it simply makes the decision one layer deeper. A read-only identity cannot reach a successful write here regardless, because it holds neither `PutObjectRetentionAction` nor the object-lock configuration to make the bucket eligible in the first place. This lock-enabled retention `403 AccessDenied` is now **directly observed** (§5.3): repeating the probe as `rouser` against the lock-enabled `wormbucket` with a valid `Content-Md5` clears the signature/bucket-info/`Content-Md5`/object-lock-config prechecks, reaches the deferred IAM decision inside the callback, and returns `403 AccessDenied` (`RequestId 18C20C03A02283AB`, audit `api.name=PutObjectRetention statusCode=403 accessKey=None`) — corroborating the call-ordering derivation above rather than leaving it inferred. On the non-lock `testbucket` the handler instead stops earlier at the object-lock configuration precheck with `400` (§5.3, §7.1). Either way it follows directly from deny-by-default (§8.1): `readonly-bp` grants no `PutObjectRetentionAction`, so `IAMSys.IsAllowed` returns false inside the callback. (Note that because this handler authenticates via `validateSignature` [cmd/object-handlers.go:L2874] rather than a top-level `checkRequestAuthType`, its audit record carries `accessKey` = `<nil>` even when the deferred check denies — the same principal-less audit shape seen for the non-lock `400` in §5.3.)
 
 ### 8.4 Coverage pass — every named item, answered by name
 
@@ -1161,7 +1401,7 @@ Citations give the handler declaration line and the authorization line. The **Au
 | **Metadata** `PutObjectTagging` | `PutObjectTaggingHandler` [cmd/object-handlers.go:L3122] → `PutObjectTaggingAction` [cmd/object-handlers.go:L3151] | 403 AccessDenied | `a.txt` xl.meta sha256 unchanged; root tag-count 0 | `PutObjectTagging` |
 | **Metadata** `DeleteObjectTagging` | `DeleteObjectTaggingHandler` [cmd/object-handlers.go:L3235] → `DeleteObjectTaggingAction` [cmd/object-handlers.go:L3301] | 403 AccessDenied | `a.txt` xl.meta sha256 unchanged | `DeleteObjectTagging` |
 | **Metadata** `PutObjectLegalHold` | `PutObjectLegalHoldHandler` [cmd/object-handlers.go:L2698] → `PutObjectLegalHoldAction` [cmd/object-handlers.go:L2718] (checked **before** Content-MD5 at [cmd/object-handlers.go:L2727]) | 403 AccessDenied | `a.txt` xl.meta sha256 unchanged | `PutObjectLegalHold` |
-| **Metadata** `PutObjectRetention` | `PutObjectRetentionHandler` [cmd/object-handlers.go:L2855] → `PutObjectRetentionAction` via `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913] (see §8.3) | **400 InvalidRequest** on non-lock `testbucket` (pre-IAM, observed); 403 on lock bucket (inferred, §8.3) | object intact; no metadata write | `PutObjectRetention` |
+| **Metadata** `PutObjectRetention` | `PutObjectRetentionHandler` [cmd/object-handlers.go:L2855] → `PutObjectRetentionAction` via `enforceRetentionBypassForPut` [cmd/object-handlers.go:L2913] (see §8.3) | **400 InvalidRequest** on non-lock `testbucket` (pre-IAM, observed); **403 AccessDenied** on lock-enabled `wormbucket` (observed, §5.3) | object intact; no metadata write | `PutObjectRetention` |
 | **Delete** `DeleteObject` (single) | `DeleteObjectHandler` [cmd/object-handlers.go:L2509] → `DeleteObjectAction` [cmd/object-handlers.go:L2528] | 403 AccessDenied | `a.txt` present; xl.meta sha256 unchanged | `DeleteObject` |
 | **Delete** `DeleteObjects` (batch) | `DeleteMultipleObjectsHandler` [cmd/bucket-handlers.go:L416] → per-object `DeleteObjectAction` [cmd/bucket-handlers.go:L505] | **200** + per-object AccessDenied in `<DeleteResult>` | all targets present; xl.meta sha256 unchanged | **`DeleteMultipleObjects`** (one event, statusCode 200) |
 | **List** `ListObjectsV2` (in prefix) | `ListObjectsV2Handler` [cmd/bucket-listobjects-handlers.go:L154] → `ListBucketAction` [cmd/bucket-listobjects-handlers.go:L172] | 200 (4 keys in `shared/`) | read — none | `ListObjectsV2` |
@@ -1172,9 +1412,13 @@ Citations give the handler declaration line and the authorization line. The **Au
 | **HEAD** `HeadObject` (outside prefix) | `headObjectHandler` [cmd/object-handlers.go:L744] → `GetObjectAction` [cmd/object-handlers.go:L760] | 403 (no XML body) | read — none | `HeadObject` |
 | **HEAD** `HeadBucket` | `HeadBucketHandler` [cmd/bucket-handlers.go:L1644] → `ListBucketAction` [cmd/bucket-handlers.go:L1658] | 200 | read — none | `HeadBucket` |
 
+**Adjacent behaviors surfaced during this coverage pass (documented in §5–§7 and §9; none breaches the read-only mutation boundary).** Exhaustively exercising the named operations also revealed the following, each observed at runtime and characterized in place: **API-1** — a malformed `PutObjectTagging` body returns `500`/`400` *before* the IAM check (§5.3), principal-independent, writing nothing; **API-2** — `Content-Md5` is validated for *presence* only, so a wrong digest is accepted on the write-capable path for `DeleteObjects`/`PutObjectRetention` (§5.4), while the read-only principal stays denied; **API-3** — an exact prefix-*stem* object hides its `stem/` descendants from `ListObjects` V1/V2 until the stem is removed (§6.3); **API-4** — `ListMultipartUploads` matches `prefix` as an exact key rather than an S3 prefix (§6.4); **STORAGE-1** — empty-prefix multipart discovery is lost across a restart while the upload persists on disk (§6.4). Each affects either *any* principal (API-1) or only *authorized writers* (API-2/API-3/API-4/STORAGE-1); none grants the read-only identity any mutation or any read it lacks. The audit-confidentiality note (**OBS-1**, §7.2) and the baseline dependency/advisory posture (**DEP-1**, §9) are likewise disclosed without altering the read-only mutation verdict.
+
 ### 8.5 Bottom line
 
 Within the tested configuration (see §9 for the exact scope and limits), a MinIO identity scoped to `s3:GetObject` (bucket+prefix) + `s3:ListBucket` (bucket) behaved as **read-only for object content and metadata mutation** under sustained concurrent write/metadata load: across every probed multipart, copy, tagging/legal-hold/retention, and delete operation — signed and presigned, inside and outside the prefix, single and batch, quiescent and same-key-contended — the read-only identity performed **no** successful mutation. Each denial returned at deny-by-default with the corresponding audit record, and the storage backend showed no side effect (the objects' `xl.meta` SHA-256 and root semantic state were unchanged; multipart create left zero upload-id directories). The one behavior that is a *disclosure*, not a mutation, is that bucket-scoped `s3:ListBucket` (with no `s3:prefix` condition) lets the identity enumerate key names, sizes, ETags, timestamps, and (via V1) owner across the whole bucket — including outside its read prefix — which should be constrained with an `s3:prefix` `Condition` if that enumeration is undesirable.
+
+Beyond that listing disclosure, exhaustive probing surfaced five adjacent behaviors (**API-1**–**API-4**, **STORAGE-1**) and an audit-confidentiality note (**OBS-1**) — catalogued in §8.4 and detailed in §5–§7 — concerning malformed-input robustness, write-path `Content-Md5` correctness, `ListMultipartUploads` prefix semantics, cross-restart multipart discovery, listing completeness under stem collisions, and audit-sink handling of presigned signatures. **None of them lets the read-only identity mutate data or read content it lacks:** API-1 affects any principal but writes nothing; API-2/API-3/API-4/STORAGE-1 concern the authorized-writer/enumeration paths; OBS-1 concerns confidentiality of the audit sink, not the S3 authorization decision. The read-only **mutation** boundary therefore holds; these items are disclosed for operator awareness, with the standard `s3:prefix` condition and audit-sink-hygiene mitigations noted in place, and the baseline dependency/advisory posture recorded in §9.
 
 ---
 
@@ -1183,12 +1427,55 @@ Within the tested configuration (see §9 for the exact scope and limits), a MinI
 This is an empirical, runtime investigation, not a formal proof or a product-wide certification. Its conclusions are bounded to what was actually exercised:
 
 - **Single deployment, single version.** All evidence comes from one single-node server built from this checkout — version string `DEVELOPMENT.GOGET`, `go1.23.12 linux/amd64`, deployment id `584479d9-b9c6-423f-bff3-1f4c9308df56` — built with `CGO_ENABLED=0 go build .` in its **default** configuration. Distributed/erasure-set topologies, other releases, and non-default server configuration were **not** tested and are out of scope.
-- **Tested principal and action set.** The read-only identity was one IAM user (`rouser`) with exactly one attached policy (`readonly-bp`: `s3:GetObject` on `testbucket/shared/*` + `s3:ListBucket` on `testbucket`). Group policies, STS/temporary credentials, service accounts, LDAP/OIDC-mapped identities, and external AuthZ plugins were **not** exercised; the `IsAllowedSTS`/`IsAllowedServiceAccount` branches (§8.1) were confirmed by code path only, not by runtime probe.
+- **Tested principal and action set.** The read-only identity under test was one IAM user (`rouser`) with exactly one attached policy (`readonly-bp`: `s3:GetObject` on `testbucket/shared/*` + `s3:ListBucket` on `testbucket`); a second read-only identity (`rouserp`, policy `readonly-bp-prefixed`) was provisioned **solely** to demonstrate the `s3:prefix` `ListBucket` mitigation at runtime (§6.3). Group policies, STS/temporary credentials, service accounts, LDAP/OIDC-mapped identities, and external AuthZ plugins were **not** exercised; the `IsAllowedSTS`/`IsAllowedServiceAccount` branches (§8.1) were confirmed by code path only, not by runtime probe.
 - **Bounded, not absolute.** The concurrency results are bounded to the tested scale — two identical 24-worker / 8-second load runs (§4) and, for TOCTOU, 968 concurrent overwrites across 25 read-only delete attempts (§7.4). The "no check-vs-use window" statement is a bounded observation over that scale (stable across the two runs), **not** a formal guarantee of impossibility at all scales.
 - **Enumerated operations only.** Coverage is the operation families named in the prompt and their variants (§8.4). S3 surface area beyond that table (e.g. SELECT/`POST` object, website/CORS/ACL sub-resources, replication and ILM internals, KMS/SSE paths) was **not** probed.
 - **WORM scope.** The object-lock independence result (§7.5) was demonstrated for **governance**-mode retention on versioned deletes; **compliance**-mode and legal-hold-only interactions were reasoned from source (`cmd/bucket-object-lock.go`) but not each independently reproduced at runtime.
 
 Where a statement rests on code path rather than a captured runtime signal, it is labeled as such above. Every other claim is backed by the adjacent wire, audit, and storage evidence from this run.
+
+### 9.1 Dependency & advisory posture (baseline)
+
+Because the prompt's concern is a security boundary, the exercised toolchain and dependency set were themselves scanned for known vulnerabilities, so the read-only-boundary result can be read against an explicit baseline. This posture is **observed** — a real `govulncheck` run against the canonically-built server module — and its remediation is **out of scope** under the read-only mandate (plan §0.3.2): no `go.mod`/`go.sum`/toolchain change is permitted, so the versions below are *reported*, not altered.
+
+**Exercised versions (read from `go.mod`, left unchanged):**
+
+- Go toolchain `go1.23.12 linux/amd64`, satisfying `go 1.23` [go.mod:L3].
+- `github.com/minio/madmin-go/v3 v3.0.77` [go.mod:L52], `github.com/minio/minio-go/v7 v7.0.80` [go.mod:L53], `github.com/minio/pkg/v3 v3.0.22` [go.mod:L55] — the admin/client/policy libraries the harness reused as-is.
+- `golang.org/x/crypto v0.29.0` [go.mod:L91] — the transitively-pinned crypto library relevant to the flagship advisory below.
+
+**Scan method (observed):** `govulncheck@v1.1.4` (Go `go1.23.12`; DB `https://vuln.go.dev`, DB timestamp `2026-07-08 17:05:00 +0000 UTC`), run against the built module. Verbatim summary:
+
+```
+Your code is affected by 50 vulnerabilities from 7 modules and the Go standard library.
+This scan also found 15 vulnerabilities in packages you import and 17
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+Use '-show verbose' for more details.
+```
+
+So of **82 advisories found in total** (50 + 15 + 17), **50 are reachable** ("your code is affected") and 32 are present-but-not-called. Two representative *reachable* advisories, quoted exactly from the scan:
+
+- **`GO-2024-3321`** — *"Misuse of connection.serverAuthenticate may cause authorization bypass in golang.org/x/crypto"*; `Found in: golang.org/x/crypto@v0.29.0`, `Fixed in: golang.org/x/crypto@v0.31.0`. Its only reported trace enters through the **SFTP** subsystem:
+
+```
+Vulnerability #50: GO-2024-3321
+    Misuse of connection.serverAuthenticate may cause authorization bypass in
+    golang.org/x/crypto
+  More info: https://pkg.go.dev/vuln/GO-2024-3321
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.29.0
+    Fixed in: golang.org/x/crypto@v0.31.0
+    Example traces found:
+      #1: cmd/sftp-server.go:509:25: cmd.startSFTPServer calls sftp.Server.Listen, which eventually calls ssh.NewServerConn
+```
+
+  (This advisory is publicly aliased as **CVE-2024-45337** — the `x/crypto/ssh` `ServerConfig` authorization-bypass issue; the CVE alias is external context, not part of the scan text.)
+- **`GO-2026-5856`** — *"Invoking Encrypted Client Hello privacy leak in crypto/tls"*, Go standard library; `Found in: crypto/tls@go1.23.12`, `Fixed in: crypto/tls@go1.25.12` — reachable via TLS transport paths (e.g. the reported trace `cmd/iam.go:1676:42: cmd.IAMSys.NormalizeLDAPMappingImport calls ldap.Config.Connect, which eventually calls tls.Conn.Handshake`).
+
+**Baseline attribution (observed).** Every one of these advisories inheres in the pinned dependency and toolchain versions that predate this task; the investigation added, updated, and removed **no** dependency. The manifests are byte-for-byte identical to the untouched baseline — `go.mod` SHA-256 `b85e689662e001da57c8e38a7cc29ff7430c81df040ab913a802aa4e080c8e0f`, `go.sum` SHA-256 `184a7add019c576c926f07da8ba57280a6c95f00ca3f427049d2a09b1d55fc63` — and `git status` shows only this answer document changed. **The investigation therefore introduced zero new dependency risk;** the posture above is the repository's own pre-existing baseline.
+
+**Reachability vs. the read-only authorization path (reasoning).** None of the reachable advisories lies on the S3 per-request PBAC decision path that this result depends on — `authenticateRequest` [cmd/auth-handler.go:L358] → `IAMSys.IsAllowed` [cmd/iam.go:L2437]. The reported traces enter through *adjacent* subsystems: the SFTP server (`GO-2024-3321`), LDAP-config/TLS transport, Prometheus metrics, and the Go TLS/x509 stack — not the object-request authorization gate. In particular, the single advisory that is itself an *authorization bypass* (`GO-2024-3321`) is reachable only when the **SFTP** service is enabled, and is unrelated to the S3 `s3:GetObject`/`s3:ListBucket` evaluation exercised here. Upgrading `golang.org/x/crypto` to `v0.31.0`+ and the toolchain to a fixed `go1.25.x` would clear the two advisories quoted above, but any such change is out of scope for this read-only task and is recorded only for operator awareness (**DEP-1**).
 
 ---
 
@@ -1197,7 +1484,7 @@ Where a statement rests on code path rather than a captured runtime signal, it i
 - **Build (exact, canonical):** `CGO_ENABLED=0 go build .` (Go 1.23.12) → exit 0, ~150 MB `./minio` binary in the repo root (git-ignored, so the tree stays clean), `go.mod`/`go.sum` unchanged. Version string `DEVELOPMENT.GOGET`.
 - **Audit sink:** a tiny local webhook receiver (`/tmp/mh/bin/sink`) was started first, appending every JSON audit event to `/tmp/audit.log`.
 - **Run (exact):** `MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_AUDIT_WEBHOOK_ENABLE=on MINIO_AUDIT_WEBHOOK_ENDPOINT=http://127.0.0.1:9099/ ./minio server /tmp/minio-data --address :9000 --console-address :9001` (server PID captured; health `/minio/health/live` and `/minio/health/ready` both returned HTTP 200; anonymous `GET /` returned the standard S3 `AccessDenied` XML baseline).
-- **Provision (canonical admin path):** `madmin` `AddCannedPolicy`/`AddUser`/`SetPolicy` → `readonly-bp` (custom bucket+prefix) on `rouser`, built-in `readwrite` on `rwuser`, custom `wormpol` on `wormuser`, custom `bypasspol` on `bypassuser`. `mc` was not installed, so the `madmin` SDK was used (an equivalent canonical entry point).
+- **Provision (canonical admin path):** `madmin` `AddCannedPolicy`/`AddUser`/`SetPolicy` → `readonly-bp` (custom bucket+prefix) on `rouser`, built-in `readwrite` on `rwuser`, custom `wormpol` on `wormuser`, custom `bypasspol` on `bypassuser`, and `readonly-bp-prefixed` (adds the `s3:prefix` `ListBucket` condition) on `rouserp` for the §6.3 mitigation demonstration. `mc` was not installed, so the `madmin` SDK was used (an equivalent canonical entry point).
 - **Probe:** raw SigV4 via `github.com/minio/minio-go/v7@v7.0.80/pkg/signer` (`SignV4` [github.com/minio/minio-go/v7@v7.0.80/pkg/signer/request-signature-v4.go:L343], `PreSignV4` [github.com/minio/minio-go/v7@v7.0.80/pkg/signer/request-signature-v4.go:L208]) — the real S3 API path, with raw HTTP for byte-level trace capture.
 - **Cleanup:** the server and sink processes were stopped, and the `./minio` binary, `/tmp/minio-data` datadir, `/tmp/mh` harness, sink, `/tmp/audit.log`, and policy JSON were removed after the run. The repository's only change is this document; `go.mod`/`go.sum` are byte-for-byte unchanged; `git status` shows only `blitzy/documentation/minio_c07e5b49d477.md`.
 - **Non-canonical values:** none. Every value above was produced by the default build exercised through the real admin and S3 APIs. Request IDs/timestamps are specific to this run; `HostId`/`X-Amz-Id-2` = `dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8`.
