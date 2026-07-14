@@ -5,18 +5,20 @@ subsystem decides whether to reconstruct an object, purge it (leave it DELETED),
 unrecoverable (DEGRADED) when the object is in an inconsistent state across the drives of a
 standalone **4-drive erasure set** (which auto-selects **EC:2** — 2 data + 2 parity).
 
-Every behavioral claim below is backed by the exact command that produced it and its raw,
-unedited output, and is grounded to a `file:line` anchor in the checkout under test
-(`minio` commit `c07e5b49d477b0774f23db3b290745aef8c01bd2`, server banner
-`DEVELOPMENT.2024-11-25T17-10-22Z`, runtime `go1.23.2 linux/amd64`). Statements that could
-not be produced through a canonical trigger are explicitly labelled **(inferred)** and cite
-the governing code.
+Every behavioral claim below is accompanied by the canonical command that produced it and its
+raw, unedited output, shown adjacent to the claim, and is grounded to a `file:line` anchor in
+the checkout under test (`minio` commit `c07e5b49d477b0774f23db3b290745aef8c01bd2`, server
+banner `DEVELOPMENT.2024-11-25T17-10-22Z`, runtime `go1.23.2 linux/amd64`). Scenarios were
+executed more than once; the two-run methodology — when a single representative run is shown
+in full versus when both runs are shown or reported as an observed distribution — is stated
+in §4.0 and recapped in the coverage pass (§8). Statements that could not be produced through
+a canonical trigger are explicitly labelled **(inferred)** and cite the governing code.
 
 ---
 
 ## 1. The question (verbatim)
 
-> On a 4-disk erasure coded instance, what happens when an object is in an inconsistent state
+> **User Question:** "On a 4-disk erasure coded instance, what happens when an object is in an inconsistent state
 > across disks (some have data, some corrupted data, some nothing) and healing runs? Does MinIO
 > ALWAYS reconstruct from valid shards, or are there situations where it decides the object
 > should stay DELETED or DEGRADED? I want actual runtime evidence in each case — not theory.
@@ -26,7 +28,7 @@ the governing code.
 > (b) what error appears when healing cannot recover an object; (c) whether healing behavior
 > differs between a partially failed WRITE vs a partially failed DELETE. Don't modify any source
 > files, but create whatever test scenarios you need to demonstrate this behavior and clean them
-> once done.
+> once done."
 
 ---
 
@@ -73,8 +75,11 @@ modtime-fallback path and uses an ETag *quorum* (finding-corrected below).
 ### 3.1 The exported entry point and dispatch chain
 
 `mc admin heal` (and the madmin-go `Heal()` API it wraps), the inline MRF auto-heal, and the
-background scanner all converge on the same per-object worker `healObject`
-(`cmd/erasure-healing.go:258`). The dispatch chain for a manual/API heal is:
+background scanner all reach object healing through the same per-object worker `healObject`
+(`cmd/erasure-healing.go:258`) — though on an **erasure** deployment the scanner's *periodic
+object* heal is gated off (`skipHeal`, §4.11), so on this standalone EC:2 set the two triggers
+that actually drive object heals are the manual path and the inline MRF path. The dispatch chain
+for a manual/API heal is:
 
 ```
 HealHandler (cmd/admin-handlers.go:1308)
@@ -385,30 +390,73 @@ flowchart TD
 
 ### 4.0 How to read this section, and the client used
 
-`mc` could not be built offline in this environment (its UI dependencies are not in the module
-cache). Every heal below is therefore triggered through a **purpose-built client that embeds
-the exact library `mc` wraps — `github.com/minio/madmin-go/v3` v3.0.77** (pinned at
-`go.mod:52`). It calls `adm.Heal(...)`, which issues the identical canonical request
-`POST /minio/admin/v3/heal/{bucket}/{prefix}` (§6.5). This is **not** a bypass: it is the same
-admin API surface the `mc admin heal` CLI uses. For each result the client prints:
+Healing is triggered and rendered with the **official `mc` client**,
+`RELEASE.2025-08-13T08-35-41Z` (`commit-id=7394ce0dd2a80935aded936b09fa12cbb3cb8096`,
+`go1.24.6`) — the exact version named in the AAP, obtained as the standard operator binary from
+the official MinIO download endpoint (`https://dl.min.io/client/mc/release/linux-amd64/mc`).
+This is the same CLI an operator would run; it is a newer release than the server under test,
+which is fully supported for the admin heal API (the one version-skew exception,
+`--force-start`, is documented in §6.4). To avoid touching any real operator configuration,
+every invocation uses an isolated config directory (`MC_CONFIG_DIR="$RUN_ROOT/mc"`), removed
+with the run root in §7.4. Provenance and versions of every tool are in §7.
 
-- a `RAW …` line — the complete, unedited `HealResultItem` JSON exactly as the server returned it
-  (fenced as `jsonl` because the stream is one JSON object per line); and
-- an `MC  …` line — the client-side summary (online/missing/corrupt/offline counts and the
-  green/yellow/red/grey colour) computed with `mc`'s own algorithm reproduced verbatim (§6.2),
-  so the reader sees both the raw server states and what `mc` would display.
+`mc admin heal` exposes the server's decision two ways, both shown throughout §4:
 
-Provenance and versions of every tool are in §7.
+- **`mc admin heal --json`** streams one JSON object per heal item (a `bucket` item, one
+  `object` item per object, and a terminal `summary`). Each carries the server's per-drive
+  `state` values plus `mc`'s computed `online`/`offline`/`missing`/`corrupted` counts and the
+  `color`. This is the client's rendering of the server's `HealResultItem` (§6.5).
+- **`mc admin heal --verbose`** prints the human `[Before -> After]` colour grid and a
+  `Healed: N/M objects` line.
 
-**Two-run methodology (auditability).** Every scenario below was executed **at least twice**,
-with a full `reset_object` (§7.2) between runs so each run starts from the pristine baseline.
-Where the two runs produced byte-identical heal output (the common case), a single representative
-capture is shown and explicitly annotated "both runs identical"; where a run varies a drive
-target (e.g. D1 corrupt on d1 vs d3), both runs are shown in full. §4.1 (D1) is the worked
-exemplar showing two complete raw runs with UTC timestamps and per-run drive targets; the
-remaining scenarios follow the identical protocol and their raw per-run captures live in the
-evidence files named in §7. No claim of stability is made from prose alone — each rests on the
-captured RAW/MC lines and the on-disk before/after shown with it.
+The healthy **baseline** object (`healtest/obj1`, 1 MiB) heals to no-op — every drive `ok`,
+green before and after (the complete, unedited stream):
+
+```console
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive local/healtest/obj1
+{"status":"success","type":"bucket","name":"healtest/","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
+{"status":"success","type":"object","name":"healtest/obj1","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":1048576,"duration":1}
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --verbose --recursive local/healtest/obj1
+[Green  ->  Green] healtest/
+[Green  ->  Green] healtest/obj1
+Healed:	0/1 objects; 1024 KiB in 1s
+```
+
+**Supplementary raw struct (`RAW …`/`MC …` lines).** `mc --json` collapses several fields of
+the server's underlying `madmin.HealResultItem` (it omits `resultId`, `parityBlocks`,
+`dataBlocks`, `setCount` and surfaces `detail` only on error). So the reconstruct, degrade and
+dangling-purge scenarios in §4.1–§4.8 **also** show two supplementary lines captured
+programmatically against the **same** admin API, using a
+tiny client built on the exact library `mc` embeds — `github.com/minio/madmin-go/v3` v3.0.77
+(pinned at `go.mod:52`), calling the identical `adm.Heal(...)` →
+`POST /minio/admin/v3/heal/{bucket}/{prefix}` route (§6.5):
+
+- a **`RAW …`** line — the complete, unedited `madmin.HealResultItem` struct exactly as the
+  server returns it (fenced `jsonl`; one object per line), exposing the erasure fields
+  (`parityBlocks`/`dataBlocks`) and `detail` that `mc --json` drops; and
+- an **`MC  …`** line — the online/missing/corrupt/offline counts and green/yellow/red/grey
+  colour computed with `mc`'s own algorithm reproduced verbatim (§6.2).
+
+These are **not** a substitute for the real `mc` output above — they expose the raw server
+struct beneath it. The delete-marker cross-product (§4.9.2) is captured with real
+`mc admin heal --json` exclusively — its per-version records already expose the decision, so
+no supplementary `RAW`/`MC` line is added there. The `MC` summary is cross-validated against real `mc --verbose`: e.g. the
+corrupt-shard scenario (§4.1) yields `mc --verbose` `[Yellow -> Green]`, matching the
+`MC` line's `before[…color=yellow] after[…color=green]`.
+
+**Two-run methodology (auditability).** Scenarios were executed **more than once**, with a full
+`reset_object` (§7.2) between runs so each starts from the pristine baseline. Where two runs
+produced byte-identical heal output, a single representative capture is shown and annotated
+"both runs identical"; where a run varies a drive target (e.g. D1 corrupt on d1 vs d3), both are
+shown. §4.1 (D1) is the worked exemplar showing two complete runs with UTC timestamps and
+per-run drive targets. Scenarios whose backend outcome is placement-sensitive (§4.9.2, the
+delete-marker cross-product) are reported as an **observed distribution across all four drive
+placements ×2 runs**, not smoothed to a single representative capture. All captures are embedded **inline** next
+to the claim they support (raw JSON, `RAW`/`MC` struct lines, on-disk listings, and trace
+output shown verbatim); the investigation persisted no external evidence files, so the
+document is self-contained and there are none to name in §7.
 
 The **baseline** healthy object (`healtest/obj1`, 1 MiB, sha256
 `84fe3ab299f674abff207058e4c001cabd570514840445af7fcde2fde1b296d2`, ETag
@@ -539,6 +587,28 @@ MC  type=object name="obj1" detail="" parity=2 data=2 before[online=3 missing=1 
 MC  type=object name="obj1" detail="" parity=2 data=2 before[online=3 missing=1 corrupt=0 offline=0 color=yellow] after[online=4 missing=0 corrupt=0 offline=0 color=green]
 # AFTER: d3 part.1=524320B rebuilt; SHA-MATCH: yes (byte-identical)
 ```
+
+The same reconstruct outcome through the **real `mc` client** (this run corrupts `part.1` on
+d2; a deep scan is used so the checksum mismatch is detected — see §4.6). `mc --json` shows the
+corrupt drive as `state:"missing"`, `color:"yellow"` before → all `ok`, `green` after, with
+`objects_healed:1`; `mc --verbose` renders `[Yellow -> Green]`:
+
+```console
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/healtest/obj1
+{"status":"success","type":"object","name":"healtest/obj1","before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"missing"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":1,"items_scanned":2,"items_healed":1,"size":1048576,"duration":1}
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --verbose --recursive --scan deep local/healtest/obj1
+[Green  ->  Green] healtest/
+[Yellow ->  Green] healtest/obj1
+Healed:	1/1 objects; 1024 KiB in 1s
+
+# recovery is byte-exact: recovered sha256 == baseline sha256
+```
+
+Note the drive-state mapping this makes concrete: a **corrupt `part.1`** (bit-rot; the file
+exists but fails its HighwayHash checksum) renders as `state:"missing"`, not `corrupt` — the
+`corrupt` state is reserved for an unreadable **`xl.meta`** (§4.2, §6.2).
 
 **Decision: 1 drive to heal ≤ parity(2) → `cannotHeal` false → reconstruct.** Both runs
 identical.
@@ -767,57 +837,159 @@ not exist in a versioned bucket; the recursive heal enumerates real versions via
 which is what drives it into the EARLY dangling site (recall the LATE site is blocked for
 delete markers by `!latestMeta.Deleted`, §3.2).
 
-**DEL-A — DM present on the majority (3 of 4; d4 reverted to `[V1]`):**
+**DEL-A — DM on the majority (3 of 4; d4 reverted to `[V1]`) → object stays DELETED:**
+
+The recursive deep heal below is the identical command for every DEL cell (it enumerates the
+DM by its version-id, per the mechanism noted above); only the on-disk pre-state differs. Full,
+unedited `mc` stream — one `object` record for the DM version, one for V1, then the `summary`:
 
 ```console
-# DURING: d1,d2,d3 xl.meta=477B [DM,V1]; d4 xl.meta=368B [V1]
+# DURING on-disk (368B = [V1] only; 477B = [DM,V1]) — DM kept on d1,d2,d3; d4 reverted:
+#   d1 xl.meta=477B [DM,V1]   d2 xl.meta=477B [DM,V1]   d3 xl.meta=477B [DM,V1]   d4 xl.meta=368B [V1]
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"yellow","offline":0,"online":3,"missing":1,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"missing"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":2,"objects_healed":1,"items_scanned":3,"items_healed":1,"size":1048576,"duration":1}
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" ls --versions local/verbkt/dobj
+[2026-07-14 01:22:15 UTC]     0B STANDARD 25b1f09d-5d70-4014-810a-6c17dd046a81 v2 DEL dobj
+[2026-07-14 01:22:15 UTC] 1.0MiB STANDARD 27f8823d-f950-4e6b-b6a2-627955e90001 v1 PUT dobj
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" stat local/verbkt/dobj
+mc: <ERROR> Unable to stat `local/verbkt/dobj`. Object does not exist.
+# AFTER on-disk — the delete marker was PROPAGATED to d4; all four converge to [DM,V1]:
+#   d1 xl.meta=477B   d2 xl.meta=477B   d3 xl.meta=477B   d4 xl.meta=477B
 ```
 
-```jsonl
-RAW {"resultId":2,"type":"object","bucket":"verbkt","object":"dobj","versionId":"978d042f-cae8-44c5-9c7f-99b320e41ed2","detail":"","parityBlocks":2,"dataBlocks":2,"diskCount":4,"setCount":0,"before":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"missing"}]},"after":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"objectSize":0}
-MC  type=object name="dobj" detail="" parity=2 data=2 before[online=3 missing=1 corrupt=0 offline=0 color=yellow] after[online=4 missing=0 corrupt=0 offline=0 color=green]
-```
+The DM is present on 3 drives and not-found on 1, so `notFoundMetaErrs = 1` and
+`dataBlocks = (len(errs)+1)/2 = (4+1)/2 = 2`; the purge test `notFoundMetaErrs > dataBlocks`
+is `1 > 2` → **FALSE**, so the DM is **not** dangling. The heal therefore **propagates the
+delete marker outward** to d4 (DM record `before color:"yellow" online:3 missing:1` → `after
+green`, `objects_healed:1`); afterwards `mc stat` reports the object gone and `mc ls --versions`
+shows the DM as the latest version. The object **stays DELETED**. The DM record's `size:0`
+reflects that a delete marker carries no data (`cmd/erasure-healing.go:1015-1016`). Both runs
+identical.
+
+**DEL-tie — DM on exactly half (2 of 4; d3,d4 reverted to `[V1]`) → object stays DELETED (the strict-`>` boundary):**
+
+This is the boundary case the earlier draft omitted. It proves the purge test is a **strict
+`>`**, not `≥`:
 
 ```console
-# versions after heal: DM (isDeleteMarker=true, isLatest=true) + V1
-$ /tmp/s3cli-bin "$ENDPOINT" stat verbkt dobj
-stat-error: The specified key does not exist.
-# AFTER on-disk: d4 xl.meta 368B → 477B  (the delete marker was PROPAGATED to d4)
+# DURING on-disk — DM kept on d1,d2; d3,d4 reverted to [V1]-only:
+#   d1 xl.meta=477B [DM,V1]   d2 xl.meta=477B [DM,V1]   d3 xl.meta=368B [V1]   d4 xl.meta=368B [V1]
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"red","offline":0,"online":2,"missing":2,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"missing"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"missing"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":0}
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":2,"objects_healed":1,"items_scanned":3,"items_healed":1,"size":1048576,"duration":1}
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" ls --versions local/verbkt/dobj
+[2026-07-14 01:22:17 UTC]     0B STANDARD e8cdeb53-2951-42f3-89d9-bac653d1d8b6 v2 DEL dobj
+[2026-07-14 01:22:17 UTC] 1.0MiB STANDARD 9b09117c-7ab1-4130-ad0d-0122e558137b v1 PUT dobj
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" stat local/verbkt/dobj
+mc: <ERROR> Unable to stat `local/verbkt/dobj`. Object does not exist.
+# AFTER on-disk — DM propagated to d3,d4; all four converge to [DM,V1]:
+#   d1 xl.meta=477B   d2 xl.meta=477B   d3 xl.meta=477B   d4 xl.meta=477B
 ```
 
-**DM has quorum ⇒ the delete marker is HEALED (propagated) to the missing drive; the object
-stays DELETED.** `objectSize:0` because a delete marker has no data. Both runs identical.
+**Key result:** the DM lives on only **2 of 4** drives — a dead **tie** — and the DM record's
+`before` grid is `color:"red", online:2, missing:2` (d3,d4 `state:"missing"`), yet the delete
+marker still **wins** and propagates to d3,d4 (`after green`, `objects_healed:1`); all four
+drives converge to 477B `[DM,V1]` and the object **stays DELETED**. The purge test is
+`notFoundMetaErrs > dataBlocks` = `2 > 2` → **FALSE**. A tie is *not* a majority-miss: a delete
+marker is purged only when it is missing on **strictly more than** `dataBlocks = 2` drives
+(i.e. ≥ 3). This is the exact `(len(errs)+1)/2` integer-division boundary at
+`cmd/erasure-healing.go:1015-1016`, and it is why a `red` before-grid is **not** by itself
+sufficient to overturn the delete. Both runs were identical (`objects_healed:1`; all four
+drives → 477B `[DM,V1]`; `mc stat` → object gone).
 
-**DEL-B — DM present on the minority (1 of 4; d2,d3,d4 reverted to `[V1]`):**
+**DEL-B — DM on the minority (1 of 4) → DM purged, object RESTORED to V1:**
+
+Two facets must be separated here: the **namespace / API decision** (uniform) and the **on-disk
+physical convergence** (placement-sensitive). Conflating them is what made the earlier
+minority-only claim imprecise.
+
+**(i) API decision — uniform across all four single-drive placements, both runs (8 of 8).**
+Wherever the lone DM lives, it is missing on the other 3 drives, so `notFoundMetaErrs = 3 >
+dataBlocks(2)` → **TRUE** → the DM is judged dangling and purged; V1 becomes the latest version
+and is readable. Representative capture, **DM-on-d1**:
 
 ```console
-# DURING: d1 xl.meta=477B [DM,V1]; d2,d3,d4 xl.meta=368B [V1]
+# DURING on-disk — DM kept on d1; d2,d3,d4 reverted to [V1]-only:
+#   d1 xl.meta=477B [DM,V1]   d2 xl.meta=368B [V1]   d3 xl.meta=368B [V1]   d4 xl.meta=368B [V1]
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","error":"Invalid parity shard count/surplus shard count given: surplusShardsBeforeHeal: 0, parityShards: 0","detail":"Version not found: verbkt/dobj(4f4d5601-16ce-4fb6-92f8-5aef051e4a20)","type":"object","name":"/","before":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"after":{"color":"","offline":0,"online":0,"missing":0,"corrupted":0,"drives":null},"size":0}
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":2,"objects_healed":0,"items_scanned":3,"items_healed":0,"size":1048576,"duration":1}
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" ls --versions local/verbkt/dobj
+[2026-07-14 01:22:19 UTC] 1.0MiB STANDARD d73476af-f266-48c6-862b-090a6aea5256 v1 PUT dobj
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" stat local/verbkt/dobj
+Name      : dobj
+Size      : 1.0 MiB
+VersionID : d73476af-f266-48c6-862b-090a6aea5256
+# AFTER on-disk — DM physically removed from every drive; all four converge to [V1]:
+#   d1 xl.meta=368B   d2 xl.meta=368B   d3 xl.meta=368B   d4 xl.meta=368B
 ```
 
-```jsonl
-RAW {"resultId":2,"type":"object","bucket":"","object":"","versionId":"","detail":"Version not found: verbkt/dobj(535a4b9f-23cb-4889-9de7-c4f524079c1f)","diskCount":0,"setCount":0,"before":{"drives":null},"after":{"drives":null},"objectSize":0}
-RAW {"resultId":3,"type":"object","bucket":"verbkt","object":"dobj","versionId":"10208161-70c9-429a-b123-131731096db4","detail":"","parityBlocks":2,"dataBlocks":2,"diskCount":4,"setCount":0,"before":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"objectSize":1048576}
-MC  type=object name="dobj" detail="" parity=2 data=2 before[online=4 missing=0 corrupt=0 offline=0 color=green] after[online=4 missing=0 corrupt=0 offline=0 color=green]
-```
+The DM version's own heal record reports `Version not found: verbkt/dobj(<DMID>)` with
+`drives:null` and the reed-solomon engine message `Invalid parity shard count/surplus shard
+count given: surplusShardsBeforeHeal: 0, parityShards: 0` — the healer resolved the DM away as
+dangling, so there is nothing to reconstruct — while V1 heals `green`. `objects_healed:0`
+because no online-shard count increased (V1 was already intact on all four drives; only the DM
+was removed). Across all four placements × 2 runs the S3 result was identical: `mc ls
+--versions` shows only V1 and `mc stat` returns the 1 MiB object.
+
+**(ii) Physical convergence — placement-sensitive.** Whether the DM's *stale on-disk `xl.meta`*
+is physically reconciled depends on which drive held it:
+
+- **DM on d1, d2, or d3 → full convergence.** The recursive version-walk enumerates the DM
+  version (`objects_scanned:2`), emits the DM heal record shown above, and the stale `[DM,V1]`
+  meta is physically removed from **every** drive, including the one that held it — after heal
+  all four drives are 368B `[V1]`. Each of the three placements was observed twice and all six
+  trials converged identically (DM-on-d1/d2/d3, `objects_scanned:2`, AFTER d1..d4 all 368B; the
+  DM-on-d1 capture above is representative).
+
+- **DM on d4 → the holding drive keeps a stale orphan.** The version-walk does **not** enumerate
+  the DM version (`objects_scanned:1`, and there is **no** DM heal record — only the V1 record
+  and the summary); d1/d2/d3 are 368B but **d4 persists at 477B `[DM,V1]`**:
 
 ```console
-# versions after heal: ONLY V1 (isDeleteMarker=false, isLatest=true)
-$ /tmp/s3cli-bin "$ENDPOINT" stat verbkt dobj
-stat verbkt/dobj etag=ac2a482b34c7a8c6ea03dbbc2a0b2449 size=1048576 versionId=10208161-70c9-429a-b123-131731096db4
-# AFTER on-disk: d1 xl.meta 477B → 368B  (the delete marker was PHYSICALLY REMOVED)
+# DM-on-d4 — same recursive deep heal; note objects_scanned:1 and NO DM record:
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --json --recursive --scan deep local/verbkt/dobj
+{"status":"success","type":"object","name":"verbkt/dobj","before":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"color":"green","offline":0,"online":4,"missing":0,"corrupted":0,"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"size":1048576}
+{"status":"success","type":"summary","objects_scanned":1,"objects_healed":0,"items_scanned":2,"items_healed":0,"size":1048576,"duration":1}
+# AFTER on-disk (DM-on-d4): d1,d2,d3 = 368B [V1];  d4 = 477B [DM,V1]  ← stale orphan
 ```
 
-**DM lacks quorum ⇒ the delete marker is judged dangling and PURGED** (`resultId:2` is the DM
-version, reported `Version not found` with `drives:null`), while **V1 heals green** on all four
-drives (`resultId:3`). Net effect: **the object is RESTORED** to V1. Both runs identical.
+The d4 orphan did **not** converge under any canonical trigger tried afterward — a second
+`--recursive --scan deep` heal, three inline GETs (the MRF path), a bucket-level recursive heal,
+and a non-recursive object heal all left d4 at 477B. Once the DM version is resolved away from
+the namespace it is no longer returned by the version enumeration (`fivs.Versions`,
+`cmd/erasure-server-pool.go:2513-2514`), so heal never revisits that version to reconcile the
+laggard. Decoding d4's `xl.meta` with `/tmp/xl-meta` confirms it still carries **two** versions
+(a `Type:2` delete-marker + a `Type:1` object) whereas d1/d2/d3 carry only the object — the
+stale DM is invisible to the S3 namespace (`mc ls`/`mc stat` never surface it) but physically
+present on d4. *(Which drive's `xl.meta` seeds the listing quorum, and thus whether the DM
+version is enumerated for heal, is an observed distribution across placements; the precise
+enumeration-gating mechanism is labeled **inferred**, grounded in the `fivs.Versions` walk
+cited above.)*
+
+**Net effect (both facets):** at the S3 level the object is uniformly **RESTORED** to V1 in
+every minority placement (8 of 8 runs); on disk, convergence is complete except when the lone
+DM sat on the last drive, which retains a namespace-invisible stale marker. The entire
+cross-product was executed **twice**; every case — including the DM-on-d1 full convergence
+(all four → 368B) versus the DM-on-d4 orphan (368B×3, d4 → 477B) — reproduced identically
+on both runs (decision shape and on-disk convergence pattern both stable).
 
 **Boundary (c), answered directly:** a partial **WRITE** and a partial **DELETE** heal by
 *different rules*. A normal object is purged only when its `xl.meta` **or** its data-dir is
-not-found on **> ParityBlocks** (≥ 3 of 4) drives (parts matter). A delete marker ignores parts
-and is judged on **metadata majority** of the version: if the DM holds quorum it is healed
-outward and the object stays DELETED; if the DM is in the minority it is purged and the
-underlying version is restored. The two branches are literally different code
-(`cmd/erasure-healing.go:1016` for delete markers vs `:1025`/`:1030` for normal objects).
+not-found on **> ParityBlocks** (≥ 3 of 4) drives — parts count (§4.9.1). A delete marker
+ignores parts entirely and is decided purely on whether the marker itself is missing on **more
+than a data-majority** of drives: it survives on a majority **or a tie** (`notFoundMetaErrs >
+dataBlocks` false when missing on ≤ 2 → DM propagated, object stays DELETED: DEL-A and DEL-tie)
+and is purged only in the strict minority (missing on ≥ 3 → object restored to V1: DEL-B). The
+two branches are literally different code (`cmd/erasure-healing.go:1015-1016` for delete markers
+vs `:1025`/`:1030` for normal objects).
 
 ### 4.10 Server-side write-back proof (reconstruction is real, and reads exactly `DataBlocks` survivors)
 
@@ -938,14 +1110,24 @@ inline to serve the read *and* enqueues the object for background repair
 ```
 
 The `healRoutine` (`cmd/mrf.go:220`) drains the queue and calls `healObject`
-(`cmd/mrf.go:272`/`276`). The same `globalMRFState.addPartialOp` producer is wired into the
-**write** paths as well, not only the GET path shown above (source-cited anchors in this
-checkout): the read/GET path at `cmd/erasure-object.go:400`, the PUT/put-object partial-write
-path at `cmd/erasure-object.go:805`, the copy/rename paths at `cmd/erasure-object.go:1578` and
-`:2113`, the multipart complete path at `cmd/erasure-multipart.go:1409`, and the peer S3 client
-at `cmd/peer-s3-client.go:261`. So a partially-failed **WRITE** enqueues the same MRF repair the
-GET path does; the outcome is the identical `healObject` decision (§3). The GET case is the one
-reproduced end-to-end on-disk below; the write-path producers are cited from source.
+(`cmd/mrf.go:272`/`276`). The `globalMRFState.addPartialOp` producer is wired into **both** read
+and write paths (source-cited anchors in this checkout — corrected from the earlier draft, which
+mis-labelled the read-path enqueue at `:805` as the PUT path):
+
+- **GET/read producers** — `getObjectWithFileInfo` (`cmd/erasure-object.go:400`, the block quoted
+  above) and `getObjectFileInfo` (`cmd/erasure-object.go:805`, which reconstructs missing
+  metadata on read). Both are on the read path, *not* the write path.
+- **Partial-WRITE producer** — `er.addPartial(bucket, object, fi.VersionID)` inside `putObject`
+  (`cmd/erasure-object.go:1574`; the loop at `:1567-1575` enqueues any disk that was offline or
+  went offline during the upload). Its helper `er.addPartial` (`cmd/erasure-object.go:2112`)
+  calls `globalMRFState.addPartialOp` (`:2113`); the bulk/versioned write branch enqueues at
+  `cmd/erasure-object.go:1578`.
+- **Other write producers** — the multipart-complete path (`cmd/erasure-multipart.go:1409`) and
+  the peer S3 client (`cmd/peer-s3-client.go:261`).
+
+So a partially-failed **WRITE** enqueues the same MRF repair a GET does; the outcome is the
+identical `healObject` decision (§3). **Both** the GET/read and the PUT/write producers are now
+reproduced end-to-end on-disk below.
 
 Observed, twice, with **no** manual heal issued — remove d3's data-dir, then GET:
 
@@ -960,26 +1142,66 @@ TRACE type=healing func=heal.Object path="healtest/obj1" bytes=1048576 dur=7.645
 
 Both runs restored d3 within ~1.5 s. This is the observed **successful on-disk MRF repair**.
 
-**Background scanner.** Wiring (finding-corrected): the periodic object scanner starts via
-`initDataScanner` (`cmd/server-main.go:1028-1030`, gated by `_MINIO_SCANNER`, default `on`) →
-`runDataScanner` (`cmd/data-scanner.go:159`) → `scannerItem.applyHealing`
-(`cmd/data-scanner.go:954`). Its per-object heal-scan selection is **1-in-`healObjectSelectProb`
-= 1-in-1024** (`cmd/data-scanner.go:61`) on a **1-minute** cycle
-(`dataScannerStartDelay`, `cmd/data-scanner.go:58`). This is a *different* subsystem from
-`initAutoHeal` (`cmd/background-newdisks-heal-ops.go:377`, invoked at
-`cmd/erasure-server-pool.go:195`), which drives *drive*-healing and MRF, not the periodic object
-scan.
+**Partial WRITE → MRF (no GET, no manual heal).** To exercise the **write**-path producer
+(`er.addPartial`, `cmd/erasure-object.go:1574`) directly, one drive is made unwritable *during*
+the PUT: the bucket directory on d2 is set immutable (`chattr +i`), so `RenameData` into d2 fails
+while d1/d3/d4 succeed. The PUT still returns success because write quorum (**3** for EC:2) is
+met, and d2 is enqueued to the MRF list. Restoring d2 writability then lets the MRF `healRoutine`
+(`cmd/mrf.go:220`) repair d2 with **no** GET and **no** manual heal. Observed twice:
 
-Genuine scaled attempt (observed, honest negative): 1024 non-inlined 512 KiB objects were
-created, one shard removed from **every** object, and `ServiceTrace` was watched for **240 s**
-(~4 cycles). The scanner was demonstrably active on the bucket (830 captured storage traces —
-`.usage-cache.bin` `ReadXL`/`RenameData`/`Delete` accounting), but **no object-level
-`heal.Object` fired and 0 shards were restored** in the window, exactly as expected from the
-1-in-1024 hash sampling (the AAP itself flags this as non-deterministic and prefers the manual
-path). The scanner's heal *action* is the same `healObject` proven deterministic above via the
-manual and MRF triggers; only its per-object **selection** is probabilistic. (Objects smaller
-than ~256 KiB inline into `xl.meta` and have no separate `part.1`; 512 KiB was used to guarantee
-separate shard files.)
+```console
+# RUN 1
+$ chattr +i "$RUN_ROOT/d2/healtest"                       # block RenameData into d2 during PUT
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" cp "$OBJSRC" local/healtest/mrfobj_1 ; echo exit=$?
+exit=0                                                     # write quorum 3 met (d1,d3,d4)
+# immediately after PUT, per-drive part.1 (d2 never received the shard):
+   d1 part.1=524320B   d2 part.1=ABSENT   d3 part.1=524320B   d4 part.1=524320B
+$ chattr -i "$RUN_ROOT/d2/healtest"                        # restore writability; MRF repairs d2
+# poll d2: ~996ms later → d2 part.1 RESTORED (524320B)     ← MRF healRoutine, no GET/manual heal
+
+# RUN 2 (identical): PUT exit=0; d2 ABSENT right after PUT; d2 restored ~1040ms later
+```
+
+Both runs: the PUT succeeded on 3 of 4 drives, d2 was absent immediately afterward, and the MRF
+`healRoutine` restored d2's `part.1` (524320B) about a second later **without any GET or manual
+heal** — the write-path counterpart to the GET repair above. (`chattr +i` is used because on a
+read-serving standalone set the health monitor keeps a drive "online" as long as reads succeed;
+making the target path immutable is the reliable way to force the write into a partial state.)
+
+**Background scanner.** Wiring: the periodic object scanner starts via `initDataScanner`
+(`cmd/server-main.go:1028-1030`, gated by `_MINIO_SCANNER`, default `on`) → `runDataScanner`
+(`cmd/data-scanner.go:159`) → `scannerItem.applyHealing` (`cmd/data-scanner.go:954`), on a
+**1-minute** cycle (`dataScannerStartDelay`, `cmd/data-scanner.go:58`). Whether an object is
+selected for a heal-scan is `item.heal.enabled = thisHash.modAlt(…) && f.shouldHeal()`
+(`cmd/data-scanner.go:510`) — the 1-in-`healObjectSelectProb` (= 1-in-**1024**,
+`cmd/data-scanner.go:61`) hash sampling **AND** the predicate `s.shouldHeal()`.
+
+**Correction — the periodic object-heal is *gated off entirely* on an erasure set, not merely
+sampled at 1/1024** (the earlier draft attributed the observed no-op to unlucky sampling; that is
+wrong). When the server runs as an erasure set, `globalIsErasure` is true
+(`cmd/server-main.go:400`, `globalIsErasure = (setupType == ErasureSetupType)`), which sets
+`skipHeal` to true in the folder scanner (`cmd/data-scanner.go:337-338`:
+`if globalIsErasure || cache.Info.SkipHealing { skipHeal.Store(true) }`). `s.shouldHeal()` then
+returns `false` on its **first** check (`cmd/data-scanner.go:343-344`: `if skipHeal.Load() {
+return false }`), *before* it ever consults the sampling probability. The assignment
+`s.healObjectSelect = healObjectSelectProb` (`cmd/data-scanner.go:357-359`) still executes, but
+`shouldHeal` short-circuits on `skipHeal` and never reaches the `healObjectSelect` check — so
+`item.heal.enabled` at `:510` is **always false** and no object is ever selected for a scanner
+heal. Erasure object repair is instead driven by the MRF queue (above), inline
+reconstruct-on-read/write, and the manual `mc admin heal` path — **not** by the scanner's
+per-object heal. (This is distinct from `initAutoHeal`, `cmd/background-newdisks-heal-ops.go:377`,
+invoked at `cmd/erasure-server-pool.go:195`, which drives *drive*/disk healing.)
+
+Runtime confirmation (observed, and consistent with the gate — *not* with 1/1024 sampling): 1024
+non-inlined 512 KiB objects were created, one shard removed from **every** object, and
+`ServiceTrace` was watched for **240 s** (~4 scanner cycles). The scanner was demonstrably active
+on the bucket (830 captured storage traces — `.usage-cache.bin` `ReadXL`/`RenameData`/`Delete`
+usage accounting), yet **no object-level `heal.Object` fired and 0 shards were restored**. Had
+this been mere 1/1024 sampling across 1024 objects over ~4 cycles, several heals would have been
+expected; zero heals is what the `skipHeal` gate predicts. The scanner's heal *action*, in the
+non-erasure modes where it is enabled, is the same `healObject` proven deterministic above via the
+manual and MRF triggers. (Objects smaller than ~256 KiB inline into `xl.meta` and have no separate
+`part.1`; 512 KiB was used to guarantee separate shard files.)
 
 
 ---
@@ -1054,14 +1276,15 @@ evidence in §4.9):
 | | Partial WRITE (normal object) | Partial DELETE (delete marker) |
 |---|---|---|
 | Branch | normal-object: `cmd/erasure-healing.go:1025` (meta) / `:1030` (parts) | delete-marker: `cmd/erasure-healing.go:1012-1016` |
-| Purge threshold | `notFoundMetaErrs > ParityBlocks` **or** `notFoundPartsErrs > ParityBlocks` (i.e. ≥ 3 of 4) | `notFoundMetaErrs > (len(errs)+1)/2` (data-majority, i.e. ≥ 3 of 4) |
+| Purge threshold | `notFoundMetaErrs > ParityBlocks` **or** `notFoundPartsErrs > ParityBlocks` (i.e. ≥ 3 of 4) | `notFoundMetaErrs > dataBlocks` with `dataBlocks=(len(errs)+1)/2=2` — a **strict `>`**, so purge needs the DM missing on **≥ 3** drives; a 2-of-4 **tie does *not* purge** (DEL-tie, §4.9.2) |
 | Parts considered? | **Yes** — a normal object with data-dir gone on 3 drives purges even when all `xl.meta` survive (§4.9.1 data-only cell) | **No** — delete markers have no parts; part errors are ignored |
 | Reached via | EARLY site (meta below quorum) or LATE site (`cmd/erasure-healing.go:438`) | **EARLY site only** — the LATE `cannotHeal` gate excludes deletes via `!latestMeta.Deleted` (§3.2) |
-| Observed outcomes | recoverable → reconstruct; ≥3 not-found → purge (stays deleted) | DM has quorum → propagate DM, object stays deleted (DEL-A, §4.9.2); DM in minority → purge DM, object restored (DEL-B) |
+| Observed outcomes | recoverable → reconstruct; ≥3 not-found → purge (stays deleted) | DM on a majority (3/4) **or a tie (2/4)** → DM propagated, object stays DELETED (DEL-A, DEL-tie); DM in the strict minority (1/4) → DM purged, object **RESTORED** to V1 (DEL-B). The S3/API decision is **uniform** across drive placements; on-disk physical convergence is **placement-sensitive** — a lone DM on the last drive leaves a namespace-invisible stale orphan (§4.9.2 DEL-B(ii)) |
 
 The concrete divergence: a partial WRITE that lost 3 **data-dirs** but kept all metadata still
-purges (parts branch), whereas a delete marker never looks at parts at all and is decided purely
-on whether the marker itself holds a data-majority across drives.
+purges (parts branch), whereas a delete marker never looks at parts at all: it is purged only when the marker itself is
+not-found on **strictly more than** `dataBlocks` (2) drives, so it survives on a majority *or an even
+split* and is removed only in the strict minority.
 
 ---
 
@@ -1188,8 +1411,9 @@ Healing is **asynchronous and streamed**: `HealHandler` calls `LaunchNewHealSequ
 the sequence, `traverseAndHeal` (`cmd/admin-heal-ops.go:832`) walks objects, `healSequence.healObject`
 (`cmd/admin-heal-ops.go:916`) heals each, and `pushHealResultItem` (`cmd/admin-heal-ops.go:618`)
 enqueues each `HealResultItem` onto the stream the client reads. `forceStart`/`forceStop`
-begin/cancel a sequence. The harness client (§4.0) drives exactly this contract: it calls
-`madmin`'s `Heal` (`heal-commands.go:253`, which POSTs `adminAPIPrefix+"/heal/%s"`) with
+begin/cancel a sequence. The real `mc admin heal` CLI drives exactly this contract; the
+supplementary `madmin-go/v3` capture used for the `RAW` lines (§4.0) calls the same
+`madmin.Heal` (`heal-commands.go:253`, which POSTs `adminAPIPrefix+"/heal/%s"`) with
 `HealOpts{Recursive, ScanMode, Remove:true}` and prints the raw `HealResultItem`s.
 
 The token/streaming contract is directly observable — the client prints the `clientToken` the
@@ -1197,14 +1421,37 @@ server assigned, streams each `HealResultItem`, and prints the terminal summary 
 finishes (captured on the healthy baseline object):
 
 ```console
-# heal started clientToken=5903d427-4492-4012-88e7-35ec261ab87f startTime=2026-07-13T18:39:24.39721781Z
+# heal started clientToken=<redacted-client-token> startTime=2026-07-13T18:39:24.39721781Z
 RAW {"resultId":1,"type":"bucket","bucket":"healtest","object":"","versionId":"","detail":"","diskCount":4,"setCount":-1,"before":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"objectSize":0}
 RAW {"resultId":2,"type":"object","bucket":"healtest","object":"obj1","versionId":"null","detail":"","parityBlocks":2,"dataBlocks":2,"diskCount":4,"setCount":0,"before":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"after":{"drives":[{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d1","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d2","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d3","state":"ok"},{"uuid":"","endpoint":"/tmp/blitzy-heal-run.main/d4","state":"ok"}]},"objectSize":1048576}
 # summary=finished failureDetail="" items=1
 ```
 
 The `clientToken` is exactly what the client re-submits to drain subsequent pages, and
-`summary=finished` marks sequence completion.
+`summary=finished` marks sequence completion. (The token's UUID is a per-session credential for
+draining that heal sequence; the concrete value captured at runtime is shown here as
+`<redacted-client-token>` and is not reproduced in this committed document.)
+
+**Version-skew caveat — `mc admin heal --force-start` is not usable against this server.** The
+`mc` client (`RELEASE.2025-08-13`) is newer than the c07 server, and its `--force-start` flow is
+incompatible with this server build: `mc` first POSTs a force-start, then **polls the same
+endpoint carrying both the returned `clientToken` and `forceStart=true`**, which
+`extractHealInitParams` rejects — `(hip.clientToken != "" && (hip.forceStart || hip.forceStop))`
+returns `ErrInvalidRequest` (`cmd/admin-handlers.go:1275-1277`). Observed (real `mc`):
+
+```console
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin heal --force-start --recursive local/healtest/obj1 ; echo exit=$?
+mc: <ERROR> Unable to display heal status. Invalid Request.
+exit=1
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" --json admin heal --force-start --recursive local/healtest/obj1
+{"status":"error","error":{"message":"Unable to display heal status.","cause":{"message":"Invalid Request","error":{"Code":"InvalidRequest","Message":"Invalid Request","BucketName":"healtest","Key":"","RequestID":"18C2037C37396591","HostID":"470a0afc0f6fdbebb6a8e14ece29122784c0656e19563387135a7c8e02feb163","Region":""}},"type":"fatal"}}
+```
+
+The **supported subset** works normally: a plain `mc admin heal` (which is what every scenario
+in §4 uses) starts a fresh sequence and returns `exit=0` immediately afterward, and
+`mc admin heal --force-stop` is accepted (`Heal stopped successfully`, `exit=0`). Only the
+`--force-start` combination trips the version skew, so it is never used here.
 
 The full dispatch chain (all anchors in this checkout):
 
@@ -1239,12 +1486,37 @@ reconstruct that the write-back trace (§4.10) exercised.
 
 ## 7. Exact build, invocation, and cleanup
 
-### 7.1 Canonical build (from this checkout)
+### 7.1 Canonical build (from a detached checkout of commit `c07e5b49d477`)
+
+> ⚠️ **Local-investigation-only — NOT production-safe.** §7.1–§7.2 build and run a **historical
+> development revision** (`c07e5b49d477`, banner `DEVELOPMENT.2024-11-25T17-10-22Z`, Go 1.23.2)
+> solely to reproduce the exact server under test, bound to **loopback** (`127.0.0.1:19000`) with
+> **disposable default credentials** (`minioadmin:minioadmin`). This build is **not** security-patched
+> to current levels: an official `govulncheck` run against the canonical c07 binary reports **82
+> vulnerable-symbol findings** across **eight modules and the Go standard library**, and MinIO has
+> since published **nine advisories whose affected ranges include or conditionally include this
+> commit (1 Critical, 6 High, 2 Medium)** — most lie outside the erasure-healing path exercised
+> here, but the runnable historical build as a whole is not production-safe. Do **not** expose it to
+> a network, and do **not** reuse these credentials outside a disposable local sandbox. For any
+> production or internet-facing deployment, install a **current, supported, patched MinIO release**
+> from the official channel (<https://min.io/download>) instead. No source file or dependency was
+> modified to produce this build (the read-only constraint is preserved via a detached `git worktree`).
+
+**The checkout must be at commit `c07e5b49d477` before building.** `gen-ldflags.go` derives
+`Version`, `ReleaseTag`, and `CommitID` from the *currently checked-out commit* (via `git`), so
+the banner is a property of the checkout, not of the source files. This repository's working
+branch carries the answer-document commits **on top of** the `c07e5b49d477` base, so building
+from the branch tip embeds that tip's commit and a later `ReleaseTag` date — **not** the
+canonical c07 banner. To reproduce the exact server under test, build from a **detached checkout
+of `c07e5b49d477`** (a `git worktree` keeps the tracked tree untouched, satisfying the read-only
+constraint):
 
 ```console
 $ export PATH=$PATH:/usr/local/go/bin
 $ export CGO_ENABLED=0
-$ cd <repo>                       # the read-only MinIO source tree (commit c07e5b49d477)
+$ cd <repo>                       # the read-only MinIO source tree
+$ git worktree add --detach /tmp/minio-c07-src c07e5b49d477b0774f23db3b290745aef8c01bd2
+$ cd /tmp/minio-c07-src           # detached HEAD at the exact commit
 $ LDFLAGS=$(go run buildscripts/gen-ldflags.go)
 $ go build -ldflags "$LDFLAGS" -o /tmp/minio-bin .
 ```
@@ -1259,10 +1531,19 @@ License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 Copyright: 2015-2024 MinIO, Inc.
 ```
 
-The exact `LDFLAGS` string produced by `gen-ldflags.go` on this host was:
+The exact `LDFLAGS` string produced by `gen-ldflags.go` in the detached c07 checkout on this
+host was (note `GOPATH`/`GOROOT` resolve empty in this build environment):
 
 ```console
--s -w -X github.com/minio/minio/cmd.Version=2024-11-25T17:10:22Z -X github.com/minio/minio/cmd.CopyrightYear=2024 -X github.com/minio/minio/cmd.ReleaseTag=DEVELOPMENT.2024-11-25T17-10-22Z -X github.com/minio/minio/cmd.CommitID=c07e5b49d477b0774f23db3b290745aef8c01bd2 -X github.com/minio/minio/cmd.ShortCommitID=c07e5b49d477 -X github.com/minio/minio/cmd.GOPATH=/root/go -X github.com/minio/minio/cmd.GOROOT=
+-s -w -X github.com/minio/minio/cmd.Version=2024-11-25T17:10:22Z -X github.com/minio/minio/cmd.CopyrightYear=2024 -X github.com/minio/minio/cmd.ReleaseTag=DEVELOPMENT.2024-11-25T17-10-22Z -X github.com/minio/minio/cmd.CommitID=c07e5b49d477b0774f23db3b290745aef8c01bd2 -X github.com/minio/minio/cmd.ShortCommitID=c07e5b49d477 -X github.com/minio/minio/cmd.GOPATH= -X github.com/minio/minio/cmd.GOROOT=
+```
+
+For contrast, running the **same** `gen-ldflags.go` from the working-branch tip (the tracked
+tree) embeds the non-canonical banner, which is exactly why the detached checkout is required:
+
+```console
+# from the working-branch tip (NOT the server under test):
+-X …cmd.Version=2026-07-13T20:04:28Z -X …cmd.ReleaseTag=DEVELOPMENT.2026-07-13T20-04-28Z -X …cmd.CommitID=9002dfc3ce2c89b8ee9242528c46d871b36b3a9c -X …cmd.ShortCommitID=9002dfc3ce2c
 ```
 
 ### 7.2 Isolated 4-drive run harness (unique root, PID-scoped)
@@ -1276,6 +1557,7 @@ anything:
 $ RUN_ROOT=/tmp/blitzy-heal-run.main          # unique disposable root (never the repo, never the agent's own environment)
 $ PORT=19000 ; CONSOLE=19500                  # non-default; verified free before bind
 $ mkdir -p "$RUN_ROOT"/d1 "$RUN_ROOT"/d2 "$RUN_ROOT"/d3 "$RUN_ROOT"/d4
+$ OBJSRC="$RUN_ROOT/objsrc.bin"; head -c 1048576 /dev/urandom > "$OBJSRC"   # 1 MiB fixture object reused by every scenario (exact size 1048576 B; the sha differs per run — the invariant verified is recovered == baseline)
 $ MINIO_CI_CD=1 /tmp/minio-bin server \
       "$RUN_ROOT"/d1 "$RUN_ROOT"/d2 "$RUN_ROOT"/d3 "$RUN_ROOT"/d4 \
       --address ":$PORT" --console-address ":$CONSOLE" > "$RUN_ROOT/minio.log" 2>&1 &
@@ -1284,14 +1566,30 @@ $ # readiness poll (not a fixed sleep):
 $ until curl -sf "http://127.0.0.1:$PORT/minio/health/live" >/dev/null; do sleep 0.2; done
 ```
 
-Default credentials `minioadmin:minioadmin`. `MINIO_CI_CD=1` bypasses the root-disk guard
+Default credentials `minioadmin:minioadmin` (disposable, loopback-only — see the safety notice at the top of §7.1). `MINIO_CI_CD=1` bypasses the root-disk guard
 (`getDiskInfo`, `cmd/xl-storage.go:367`, root-disk logic at L372-378) only when `/tmp` happens
 to share a device with `/` on a given host;
-it changes no healing behavior. The set auto-selects **EC:2**, confirmed at runtime:
+it changes no healing behavior. An isolated `mc` alias is configured against the running server,
+and the set auto-selects **EC:2**, confirmed at runtime — `mc admin info` shows one erasure set
+of stripe size 4 (4/4 drives), and the per-object heal item reports `parityBlocks:2`:
 
 ```console
-$ /tmp/s3cli-bin 127.0.0.1:19000 mb healtest        # create bucket
-$ # server RAW heal item reports parityBlocks:2 dataBlocks:2 diskCount:4 → EC:2 on 4 drives
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" alias set local http://127.0.0.1:19000 minioadmin minioadmin
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" admin info local
+●  127.0.0.1:19000
+   Uptime: 23 minutes
+   Version: 2024-11-25T17:10:22Z
+   Network: 1/1 OK
+   Drives: 4/4 OK
+   Pool: 1
+
+┌──────┬──────────────────────┬─────────────────────┬──────────────┐
+│ Pool │ Drives Usage         │ Erasure stripe size │ Erasure sets │
+│ 1st  │ 2.1% (total: 48 TiB) │ 4                   │ 1            │
+└──────┴──────────────────────┴─────────────────────┴──────────────┘
+
+$ /tmp/mc --config-dir "$RUN_ROOT/mc" mb --ignore-existing local/healtest   # create bucket
+$ # server heal item then reports parityBlocks:2 dataBlocks:2 diskCount:4 → EC:2 on 4 drives
 ```
 
 All `<DATADIR>` values used in fault injection were **resolved from trusted `ls` output,
@@ -1346,33 +1644,49 @@ never modified) — note they decode **different** files:
   a drive heal — which is a distinct artifact from `xl.meta` and was not needed for these
   object-level scenarios.
 
-### 7.3 Client provenance (why not `mc`)
+### 7.3 Client provenance
 
-`mc` could not be built offline in this environment, so the admin/S3 surface was driven by three
-tiny purpose-built clients compiled **against the exact pinned dependencies** from this checkout's
-`go.mod`, with `GOPROXY=off` (cached modules only):
+**Primary client — the official `mc`.** All heals in §4 are triggered and rendered with the
+official MinIO client, obtained as the standard operator binary from the official download
+endpoint (`https://dl.min.io/client/mc/release/linux-amd64/mc`) — the exact version named in the
+AAP:
+
+```console
+$ /tmp/mc --version
+mc version RELEASE.2025-08-13T08-35-41Z (commit-id=7394ce0dd2a80935aded936b09fa12cbb3cb8096)
+Runtime: go1.24.6 linux/amd64
+Copyright (c) 2015-2025 MinIO, Inc.
+License GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>
+```
+
+`mc` hits the real `POST /minio/admin/v3/heal/` route and the real `healObject` worker; nothing
+is mocked or bypassed. It is a newer release than the c07 server, which is fully supported for
+the admin heal API save for the `--force-start` combination documented in §6.4.
+
+**Supplementary harness clients.** To expose fields `mc --json` collapses and to construct the
+fault scenarios, three tiny clients were also compiled **against the exact pinned dependencies**
+from this checkout's `go.mod`, with `GOPROXY=off` (cached modules only). They are
+supplementary to — not a replacement for — the `mc` output above:
 
 | Harness client | Module used (pinned in `go.mod`) | Role |
 |----------------|----------------------------------|------|
-| `/tmp/healcli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | POSTs the canonical heal route (`madmin.Heal`), prints raw `HealResultItem` JSON, and reproduces `mc`'s `getHColCode` colour algorithm and `hColTable` **verbatim** (return type adapted from `mc`'s internal `col` to `string`) |
+| `/tmp/healcli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | captures the raw `madmin.HealResultItem` struct (the `RAW` lines in §4 — `resultId`/`parityBlocks`/`dataBlocks`/`detail` that `mc --json` drops) via the same `madmin.Heal` the CLI uses, and reproduces `mc`'s `getHColCode` colour algorithm and `hColTable` **verbatim** for the `MC` lines |
 | `/tmp/s3cli-bin` | `github.com/minio/minio-go/v7 v7.0.80` | canonical S3 PUT/GET/STAT/RM/versioning used to build scenarios and observe reads |
 | `/tmp/tracecli-bin` | `github.com/minio/madmin-go/v3 v3.0.77` | subscribes to the canonical `ServiceTrace` stream (the same stream `mc admin trace` consumes) to prove write-back |
 
-These are **canonical entry points** — the heal client hits the real `POST /minio/admin/v3/heal/`
-route and the real `healObject` worker; nothing is mocked or bypassed. The colour computation is
-the only client-side reproduction, and it is byte-identical to `mc`'s table (§6.2). All three were
-built as:
+The colour computation in `healcli` is the only client-side reproduction, and it is
+byte-identical to `mc`'s table (§6.2) — cross-validated against real `mc --verbose` in §4.0/§4.1.
+All three were built as:
 
 ```console
 $ cd /tmp/healcli && GOPROXY=off GOFLAGS=-mod=mod /usr/local/go/bin/go build -o /tmp/healcli-bin .
 ```
 
-**Config isolation.** Unlike `mc alias set`, these clients write **no** persistent configuration:
-each invocation takes the endpoint and credentials as arguments/flags
-(e.g. `/tmp/s3cli-bin 127.0.0.1:19000 …`, `/tmp/healcli-bin -endpoint 127.0.0.1:19000 …`) and
-holds them only in-process. There is no `~/.mc`/`MC_CONFIG_DIR` to leak into or clean up, so no
-operator configuration can be altered. Had `mc` been used instead, every command would need an
-isolated `--config-dir "$RUN_ROOT/mc"` (removed by the `rm -rf "$RUN_ROOT"` in §7.4).
+**Config isolation.** `mc` is invoked with an isolated `--config-dir "$RUN_ROOT/mc"` on every
+call, so it never reads or writes the default `~/.mc` and no real operator alias/config can be
+altered; that directory is removed by the `rm -rf "$RUN_ROOT"` in §7.4. The three harness
+clients write **no** persistent configuration at all — each takes the endpoint and credentials
+as arguments/flags (e.g. `/tmp/s3cli-bin 127.0.0.1:19000 …`) and holds them only in-process.
 
 ### 7.4 Cleanup (leaves the repository byte-unchanged except the answer document)
 
@@ -1380,16 +1694,34 @@ On completion, the server is stopped **by its captured PID** (never a broad `pki
 ephemeral artifact is removed so `git status` shows only this document:
 
 ```bash
-kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null || true   # PID-scoped shutdown
-rm -rf /tmp/blitzy-heal-run.main            # the 4 drives + logs + fixture
-rm -f  /tmp/minio-bin                        # built server binary
-rm -rf /tmp/minio-src                        # detached build worktree
-rm -rf /tmp/healcli /tmp/healcli-bin /tmp/s3cli /tmp/s3cli-bin \
-       /tmp/tracecli /tmp/tracecli-bin /tmp/.v1meta.bin   # harness clients + scratch
-rm -rf /tmp/heal-evidence /tmp/heal-*.sh /tmp/canon_ldflags.txt   # evidence + scripts
-# verify: no listener remains on the run port, and the tree is clean
-ss -ltnp 2>/dev/null | grep ':19000' || echo "no 19000 listener"
-git -C <repo> status --porcelain           # → only: ?? blitzy/documentation/minio_c07e5b49d477.md
+# --- PID-scoped shutdown: verify the captured PID really is our minio-bin before signalling ---
+if [ -n "${SRV_PID:-}" ] && tr '\0' ' ' < "/proc/$SRV_PID/cmdline" 2>/dev/null | grep -q '/tmp/minio-bin'; then
+  kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null || true
+fi
+
+# --- guarded removal: only delete a path that resolves STRICTLY under /tmp (never /, /tmp, or outside) ---
+safe_rm() {                        # refuses empty vars and anything that is not a real path under /tmp
+  local p="${1:-}" rp
+  [ -n "$p" ] || { echo "skip (empty var)"; return; }
+  rp="$(realpath -m -- "$p")"
+  case "$rp" in /tmp/?*) : ;; *) echo "refuse (not under /tmp): $rp"; return;; esac
+  [ -e "$rp" ] || { echo "absent: $rp"; return; }
+  rm -rf -- "$rp"; echo "removed: $rp"
+}
+RUN_ROOT="/tmp/blitzy-heal-run.main"          # the unique, collision-checked root created in §7.2
+for p in "$RUN_ROOT" /tmp/minio-bin /tmp/mc /tmp/xl-meta /tmp/s3cli-bin; do safe_rm "$p"; done
+
+# --- detached build worktree: remove THROUGH git so the tracked tree's worktree list stays clean ---
+git -C <repo> worktree remove --force /tmp/minio-c07-src 2>/dev/null || safe_rm /tmp/minio-c07-src
+git -C <repo> worktree prune
+
+# --- verify: no listener on the run port, and the tracked tree is clean ---
+ss -ltnp 2>/dev/null | grep -q ':19000' && echo "WARN: :19000 still listening" || echo "no :19000 listener"
+git -C <repo> status --porcelain
+#   Expected output: EMPTY. The answer document is TRACKED and committed on the integrated branch,
+#   so a clean working tree prints nothing. (Before committing a doc edit you would instead see a
+#   single ' M blitzy/documentation/minio_c07e5b49d477.md'; you would never see '??', which would
+#   mean the file is untracked — it is not.)
 ```
 
 The MinIO source tree (`cmd/**`, `internal/**`, `docs/**`, build files) is **never modified**;
@@ -1409,10 +1741,16 @@ dangling purge when metadata or data-dir is not-found beyond parity (§4.8, §4.
 minority delete marker is purged (§4.9.2 DEL-B leaves the marker gone). DEGRADED: too many
 non-actionable corruptions to reconstruct but not dangling (§4.7).
 
-**"Runtime evidence in each case, not theory"** — every claim above carries its raw
-`HealResultItem` JSON, `MC` colour line, on-disk before/during/after, S3 GET/STAT output, and —
-for reconstruction and triggers — a `ServiceTrace` capture (§4.10, §4.11). Each scenario was run
-**twice** with resets between; all were stable.
+**"Runtime evidence in each case, not theory"** — each scenario above is evidenced by its
+canonical command and raw output: the `mc admin heal --json`/`--verbose` stream (baseline §4.0,
+corrupt-shard §4.1, and the full delete-marker cross-product §4.9.2) and/or the supplementary
+`RAW`/`MC` `HealResultItem` struct lines (§4.1–§4.8), plus on-disk before/during/after and S3
+GET/STAT output; reconstruction and trigger scenarios additionally carry a `ServiceTrace`
+capture (§4.10, §4.11). Per the two-run methodology (§4.0), every scenario was executed more
+than once with a full reset between runs: §4.1 (D1) shows two complete runs with per-run drive
+targets; scenarios whose two runs were byte-identical show one representative run so annotated;
+and the placement-sensitive delete-marker cross-product (§4.9.2) is reported as an observed
+distribution across all four placements ×2 runs. All were stable on the stated invariants.
 
 **"BEFORE/AFTER status indicators?"** — yes: the `Before`/`After` per-drive `State` blocks of
 `HealResultItem` (§6.1), rendered by the client as the green/yellow/red/grey grid (§6.2).
@@ -1430,9 +1768,15 @@ operation …` (unwrapping `errErasureReadQuorum` = `Read failed. Insufficient n
 online`) for degraded (§4.7, §5.2), and `Object not found: …` for dangling purge (§4.8).
 
 **"(c) partial WRITE vs partial DELETE?"** — different branches of `isObjectDangling` with
-different thresholds; full cross-product in §4.9 and the comparison table in §5.3. WRITE
-considers parts (`:1030`); DELETE ignores parts and uses data-majority (`:1016`); a delete marker
-can only reach the dangling test via the EARLY site because the LATE gate excludes deletes.
+different thresholds; full cross-product in §4.9.2 (DEL-A/DEL-tie/DEL-B) and the comparison table
+in §5.3. WRITE considers parts (`:1030`) and purges on `> ParityBlocks` (≥ 3 of 4); DELETE ignores
+parts and uses the **strict** `notFoundMetaErrs > dataBlocks(2)` (`:1015-1016`) — so a delete
+marker survives on a majority **or a 2-of-4 tie** (propagated, object stays DELETED) and is purged
+only in the strict minority (object restored to V1). A delete marker can only reach the dangling
+test via the EARLY site because the LATE gate excludes deletes (`!latestMeta.Deleted`, §3.2). The
+DELETE-minority S3 decision was **uniform** across all four placements (8 of 8 runs); on-disk
+physical convergence was **placement-sensitive** — a lone DM on the last drive leaves a
+namespace-invisible stale orphan that no canonical trigger reconciled (§4.9.2 DEL-B(ii)).
 
 **Named mechanisms exercised and cited:** `healObject` `:258`, `cannotHeal` `:428`, both
 `deleteIfDangling` sites `:309`/`:438`, `isObjectDangling` `:968` (all four branches),
@@ -1440,9 +1784,16 @@ can only reach the dangling test via the EARLY site because the LATE gate exclud
 `defaultHealResult`, `objectQuorumFromMeta` `:531`, `Erasure.Heal` `:317`, `NewErasure`
 `:42`/`reedsolomon.New` `:63`, `HealHandler` `:1308`, `LaunchNewHealSequence` `:296`,
 `pushHealResultItem` `:618`, the dispatch chain to `erasureObjects.HealObject` `:1039`, the MRF
-producer `erasure-object.go:397-414` + `mrf.go:220/272`, and the scanner
-`data-scanner.go:954/61/58`. All three canonical triggers (manual, MRF-on-GET, background
-scanner) were exercised (§4.11).
+producers — GET/read at `erasure-object.go:400` and `:805`, partial-WRITE at
+`erasure-object.go:1574` (`er.addPartial` → `:2113`) — draining via `mrf.go:220/272`, and the
+scanner `data-scanner.go:954/510/61/58` with its erasure gate
+`server-main.go:400`+`data-scanner.go:337-338/343-344`. **Triggers exercised at runtime:** the
+**manual** `mc admin heal` path (§4.11, §4.1) and the **inline MRF** path on **both** a partial
+GET (remove d3 data-dir, then GET → repaired ~1.5 s) and a partial WRITE (write-block d2 during
+PUT → MRF repaired ~1 s), each observed twice. The **background scanner** was run and observed
+active, but its per-object heal is **gated off on an erasure set** by `skipHeal` (source-grounded
+above), so it performs no object heal on this standalone EC:2 deployment (0 heals in 240 s) — that
+is the correct, observed behavior, not a missed trigger.
 
 **"Create test scenarios and clean them once done"** — honored: all scenarios were built on the
 disposable `/tmp` root and torn down (§7.4); the source tree remains byte-unchanged and the only
