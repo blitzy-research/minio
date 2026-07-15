@@ -2081,7 +2081,7 @@ This GET, too, produced 0 new server-log lines.
   ```
   So `mode=0` in the trace is **`HealUnknownScan`**, not `HealNormalScan`. The read path computes the *correct* (deep) intent, but it is discarded before the queued task runs:
   - `cmd/erasure-object.go:407` — the read flags bit-rot: `BitrotScan: errors.Is(err, errFileCorrupt)` (here `true`).
-  - `cmd/mrf.go:260-263` — that flag is mapped to a scan mode, then dispatched at `:277`:
+  - `cmd/mrf.go:260-263` — that flag is mapped to a scan mode, then dispatched at `:276`:
     ```go
     scan := madmin.HealNormalScan
     if u.BitrotScan {
@@ -3399,7 +3399,7 @@ A representative `403` body (identical shape for every `AccessDenied` row): `{"C
 - **Routes (both wrapped in `adminMiddleware`)** — `cmd/admin-router.go:264` registers `PUT .../set-user-or-group-policy` → `adminMiddleware(adminAPI.SetPolicyForUserOrGroup)`; `cmd/admin-router.go:268` registers `POST .../idp/builtin/policy/{operation}` → `adminMiddleware(adminAPI.AttachDetachPolicyBuiltin)`.
 - **Handler A** — `SetPolicyForUserOrGroup` at `cmd/admin-handlers-users.go:1770`; its **first** statement is `objectAPI, _ := validateAdminReq(ctx, w, r, policy.AttachPolicyAdminAction)` (`:1773`). The mapping write it would perform, `PolicyDBSet` (`:1849`), runs only after `validateAdminReq` succeeds.
 - **Handler B** — `AttachDetachPolicyBuiltin` at `cmd/admin-handlers-users.go:1908`; its first statement is `objectAPI, cred := validateAdminReq(ctx, w, r, policy.UpdatePolicyAssociationAction, policy.AttachPolicyAdminAction)` (`:1911`). Its body parsing (octet-stream check `:1926`, `madmin.DecryptData` `:1939`, `PolicyAssociationReq` unmarshal `:1945`) and the mapping write `PolicyDBUpdateBuiltin` (`:1956`) all run only after `validateAdminReq` succeeds.
-- **Admin-action gate** — `validateAdminReq` at `cmd/admin-handler-utils.go:37` loops over the required admin actions, calling `checkAdminRequestAuth` (`:47`) for each; on `ErrAccessDenied` it tries the next action, and after all are denied it writes `ErrAccessDenied` (`:60`) and returns a `nil` `ObjectLayer`, so the handler aborts before any body parsing or mapping write:
+- **Admin-action gate** — `validateAdminReq` at `cmd/admin-handler-utils.go:37` loops over the required admin actions, calling `checkAdminRequestAuth` (`:47`) for each; on `ErrAccessDenied` it tries the next action, and after all are denied it writes `ErrAccessDenied` (`:59`) and returns a `nil` `ObjectLayer`, so the handler aborts before any body parsing or mapping write:
 
 ```go
 func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...policy.AdminAction) (ObjectLayer, auth.Credentials) {
