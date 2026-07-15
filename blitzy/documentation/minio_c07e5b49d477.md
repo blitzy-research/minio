@@ -14,7 +14,7 @@
 | **Q4** | What in the output reveals the decision? Before/after? Why? | For a **reconstruct**, the `HealResultItem` carries a per‑drive **`before`/`after` state table** (`ok`/`missing`/`corrupt`). For a **purge**, a `DeleteDanglingObject` **audit event** is emitted whose `caller` tag names the exact code path and whose `d:p`/`derrs` tags describe the object class and per‑part status. For a **degrade**, the item's `detail` string states the reason (`file is corrupted`). Important limits on the "why" are documented in §7 (Observability). |
 | **Q5a** | How many valid shards must exist to heal? | **At least `DataBlocks` = 2** intact shards must remain, **and** the number of drives needing repair must be **≤ `ParityBlocks` = 2**. Observed tipping point for a data object: **2 damaged parts → heals**, **3 damaged parts → cannot reconstruct** (purged as dangling). |
 | **Q5b** | What error appears when heal cannot recover? | It depends on *which interface* and *which failure*. The **heal interface** (`HealResultItem.detail`) surfaces `"file is corrupted"` (degrade) or `"Version not found: <bkt>/<obj>(<vid>)"` (purge) — it does **not** surface the internal read‑quorum string. A **client read** of an object that kept its metadata but lost its data shards renders `SlowDownRead` — "Resource requested is unreadable, please reduce your request rate"; a client read of an object that lost metadata quorum renders "Object does not exist". The internal `errErasureReadQuorum = "Read failed. Insufficient number of drives online"` [`cmd/erasure-errors.go:23`] and the reconstruction write‑side error `"all drives had write errors, unable to heal <bucket>/<object>"` [`cmd/erasure-healing.go:615`] are **source‑defined** strings, labelled as such. |
-| **Q5c** | Does a partially‑failed **write** (data object) differ from a partially‑failed **delete** (delete marker)? | **On this 4‑drive EC:2 set the numeric boundary COINCIDES** — both purge at **≥ 3 missing metadata files** and both survive at ≤ 2. **The mechanism DIFFERS**: the delete‑marker rule uses a *fixed majority* `(len(errs)+1)/2` and **ignores parts**; the data‑object rule is *parity‑based* and **also considers part/data‑dir errors**. They are distinguishable at runtime by the audit tag **`d:p` (`2:2` for a data object vs `0:0` for a delete marker)** and **`sz` (`8388608` vs `0`)**. |
+| **Q5c** | Does a partially‑failed **write** (data object) differ from a partially‑failed **delete** (delete marker)? | **On this 4‑drive EC:2 set the numeric boundary COINCIDES** — both purge at **≥ 3 missing metadata files** and both survive at ≤ 2 *(with one observed qualification that applies to **both** classes alike: this boundary describes the **per‑object decision**, which fires only when the heal reaches the object; a **recursive / bucket‑wide** heal whose *sole* surviving `xl.meta` is on the excluded fallback drive `d4` never enumerates the object and leaves it in place — see §6 c2 "drive‑position dependence")*. **The mechanism DIFFERS**: the delete‑marker rule uses a *fixed majority* `(len(errs)+1)/2` and **ignores parts**; the data‑object rule is *parity‑based* and **also considers part/data‑dir errors**. They are distinguishable at runtime by the audit tag **`d:p` (`2:2` for a data object vs `0:0` for a delete marker)** and **`sz` (`8388608` vs `0`)**. |
 
 ---
 
@@ -499,7 +499,7 @@ This confirms the state split (`corrupt` for `xl.meta` corruption vs `missing` f
 
 ### (c2) STAY‑DELETED — purged as *dangling*  ·  answers **Q2**, contributes to **Q3/Q4**
 
-**Direct answer:** when *too many* metadata files are cleanly **missing** — more than `ParityBlocks` (2), i.e. **≥ 3 of 4** — read quorum cannot be computed, `isObjectDangling` returns `true`, and MinIO **purges** the object (issues `DeleteVersion` on every drive) and emits a `DeleteDanglingObject` audit event. The object does **not** come back.
+**Direct answer:** when *too many* metadata files are cleanly **missing** — more than `ParityBlocks` (2), i.e. **≥ 3 of 4** — read quorum cannot be computed, `isObjectDangling` returns `true`, and MinIO **purges** the object (issues `DeleteVersion` on every drive) and emits a `DeleteDanglingObject` audit event. The object does **not** come back. **One qualification, established by observation below:** this ≥ 3‑missing → purge rule is the **per‑object decision**, and it fires **only when the heal actually reaches that object**. For a **single‑object heal**, and for a **recursive** heal when the surviving `xl.meta` sits on one of the enumerated primary drives (`d1`–`d3`), the purge fires exactly as stated; but a **recursive / bucket‑wide** heal whose *sole* surviving `xl.meta` sits on the **excluded fallback drive `d4`** never enumerates the object and therefore **leaves it in place**. The decision itself is drive‑position‑independent — only recursive *discovery* is not. See *(c2·obs) Observed drive‑position dependence of the recursive purge* below, which reproduces this deterministically.
 
 **Setup (E2 — `purge_data`, `remove=true`, deep scan):** the 8 MiB data object; **`xl.meta` removed on `d2`,`d3`,`d4`** (`guarded_rm "${M[1]}"; …"${M[2]}"; …"${M[3]}"`), `d1` valid.
 
@@ -547,6 +547,41 @@ This confirms the state split (`corrupt` for `xl.meta` corruption vs `missing` f
 3. Being dangling, `deleteIfDangling` issues `DeleteVersion` on all disks [`cmd/erasure-object.go:548`] and defers `auditDanglingObjectDeletion` (event `DeleteDanglingObject`) [`cmd/erasure-object.go:451`].
 
 The `detail` string is **`"Version not found: <bucket>/<object>(<versionId>)"`** — note this precise wording (the object version is what is reported gone), corrected here from an earlier "Object not found" phrasing.
+
+#### (c2·obs) Observed drive‑position dependence of the recursive purge  ·  refines **Q2 / Q5c**
+
+**Direct answer:** the ≥ 3‑missing → purge rule above is the **per‑object decision** taken inside `healObject`, and that decision is **drive‑position‑independent** — any heal that *reaches* `healObject` purges the dangling object no matter which drive still holds the survivor. What is **not** position‑independent is whether a **recursive** heal (`Recursive=true` — the `mc admin heal -r` / bucket‑wide form) *reaches* that decision for a given object. A recursive heal discovers objects by **listing**, and `listAndHeal` splits the set's drives before it walks them:
+
+```go
+// cmd/erasure-healing.go:57-59  (listAndHeal)
+expectedDisks := len(disks)/2 + 1   // = 4/2 + 1 = 3
+fallbackDisks := disks[expectedDisks:]  // = [d4]
+disks = disks[:expectedDisks]           // = [d1, d2, d3]  ← the only drives walked
+```
+
+The primary listing walks **only the first three drives**; the fallback drive is consulted **only to replace a primary whose walk errors**, never to augment discovery [`cmd/metacache-set.go:1055-1062`]. The set's drive order is the **canonical** order: the `r.Perm(len(disks))` shuffle in `getOnlineDisksWithHealingAndInfo` randomizes **only** the launch order of the parallel `DiskInfo` goroutines [`cmd/erasure.go:289`], each of which writes its result back at its *original* index (`infos[i] = di`); the drives are then collected by iterating `infos` **in index order** [`cmd/erasure.go:315`], so `newDisks` preserves `[d1,d2,d3,d4]` and **`d4` is consistently the excluded fallback**. Consequently, when the **sole surviving `xl.meta` is on `d4`**, a recursive heal never enumerates the object and it is **left in place**; a **targeted single‑object heal** (`Recursive=false`) instead calls `healObject` directly [`cmd/admin-heal-ops.go:899` → `:901`] (the recursive branch takes `objAPI.HealObjects(...)` at [`cmd/admin-heal-ops.go:909`] → `erasureServerPools.HealObjects` [`cmd/erasure-server-pool.go:2481`] → per‑set `set.listAndHeal(...)` [`cmd/erasure-server-pool.go:2544`]) and purges the object regardless of position.
+
+**Observed — reproduced deterministically** (real 4‑drive EC:2 build, heal driven through the genuine `POST /minio/admin/v3/heal`; a non‑versioned data object so the reached‑`healObject` outcome is unambiguous; each row confirmed across **2/2 runs**) [OBSERVED]:
+
+```text
+non-versioned 8 MiB data object, xl.meta removed on the three NON-keep drives:
+  keep=d1  recursive              -> PURGE  (metas_after=0, 1 DeleteDanglingObject, heal items=1)
+  keep=d2  recursive              -> PURGE  (metas_after=0, 1 DeleteDanglingObject)
+  keep=d3  recursive              -> PURGE  (metas_after=0, 1 DeleteDanglingObject)
+  keep=d4  recursive              -> RETAIN (metas_after=1, 0 DeleteDanglingObject, heal items=0 — never enumerated)
+  keep=d4  single-object (Recursive=false) -> PURGE (metas_after=0, 1 DeleteDanglingObject)
+```
+
+The `keep=d4` single‑object purge returns the **same zero‑value heal item** documented above, differing only in the not‑found phrasing for a *non‑versioned* object (`errFileNotFound` → `ObjectNotFound`, versus `errFileVersionNotFound` → `VersionNotFound` for the versioned E2) [OBSERVED]:
+
+```json
+{ "resultId": 2, "type": "object", "bucket": "", "object": "", "versionId": "",
+  "detail": "Object not found: nbucket/rc_nonrec_d4_r1",
+  "diskCount": 0, "setCount": 0,
+  "before": { "drives": null }, "after": { "drives": null }, "objectSize": 0 }
+```
+
+**Cause → effect:** with `d1`,`d2`,`d3` healthy, their `WalkDir` never errors, so `fallbackDisks=[d4]` is never activated [`cmd/metacache-set.go:1055-1062`]; the object — whose only `xl.meta` is on `d4` — is absent from every walked drive and is therefore **never handed to `healObject`**, so the (correct, drive‑agnostic) purge decision is simply never taken. The **E2 evidence above uses a survivor on `d1`**, so it shows the purge outcome **faithfully**; this note **refines, not contradicts,** that boundary — it localizes the sole exception to a `d4`‑only survivor under a *recursive* heal. The exception is genuinely confined to `d4`: `keep=d2` and `keep=d3` recursive both purge (above). The **same discovery caveat applies to a delete marker** (§9: `keep=d1` recursive purges, `keep=d4` recursive retains — observed) and **does *not* apply to the parts‑missing trigger** of §7 (there the metadata is intact on all four drives, so listing on `d1`–`d3` always enumerates the object and it purges via `caller=…:438` regardless of which drive holds the surviving part — observed).
 
 ---
 
@@ -611,7 +646,7 @@ dangling_events=0
 | Outcome | Trigger (observed) | Decision site | Runtime evidence |
 |---------|--------------------|---------------|------------------|
 | **Reconstruct** | ≤ 2 drives need repair, ≥ 2 valid shards (missing *or* corrupt) | `cannotHeal` false → `erasure.Heal` [`:428`,`:581`] | `before` mix → `after` all `ok`; byte‑identical read‑back (E1, E1c) |
-| **Stay‑deleted (purge)** | ≥ 3 metas (or ≥ 3 parts) **missing** → `isObjectDangling` true | `:1025-1033` (data) / `:1012-1017` (marker) → `DeleteVersion` `:548` | `detail:"Version not found: …"`; `DeleteDanglingObject` audit; version gone (E2, E4a, E5) |
+| **Stay‑deleted (purge)** | ≥ 3 metas (or ≥ 3 parts) **missing** → `isObjectDangling` true *(per‑object decision; recursive‑discovery caveat §6 c2)* | `:1025-1033` (data) / `:1012-1017` (marker) → `DeleteVersion` `:548` | `detail:"Version not found: …"`; `DeleteDanglingObject` audit; version gone (E2, E4a, E5) |
 | **Leave‑degraded (retain)** | corruption survives (`nonActionable*Errs > 0`) | `isObjectDangling` false [`:1008-1010`] | `detail:"file is corrupted"`; object still on all drives; **0** dangling events (E3) |
 
 
@@ -709,7 +744,7 @@ Here heal **leaves the object degraded** (`dangling_events=0`, `metas_after=2` r
 
 **Direct answer (lead with the result, including the "no‑difference" part):**
 
-- **The numeric boundary COINCIDES** on this 4‑drive EC:2 set: **both** a data object *and* a delete marker are purged as dangling at **≥ 3 missing metadata files**, and both survive at ≤ 2.
+- **The numeric boundary COINCIDES** on this 4‑drive EC:2 set: **both** a data object *and* a delete marker are purged as dangling at **≥ 3 missing metadata files**, and both survive at ≤ 2. *(This is the **per‑object decision**; it fires when the heal reaches the object. The **recursive‑discovery** qualification of §6 c2 applies identically to **both** classes: a **recursive** heal whose sole surviving `xl.meta` is on the excluded fallback drive `d4` never enumerates the object and leaves it in place — observed for the delete marker as `keep=d1` recursive → purge vs `keep=d4` recursive → retain.)*
 - **The mechanism DIFFERS.** The delete‑marker decision uses a **fixed majority** `(len(errs)+1)/2` and **ignores parts entirely**; the data‑object decision is **parity‑based** and **also inspects part/data‑dir errors**. They only *land* on the same integer here because `(4+1)/2 = 2 = ParityBlocks`.
 - **They are distinguishable at runtime** by the `DeleteDanglingObject` audit tags: a data object carries **`d:p = 2:2`, `sz = 8388608`**; a delete marker carries **`d:p = 0:0`, `sz = 0`**.
 
@@ -767,6 +802,7 @@ A delete marker was isolated by `PUT` (versioned) → the marker's `xl.meta` is 
 |---|---|---|
 | Purge threshold | `notFoundMetaErrs > ParityBlocks (2)` | `notFoundMetaErrs > (len(errs)+1)/2 (2)` |
 | Numeric boundary (4‑drive EC:2) | **≥ 3 missing metas** | **≥ 3 missing metas** ← *coincides* |
+| Recursive‑discovery caveat (observed) | Survivor on `d4` only → **not enumerated → retained** [§6 c2, `cmd/erasure-healing.go:57-59`] | Survivor on `d4` only → **not enumerated → retained** ← *same* |
 | Also considers **parts**? | **Yes** — `notFoundPartsErrs > ParityBlocks` [`:1030-1032`] | **No** — parts ignored [`:1012-1017`] |
 | Audit `d:p` (observed) | **`2:2`** | **`0:0`** |
 | Audit `sz` (observed) | `8388608` | `0` |
@@ -888,7 +924,7 @@ This document is pinned to commit **`c07e5b49d477…`**. Where line numbers or s
 | **Q4** — decision visibility / why | `before`/`after` states (reconstruct); `DeleteDanglingObject` audit `caller`/`d:p`/`derrs` (purge); `detail` (degrade) — with stated limits (`merrs` empty; `derrs` empty on quorum path) | §10 tables + §6 evidence | `:382-405`; `cmd/erasure-object.go:451`,`:467`,`:482` |
 | **Q5a** — success boundary | ≥ `DataBlocks`(2) valid shards **and** `disksToHealCount ≤ ParityBlocks`(2); 2 damaged heals, 3 purged | §7 boundary table + E4a audit | `cmd/erasure-healing.go:428`, `:581`, `:1030-1032` |
 | **Q5b** — failure error | Heal interface surfaces `detail` (`"file is corrupted"` / `"Version not found…"`); client read renders `SlowDownRead` (data lost, meta intact) or "Object does not exist" (meta quorum lost); source‑defined `errErasureReadQuorum` & write‑side string labelled | §8 (Cases A/B) + source citations | `cmd/erasure-errors.go:23`; `cmd/api-errors.go:2190-2191`,`:869-872`; `cmd/erasure-healing.go:615` |
-| **Q5c** — write vs delete | Numeric boundary **coincides** (≥3 missing metas); mechanism **differs** (parts‑aware/parity vs fixed‑majority/parts‑ignored); audit `d:p` 2:2 vs 0:0, `sz` 8388608 vs 0 | §9 E2 vs E5 tables + both audit records | `cmd/erasure-healing.go:1012-1017` vs `:1025-1033` |
+| **Q5c** — write vs delete | Numeric boundary **coincides** (≥3 missing metas); mechanism **differs** (parts‑aware/parity vs fixed‑majority/parts‑ignored); audit `d:p` 2:2 vs 0:0, `sz` 8388608 vs 0; recursive **discovery** is drive‑position‑dependent for **both** classes (sole survivor on fallback `d4` → retained) [OBSERVED] | §9 E2 vs E5 tables + both audit records; §6 c2 drive‑position reproduction | `cmd/erasure-healing.go:1012-1017` vs `:1025-1033`; `:57-59` |
 
 Every sub‑question is answered with a direct answer first, adjacent captured output, and `file:line` grounding; inferred statements (write‑side error string; larger‑set divergence; edge cases) are explicitly labelled **[INFERRED]**.
 
