@@ -105,7 +105,7 @@ When the investigation finished, the server was stopped with an explicit `SIGTER
 
 ## Observed scenario matrix (S0-S3)
 
-All values were captured from the running non-root server via the HTTP health endpoints (`curl`) and `boto3` `PUT`/`GET`/`LIST`. A representative, lightly annotated transcript for each state follows the table — health-endpoint responses are grouped under `#` labels rather than repeating each full `curl` invocation, and intermediate poll lines are elided where marked. (The fully raw, `$ curl …`-prefixed capture is shown for **S0** and in **Q1**.)
+All values were captured from the running non-root server via the HTTP health endpoints (`curl`) and `boto3` `PUT`/`GET`/`LIST`. A representative, lightly annotated transcript for each state follows the table — health-endpoint responses are grouped under `#` labels rather than repeating each full `curl` invocation, only the salient MinIO-specific response headers are shown (standard/boilerplate and per-request headers such as `Date`, `Server`, and `X-Amz-Request-Id` are omitted for readability), and intermediate poll lines are elided where marked. (The `$ curl …`-prefixed invocations are shown explicitly for **S0** and in **Q1**.)
 
 | Scenario | Drives online | `/minio/health/cluster` | `/minio/health/cluster/read` | S3 `PUT` |
 |----------|---------------|-------------------------|------------------------------|----------|
@@ -114,7 +114,7 @@ All values were captured from the running non-root server via the HTTP health en
 | **S2 — `chmod 000 d3`** | 2 / 4 (< wq 3) | **`503`** | `200` (2 ≥ rq 2) | **ERROR `SlowDownWrite`** |
 | **S3 — `chmod 755` restore** | 4 / 4 | `200` | `200` | OK |
 
-### S0 — Healthy (4 / 4 online) — observed output (unedited)
+### S0 — Healthy (4 / 4 online) — observed output (annotated; salient MinIO-specific headers shown, standard/boilerplate and per-request headers omitted for readability)
 
 ```
 $ curl -s -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:9000/minio/health/live
@@ -199,7 +199,7 @@ Restoring permissions returns the cluster to **4 / 4** online. `/minio/health/cl
 
 **Direct answer.** MinIO decides health **per erasure set**: it counts how many drives in the set currently report state OK and compares that live count against two thresholds derived from the set's data/parity split — the **write quorum** (for the `/minio/health/cluster` "healthy" verdict) and the **read quorum** (for `/minio/health/cluster/read`). It does **not** assume a static "N disks required" number; the required number *is* the quorum. For this 4-drive (2+2) set it assumes it needs **≥ 3 online drives to be writable-healthy** and **≥ 2 online drives to be read-healthy**.
 
-**Observed evidence (unedited).** At S0 (4/4 online) the two cluster endpoints advertise the thresholds directly in their headers:
+**Observed evidence (annotated — MinIO-specific quorum headers shown; standard/boilerplate and per-request headers omitted).** At S0 (4/4 online) the two cluster endpoints advertise the thresholds directly in their headers:
 
 ```
 $ curl -s -D - -o /dev/null http://127.0.0.1:9000/minio/health/cluster
@@ -295,7 +295,7 @@ HTTP 200
 
 **Direct answer.** **Yes — the logs name the failing drive by its full filesystem path**, and the server continuously inspects each drive's live healing state while running (it re-probes every drive on every health poll).
 
-**Observed evidence (unedited).** During the outage the server log repeatedly emitted (full block in **Appendix A2**):
+**Observed evidence (annotated — leading `Time`/`DeploymentID`/`API` log-header lines omitted).** During the outage the server log repeatedly emitted (full block in **Appendix A2**):
 
 ```
 Error: unable to read /tmp/minio_data/d4/.minio.sys/buckets/.healing.bin: open /tmp/minio_data/d4/.minio.sys/buckets/.healing.bin: permission denied (*fmt.wrapError)
@@ -383,7 +383,7 @@ Before/after on-disk distribution (one `xl.meta` per shard location):
 
 **Direct answer.** The threshold is **computed** in `objectQuorumFromMeta()` [`cmd/erasure-metadata.go:531-565`] and **enforced** (for the health verdict) in `(*erasureServerPools).Health()` [`cmd/erasure-server-pool.go:2679`]. For a 2+2 set: **read quorum = N/2 = 2**; **write quorum = dataBlocks = 2, incremented to 3 because `dataBlocks == parityBlocks`.**
 
-**Observed evidence (unedited).** The decisive server-log line printed at the exact moment the cluster dropped to 2/4 and `/cluster` began returning 503 (full block in **Appendix A3**):
+**Observed evidence (annotated — decisive line excerpted).** The decisive server-log line printed at the exact moment the cluster dropped to 2/4 and `/cluster` began returning 503 (full block in **Appendix A3**):
 
 ```
 Error: Write quorum could not be established on pool: 0, set: 0, expected write quorum: 3, drives-online: 2 (*errors.errorString)
