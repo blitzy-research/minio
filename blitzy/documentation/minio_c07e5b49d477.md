@@ -60,7 +60,14 @@ d6a1593a39badfd0c700af1d8f8934cd5350073f docs: add runtime-evidenced healing-dec
 A	blitzy/documentation/minio_c07e5b49d477.md
 ```
 
-`HEAD~1` **is** the subject commit `c07e5b49d477b0774f23db3b290745aef8c01bd2`. The only commit on top of it is the documentation commit shown above, which adds **exactly one file** (this document — status `A`) and changes **no `.go` source**. Therefore the compiled MinIO source is **byte‑identical to `c07e5b49d477`**. The binary's embedded `CommitID` `d6a1593a39ba` (from `minio --version`, above) is that build‑time documentation HEAD — `make` stamps `git rev-parse HEAD` at build time — which is why a documentation‑only commit legitimately appears in the binary's identity without changing a single line of MinIO source.
+At build time, `HEAD` was the documentation commit shown above (`d6a1593a39ba`), sitting directly on the subject commit `c07e5b49d477b0774f23db3b290745aef8c01bd2` and adding **only this document** (status `A`) with **no `.go` source** change. `make` stamps `git rev-parse HEAD` into the binary at build time, which is why the embedded `CommitID` `d6a1593a39ba` (from `minio --version`, above) is a *documentation‑only* HEAD rather than the subject commit itself — no line of MinIO source was changed. The substantive, time‑independent guarantee is that **the compiled MinIO source is byte‑identical to `c07e5b49d477`**, and it holds no matter how many documentation‑only commits accumulate on top of the subject commit. Verify it at any point with the cumulative diff against the subject commit [OBSERVED]:
+
+```console
+$ git diff c07e5b49d477..HEAD --name-status
+A	blitzy/documentation/minio_c07e5b49d477.md
+```
+
+The *only* path that differs from the subject commit is this document, and **no `.go`/`go.mod`/`go.sum`/`Makefile` file is touched** — so the healing behavior reported here is exactly that of `c07e5b49d477`. (The build‑time `git log`/`git show` capture above is a point‑in‑time snapshot of that documentation HEAD; subsequent documentation‑only re‑commits change the on‑top commit hash but never this invariant.)
 
 **Build — canonical `make build`.** The `build:` target is at `Makefile:177`; it depends on `build-debugging` (which compiles the `docs/debugging/*` helper tools) and the compile line is at `Makefile:179`. The exact expansion captured with `make -n build` is [OBSERVED]:
 
@@ -118,12 +125,30 @@ The heal driver (§3) is built against **`github.com/minio/madmin-go/v3 v3.0.77`
 $ mc admin heal --help | sed -n '1,6p'
 NAME:
   mc admin heal - monitor healing for bucket(s) and object(s) on MinIO server
+
 USAGE:
   mc admin heal [FLAGS] TARGET
-EXAMPLES:
-  1. Monitor healing status on a running server at alias 'myminio':
-     $ mc admin heal myminio/
+
+$ mc admin heal --help | sed -n '7,22p'
+FLAGS:
+  --force                          avoid showing a warning prompt
+  --verbose, -v                    show verbose information
+  --all-drives, -a                 select all drives for verbose printing
+  --config-dir value, -C value     path to configuration folder (default: "/root/.mc") [$MC_CONFIG_DIR]
+  --quiet, -q                      disable progress bar display [$MC_QUIET]
+  --disable-pager, --dp            disable mc internal pager and print to raw stdout [$MC_DISABLE_PAGER]
+  --no-color                       disable color theme [$MC_NO_COLOR]
+  --json                           enable JSON lines formatted output [$MC_JSON]
+  --debug                          enable debug output [$MC_DEBUG]
+  --resolve value                  resolves HOST[:PORT] to an IP address. Example: minio.local:9000=10.10.75.1 [$MC_RESOLVE]
+  --insecure                       disable SSL certificate verification [$MC_INSECURE]
+  --limit-upload value             limits uploads to a maximum rate in KiB/s, MiB/s, GiB/s. (default: unlimited) [$MC_LIMIT_UPLOAD]
+  --limit-download value           limits downloads to a maximum rate in KiB/s, MiB/s, GiB/s. (default: unlimited) [$MC_LIMIT_DOWNLOAD]
+  --custom-header value, -H value  add custom HTTP header to the request. 'key:value' format.
+  --help, -h                       show help
 ```
+
+(`sed -n '1,6p'` shows the `NAME`/`USAGE` sections; `sed -n '7,22p'` shows the complete `FLAGS` section. There is **no** `--recursive`, `--scan`, or `--remove` flag — confirming this `mc` is monitor‑only. The help's `EXAMPLES:` section, at lines 24‑26, likewise shows only a *monitor* invocation `mc admin heal myminio/`.)
 
 Running it against a healthy bucket returns a **bucket‑level status/summary**, not a per‑object heal result [OBSERVED]:
 
@@ -784,7 +809,7 @@ Healing's decision is visible in **three** places, each with a different scope. 
 - `item.heal.enabled` requires `f.shouldHeal()` [`cmd/data-scanner.go:510`], so it stays `false`.
 - `applyHealing` (which calls `o.HealObject(...)` [`cmd/data-scanner.go:970`]) runs only `if i.heal.enabled` [`cmd/data-scanner.go:1203-1205`].
 - The stated topology sets `globalIsErasure = true` (`setupType == ErasureSetupType`) [`cmd/server-main.go:400`] — confirmed by the runtime `EC:2 / 1 set(s), 4 drives per set` in §5.
-- The scanner itself *does* start (unconditionally: `initDataScanner` [`cmd/data-scanner.go:77-93`] ← `cmd/server-main.go:1028-1030`); its first cycle fires ~60 s after boot (`scannerTimer` initialized to the 1‑minute `scannerCycle` [`cmd/data-scanner.go:176`]). A separate `checkAbandonedParts` path still runs [`cmd/data-scanner.go:1210`], but that is not object reconstruction/purge.
+- The scanner itself *does* start (unconditionally: `initDataScanner` [`cmd/data-scanner.go:77-93`] ← `cmd/server-main.go:1028-1030`); its first cycle fires ~60 s after boot (`scannerTimer` initialized to the 1‑minute `scannerCycle` [`cmd/data-scanner.go:176`]). On this erasure topology the scanner's abandoned‑part cleanup also does **not** run: the `o.CheckAbandonedParts(...)` call [`cmd/data-scanner.go:1210`] is nested inside the **same** `if i.heal.enabled` gate [`cmd/data-scanner.go:1203`] (beneath a further `if healDeleteDangling` [`cmd/data-scanner.go:1208`]), so when `globalIsErasure` is true it is just as unreachable as `applyHealing`. The scanner therefore starts and scans, but performs **neither** object reconstruction/purge **nor** abandoned‑part cleanup at this commit — matching the trace below, which shows only `Scan*` events and no `CleanAbandoned` event.
 
 **Observation.** A fresh 4‑drive set was started; an 8 MiB object was `PUT`, then `part.1` was deleted on `d3`,`d4` (a reconstruct‑eligible degraded state, `metas` all intact). Two trace streams — `mc admin trace --call scanner` and `--call healing` — were captured for a 170 s window (≥ 1 scan cycle), while the backend was snapshotted every 30 s. Confirmed stable across two runs (ports 9200/9210):
 
@@ -885,11 +910,17 @@ no ignored build products remain
 $ pgrep -a -f '[m]inio server' || echo "no minio server processes"
 no minio server processes
 
-$ ss -ltn 2>/dev/null | grep -E ':(9000|9001|9200|9210|9300)\b' || echo "no lab listeners"
+# ss-less-portable listener check — this image ships no `ss`/`netstat`/`lsof`, so
+# parse /proc/net/tcp{,6} directly: local address is HEX ip:port, state 0A = LISTEN.
+$ found=0; for p in 9000 9001 9200 9210 9300; do hex=$(printf '%04X' "$p"); \
+    grep -qiE ":${hex} [0-9A-F:]+ 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+    && { echo "port $p LISTENING"; found=1; }; done; [ "$found" = 0 ] && echo "no lab listeners"
 no lab listeners
 ```
 
-The compiled Go source at the doc commit is byte‑identical to `c07e5b49d477…` (§2): the only commit on top of that subject commit adds this one documentation file.
+> Note on tooling: `ss` (iproute2), `netstat`, and `lsof` are absent from the canonical container, so the listener proof is done by reading `/proc/net/tcp` and `/proc/net/tcp6` — where each socket's local `address:port` is hex‑encoded and TCP state `0A` denotes `LISTEN`. The `printf '%04X'` per‑port lookup above is deliberately `strtonum`‑free so it works under the container's `mawk` as well as `gawk`.
+
+As shown in §2, the compiled MinIO source is **byte‑identical to `c07e5b49d477`** — verified by the cumulative `git diff c07e5b49d477..HEAD --name-status`, which lists **only** this document (`A blitzy/documentation/minio_c07e5b49d477.md`) no matter how many documentation‑only commits sit on top of the subject commit. The `git status --porcelain` line above reflects the **staged, pre‑commit** snapshot (`A` = added); once this document is committed the working tree is clean (`git status --porcelain` is empty), and the single addition remains confirmed by that cumulative diff against the subject commit.
 
 ---
 
