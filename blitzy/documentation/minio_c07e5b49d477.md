@@ -44,7 +44,7 @@ CGO_ENABLED=0 go build -o /tmp/minio_bin .
 
   Result: success, ~59 s, 156 MB binary. `/tmp/minio_bin --version` reported `Runtime: go1.23.2 linux/amd64` and `version DEVELOPMENT.GOGET`. This mirrors the `Makefile` `build:` target [`Makefile:177`], which is `CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio` — the same pure-Go, `CGO_ENABLED=0` build.
 
-### Exact run command (verbatim), executed as a NON-ROOT user (`miniorunner`, uid 1001)
+### Exact run command (verbatim), executed as a NON-ROOT user (`miniouser`, uid 1001)
 
 ```
 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_CI_CD=1 /tmp/minio_bin server /tmp/minio_data/d1 /tmp/minio_data/d2 /tmp/minio_data/d3 /tmp/minio_data/d4 --address :9000 --console-address :9001
@@ -75,18 +75,30 @@ The permission-based fault must be experienced by the server as a genuine I/O fa
 
 > A separate instance run **as root (uid 0)** on `:9010`, after `chmod 000` on **two** drives, **still** returned `HTTP/1.1 200 OK` with `X-Minio-Write-Quorum: 3` on `/minio/health/cluster`, and a `PUT` that **succeeded** (`status=200`). See **Appendix A5** for the transcript.
 
-Because a root run masks the very failure under investigation, it is a **non-canonical** observation. The canonical reproduction below therefore runs MinIO as the **non-root** user `miniorunner` (uid 1001), so that `chmod 000` truly revokes the drive and MinIO reacts exactly as it would to a real disk becoming unreadable. The root run is documented only to justify this methodology.
+Because a root run masks the very failure under investigation, it is a **non-canonical** observation. The canonical reproduction below therefore runs MinIO as the **non-root** user `miniouser` (uid 1001), so that `chmod 000` truly revokes the drive and MinIO reacts exactly as it would to a real disk becoming unreadable. The root run is documented only to justify this methodology.
+
+When the investigating shell is itself `root`, the server is started with an explicit **privilege drop** to `miniouser` so the process genuinely runs unprivileged. Any of the following equivalent forms works; the run command shown above is launched through the first of these:
+
+```
+runuser -u miniouser -- env MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_CI_CD=1 /tmp/minio_bin server /tmp/minio_data/d1 /tmp/minio_data/d2 /tmp/minio_data/d3 /tmp/minio_data/d4 --address :9000 --console-address :9001
+# equivalently:
+setpriv --reuid=miniouser --regid=miniouser --clear-groups /tmp/minio_bin server /tmp/minio_data/d1 /tmp/minio_data/d2 /tmp/minio_data/d3 /tmp/minio_data/d4 --address :9000 --console-address :9001
+# or:
+su miniouser -c '/tmp/minio_bin server /tmp/minio_data/d1 /tmp/minio_data/d2 /tmp/minio_data/d3 /tmp/minio_data/d4 --address :9000 --console-address :9001'
+```
+
+The data directories must be owned by (or writable to) `miniouser` — `chown -R miniouser:miniouser /tmp/minio_data` — so the unprivileged process can format and write them. If the investigating shell is already the non-root user, the drop is unnecessary and the run command is executed directly.
 
 ### Canonical observation surfaces
 
 - **HTTP health endpoints** via `curl` — `GET /minio/health/{live,ready,cluster,cluster/read}`. These routes are registered by `registerHealthCheckRouter()` [`cmd/healthcheck-router.go:36`] under the `/minio/health` prefix (`healthCheckPathPrefix` [`cmd/healthcheck-router.go:32`]) for both `GET` and `HEAD`: `/cluster` → `ClusterCheckHandler` [`cmd/healthcheck-router.go:41-42`], `/cluster/read` → `ClusterReadCheckHandler` [`:43-44`], `/live` → `LivenessCheckHandler` [`:47-48`], and `/ready` → `ReadinessCheckHandler` [`:51-52`].
-- **Real S3 requests** via `boto3` (observed version **1.43.45**) — canonical `PUT`, `GET`, and `LIST` against the running server.
+- **Real S3 requests** via `boto3` (observed version **1.43.47**) — canonical `PUT`, `GET`, and `LIST` against the running server.
 - `mc` and the AWS CLI were **not** required and were not used; `curl` + `boto3` exercised every canonical path.
 - `MINIO_CI_CD=1` was set during the run — a **non-default harness setting** that sets `globalIsCICD` [`cmd/common-main.go:99`]. Its most relevant effect here is that it **skips MinIO's root-drive detection** [`cmd/xl-storage.go:371`], which is what lets the four data directories share a single root filesystem under `/tmp`; its other setup/runtime effects are enumerated under *Configuration notes* below. It has **no** effect on the quorum arithmetic or the health decision — neither `objectQuorumFromMeta()` nor `(*erasureServerPools).Health()` references `globalIsCICD` — so the write-quorum-3 / read-quorum-2 behavior reported here is unchanged by it.
 
 ### Repository integrity
 
-All build, run, and data artifacts (the binary at `/tmp/minio_bin`, the data directories under `/tmp/minio_data/`, and the temporary observation scripts) lived **outside** the checkout and were removed afterward. `git status` was verified clean (working tree unchanged) both before and after the investigation. The investigation left the repository byte-for-byte unchanged; the **only** addition is this document.
+When the investigation finished, the server was stopped with an explicit `SIGTERM`. The launch captured the server PID in the shell (`… &` followed by `MINIO_PID=$!`), and teardown was `kill -TERM "$MINIO_PID"` — MinIO registers `os.Interrupt` (SIGINT), `SIGTERM`, and `SIGQUIT` via `signal.Notify(globalOSSignalCh, …)` [`cmd/server-main.go:747`] and services them in `handleSignals()` → `stopProcess()` [`cmd/signals.go:67`], which drains the HTTP server and shuts down the object layer for a graceful exit; port `:9000` was then confirmed closed. All build, run, and data artifacts (the binary at `/tmp/minio_bin`, the data directories under `/tmp/minio_data/`, and the temporary observation scripts) lived **outside** the checkout and were removed afterward (`rm -rf /tmp/minio_bin /tmp/minio_data`). `git status` was verified clean (working tree unchanged) both before and after the investigation. The investigation left the repository byte-for-byte unchanged; the **only** addition is this document.
 
 
 ---
@@ -434,7 +446,7 @@ MinIO's public `docs.min.io` pages document the commercial **AIStor** product, i
 ### Configuration notes
 
 - **`MINIO_CI_CD=1` is a non-default harness setting** (not part of MinIO's default configuration). It sets `globalIsCICD = true` [`cmd/common-main.go:99`] (a non-empty `CI` env var does the same), which has several material setup/runtime effects in this checkout: (1) it **skips root-drive detection** — the `if !globalIsCICD && !globalIsErasureSD` guard in `getDiskInfo()` [`cmd/xl-storage.go:371`] bypasses the `disk.IsRootDisk` check [`cmd/xl-storage.go:371-380`], which is precisely what permits the four data directories to live on one root filesystem under `/tmp` without being rejected as root disks; (2) it shrinks each drive's immediate-purge queue from 100000 to 1 in `newXLStorage()` [`cmd/xl-storage.go:217-220`]; (3) it caps the erasure byte-pool buffer sizing to 256 MiB in the byte-pool initializer [`cmd/erasure-server-pool.go:103-104`]; and it also relaxes empty-`Host`-header validation in `hasBadHost()` [`cmd/generic-handlers.go:303-305`]. **Crucially, it does *not* touch the quorum arithmetic or the health decision** — `objectQuorumFromMeta()` [`cmd/erasure-metadata.go:531-565`] and `(*erasureServerPools).Health()` [`cmd/erasure-server-pool.go:2679`] contain no reference to `globalIsCICD`, so the write-quorum-3 / read-quorum-2 computation and the `online >= quorum` comparison observed here are identical with or without CI mode. **[inferred]** the non-quorum effects above are read from these code paths; of them, only the drive-layout consequence (four `/tmp` directories accepted at startup) was exercised at runtime.
-- The observed `boto3` version was **1.43.45**.
+- The observed `boto3` version was **1.43.47**.
 - The deployment used MinIO's default storage class (no non-default parity was configured), so `DefaultParityBlocks(4) = 2` [`internal/config/storageclass/storage-class.go:355`] governs the 2+2 split. A different configured parity would shift the quorums accordingly, but the *mechanism* (compare live online count to a data/parity-derived quorum) is unchanged.
 
 
@@ -529,7 +541,7 @@ X-Minio-Write-Quorum: 3
 [put_object] OK key=obj-root ETag="b9d876737c5acc8aa111c1e1282be1cd" status=200
 ```
 
-As root, `chmod 000` on two drives did **not** degrade health — `/cluster` still returned `200` with `X-Minio-Write-Quorum: 3`, and the `PUT` succeeded (`status=200`) — because a root process bypasses POSIX permission bits and the drives were still fully readable/writable. This confirms why the canonical reproduction (S0-S3) must run as the **non-root** user `miniorunner` (uid 1001): only then does `chmod 000` genuinely revoke a drive so MinIO experiences and reports the fault.
+As root, `chmod 000` on two drives did **not** degrade health — `/cluster` still returned `200` with `X-Minio-Write-Quorum: 3`, and the `PUT` succeeded (`status=200`) — because a root process bypasses POSIX permission bits and the drives were still fully readable/writable. This confirms why the canonical reproduction (S0-S3) must run as the **non-root** user `miniouser` (uid 1001): only then does `chmod 000` genuinely revoke a drive so MinIO experiences and reports the fault.
 
 ---
 
