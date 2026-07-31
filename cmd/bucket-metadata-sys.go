@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	bucketsse "github.com/minio/minio/internal/bucket/encryption"
@@ -134,6 +135,9 @@ func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket string,
 	case bucketTaggingConfig:
 		meta.TaggingConfigXML = configData
 		meta.TaggingConfigUpdatedAt = updatedAt
+	case bucketCORSConfig:
+		meta.CORSConfigXML = configData
+		meta.CORSConfigUpdatedAt = updatedAt
 	case bucketQuotaConfigFile:
 		meta.QuotaConfigJSON = configData
 		meta.QuotaConfigUpdatedAt = updatedAt
@@ -357,6 +361,22 @@ func (sys *BucketMetadataSys) GetSSEConfig(bucket string) (*bucketsse.BucketSSEC
 		return nil, time.Time{}, BucketSSEConfigNotFound{Bucket: bucket}
 	}
 	return meta.sseConfig, meta.EncryptionConfigUpdatedAt, nil
+}
+
+// GetCORSConfig returns configured CORS config
+// The returned object may not be modified.
+func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config, time.Time, error) {
+	meta, _, err := sys.GetConfig(GlobalContext, bucket)
+	if err != nil {
+		if errors.Is(err, errConfigNotFound) {
+			return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
+		}
+		return nil, time.Time{}, err
+	}
+	if meta.corsConfig == nil {
+		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
+	}
+	return meta.corsConfig, meta.CORSConfigUpdatedAt, nil
 }
 
 // CreatedAt returns the time of creation of bucket
