@@ -674,21 +674,26 @@ func corsRuleAllowsHeader(rule *miniogocors.Rule, reqHeader string) bool {
 //
 // Delegated untouched, so the server wide MINIO_API_CORS_ALLOW_ORIGIN setting
 // stays in force exactly as before this feature existed: anything that is not a
-// preflight, a preflight without an origin to echo back, a preflight that does
-// not resolve to a syntactically valid bucket, and a preflight for a bucket
-// that definitively has no CORS configuration.
+// preflight, a preflight without an origin to echo back, a preflight whose
+// target bucket cannot be resolved at all or does not resolve to a syntactically
+// valid bucket, and - the case that preserves the fallback - a preflight for a
+// bucket whose own CORS rules this layer cannot produce. That last case covers
+// every reason at once: the bucket has no stored configuration, the metadata
+// subsystem is absent or has not finished loading, the stored document carries
+// no rule, or the lookup failed outright. A bucket only ever answers from its
+// own rules once those rules are in hand, so a bucket that has none - for
+// whatever reason - behaves exactly as it did before this feature existed, on
+// every request type.
 //
 // Answered from the matched rule, with the five Access-Control-Allow families
 // and HTTP 200.
 //
 // Denied - HTTP 200 carrying no Access-Control-Allow-* header at all, which is
-// how a browser learns the request is not permitted: the bucket has rules but
-// none of them allows this request, the request asks about an implausible
-// number of headers, or the server cannot currently establish what the bucket's
-// rules are. That last case is deliberate: treating an unavailable or
-// unreadable configuration as no configuration would silently hand the request
-// to the permissive server wide default, so a restrictive bucket policy would
-// relax during exactly the moments it matters most.
+// how a browser learns the request is not permitted. Denial is reachable only
+// once the bucket's own rules have been loaded and none of them allows the
+// request: either no rule matches its origin, method and requested headers, or
+// the request asks about an implausible number of headers and therefore cannot
+// be matched at all.
 func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match the rs/cors preflight gate, plus the Origin that a matched rule
@@ -705,10 +710,29 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Resolve the target bucket. request2BucketObjectName handles both
-		// path-style and virtual-host-style addressing; a preflight for the
-		// server root resolves to an empty bucket and has nothing to evaluate.
-		bucket, _ := request2BucketObjectName(r)
+		// Resolve the target bucket the same way the rest of the server does,
+		// so both path-style and virtual-host-style addressing are handled:
+		// getResource turns a virtual-host-style Host into a path-style
+		// resource, and path2BucketObject splits the bucket off it. A preflight
+		// for the server root resolves to an empty bucket and has nothing to
+		// evaluate, so it is handed on below.
+		//
+		// These are the two halves of request2BucketObjectName, spelled out
+		// rather than called through it, because that wrapper reports a Host it
+		// cannot parse through logger.CriticalIf, which panics. This middleware
+		// runs before any authentication, on a Host header the client chooses
+		// freely, so an unauthenticated request carrying a malformed one would
+		// become a recovered HTTP 500 plus a stack trace in the server log
+		// instead of the delegated preflight it was before this feature existed.
+		// A Host that does not parse simply does not identify a bucket, and an
+		// unresolved bucket has no rules of its own to apply, so it is handled
+		// exactly like a preflight for the server root: delegate.
+		resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		bucket, _ := path2BucketObject(resource)
 		if bucket == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -724,20 +748,21 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		}
 
 		cfg, err := preflightCORSConfig(bucket)
-		switch {
-		case err == nil:
-			// A configuration is available; fall through and evaluate it.
-		case isBucketCORSConfigNotFound(err):
-			// The bucket definitively has no CORS configuration of its own,
-			// which is the one and only case that falls back to the server
-			// wide handler.
+		if err != nil {
+			// No usable per-bucket rules: the bucket has no stored
+			// configuration, the metadata subsystem is absent or has not
+			// finished loading, the stored document carries no rule, or the
+			// lookup failed. Every one of those means this layer has nothing to
+			// evaluate the request against, so the request continues to the
+			// server wide handler and the pre-existing
+			// MINIO_API_CORS_ALLOW_ORIGIN behavior answers it unchanged.
+			//
+			// Answering here instead would make the outcome depend on how far
+			// through startup the server happens to be, and would turn a
+			// transiently unreadable configuration into an affirmative denial
+			// that a browser then caches for the lifetime of its preflight
+			// cache.
 			next.ServeHTTP(w, r)
-			return
-		default:
-			// The configuration could not be established - the metadata
-			// subsystem is absent or still loading, the stored document is
-			// unusable, or the lookup failed. Deny rather than fall back.
-			writeCORSPreflightDenied(w)
 			return
 		}
 
@@ -790,10 +815,11 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 // permanent entries in the bucket metadata map, with work that outlives the
 // request because that accessor is not request scoped.
 //
-// A configuration that parsed but carries no rule cannot have come from
-// PutBucketCors, which requires at least one, so it is reported as an error
-// rather than as an absence: the caller denies on it instead of falling back to
-// the server wide default.
+// Every reason a bucket's own rules cannot be produced is reported as an error,
+// including a configuration that parsed but carries no rule, which cannot have
+// come from PutBucketCors because that requires at least one. The caller treats
+// them all alike: a request it cannot evaluate against the bucket's own rules is
+// handed to the server wide handler untouched.
 func preflightCORSConfig(bucket string) (*miniogocors.Config, error) {
 	if globalBucketMetadataSys == nil {
 		return nil, errServerNotInitialized
@@ -806,15 +832,6 @@ func preflightCORSConfig(bucket string) (*miniogocors.Config, error) {
 		return nil, fmt.Errorf("Stored CORS configuration for bucket %s contains no CORSRule", bucket)
 	}
 	return cfg, nil
-}
-
-// isBucketCORSConfigNotFound reports whether err is the concrete sentinel that
-// says a bucket has no CORS configuration, as opposed to any other reason the
-// configuration could not be produced. Only that one condition may be treated as
-// an absence, so the test is deliberately narrow.
-func isBucketCORSConfigNotFound(err error) bool {
-	var notFound BucketCORSConfigNotFound
-	return errors.As(err, &notFound)
 }
 
 // setCORSPreflightVary declares which request headers the preflight response

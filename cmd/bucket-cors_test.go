@@ -2359,6 +2359,133 @@ func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 	}
 }
 
+// TestBucketCorsPreflightMiddlewareUnresolvableHost pins the disposition of a
+// preflight whose target bucket cannot be resolved because the Host header
+// cannot be parsed.
+//
+// With virtual host style addressing configured the bucket name is taken from
+// the Host header, and on this path that header is entirely client controlled:
+// a preflight arrives unauthenticated and is answered ahead of the mux. A Host
+// the server cannot parse - a non-numeric or out of range port, an invalid host
+// label, an address carrying too many colons, or no Host at all - therefore
+// leaves the bucket unresolved, and an unresolved bucket has no rules of its own
+// to apply. Such a request must be handed to the server wide handler exactly as
+// it was before per-bucket rules existed, and it must above all not fail:
+// resolving the bucket through request2BucketObjectName instead reaches
+// logger.CriticalIf, which panics by design, turning a malformed client header
+// into an internal server error plus a goroutine dump for any anonymous caller.
+//
+// Each case installs a configuration that would have matched the request, so the
+// disposition is provably decided by the unresolved bucket alone.
+func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
+	const (
+		domain        = "s3.example.com"
+		bucket        = "blitzy-cors-bucket"
+		origin        = "https://www.example1.com"
+		delegatedBody = "delegated"
+	)
+
+	matchingRule := miniogocors.Rule{
+		ID:            "would-have-matched",
+		AllowedHeader: []string{"*"},
+		AllowedMethod: []string{http.MethodGet},
+		AllowedOrigin: []string{"*"},
+		ExposeHeader:  []string{"ETag"},
+		MaxAgeSeconds: 3000,
+	}
+
+	testCases := []struct {
+		name string
+		host string
+		// resolves reports whether the host is parseable, and therefore whether
+		// the bucket it names is evaluated against the stored rules instead of
+		// being handed on.
+		resolves bool
+	}{
+		{name: "nonNumericPort", host: bucket + "." + domain + ":notaport"},
+		{name: "portOutOfRange", host: bucket + "." + domain + ":99999"},
+		{name: "invalidHostLabel", host: "]bad[." + domain},
+		{name: "tooManyColons", host: ":::"},
+		{name: "noHostAtAll", host: ""},
+		// Port zero is a valid port, so this host parses and the bucket it names
+		// is evaluated. It is the boundary that proves only an unparsable host
+		// is handed on.
+		{name: "portZeroResolves", host: bucket + "." + domain + ":0", resolves: true},
+		{name: "wellFormedHostResolves", host: bucket + "." + domain, resolves: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+
+			saved := globalDomainNames
+			t.Cleanup(func() { globalDomainNames = saved })
+			globalDomainNames = []string{domain}
+
+			delegated := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				delegated = true
+				w.WriteHeader(http.StatusTeapot)
+				if _, err := w.Write([]byte(delegatedBody)); err != nil {
+					t.Errorf("writing the delegated response failed: %v", err)
+				}
+			})
+
+			req := httptest.NewRequest(http.MethodOptions, "/object", nil)
+			req.Host = tc.host
+			req.Header.Set("Origin", origin)
+			req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+			req.Header.Set("Access-Control-Request-Headers", "content-type")
+			rec := httptest.NewRecorder()
+
+			// A panic here is the regression this test exists for, so it is
+			// reported as a failure of this case rather than allowed to abort
+			// the whole run.
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Fatalf("the middleware panicked on the host %q: %v", tc.host, recovered)
+					}
+				}()
+				bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+			}()
+
+			if tc.resolves {
+				if delegated {
+					t.Fatalf("expected the parseable host %q to resolve to bucket %q and be evaluated, but the request was handed on",
+						tc.host, bucket)
+				}
+				if rec.Code != http.StatusOK {
+					t.Errorf("expected status %d for the matched rule, got %d", http.StatusOK, rec.Code)
+				}
+				if got := rec.Header().Get("Access-Control-Allow-Origin"); got != origin {
+					t.Errorf("expected the matched rule to echo the origin %q, got %q", origin, got)
+				}
+				return
+			}
+
+			if !delegated {
+				t.Fatalf("expected a preflight carrying the unparsable host %q to reach the wrapped handler, got status %d with headers %v",
+					tc.host, rec.Code, rec.Header())
+			}
+			if rec.Code != http.StatusTeapot {
+				t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
+			}
+			if rec.Body.String() != delegatedBody {
+				t.Errorf("expected the wrapped handler's body %q, got %q", delegatedBody, rec.Body.String())
+			}
+			for _, name := range corsPreflightAllowHeaders {
+				if value := rec.Header().Get(name); value != "" {
+					t.Errorf("expected the middleware not to set %s on a delegated request, got %q", name, value)
+				}
+			}
+			if value := rec.Header().Get("Vary"); value != "" {
+				t.Errorf("expected the middleware not to set Vary on a delegated request, got %q", value)
+			}
+		})
+	}
+}
+
 // corsPreflightAllowHeaders are the response headers a matched rule produces.
 // Not one of them may appear on a delegated or denied response: their absence is
 // exactly how a browser learns that a preflight was refused.
@@ -2400,6 +2527,19 @@ func setTestBucketCORSConfig(sys *BucketMetadataSys, bucket string, cfg *miniogo
 	sys.Set(bucket, meta)
 }
 
+// isTestBucketCORSConfigNotFound reports whether err is the concrete sentinel
+// saying a bucket has no CORS configuration, as opposed to any other reason a
+// configuration could not be produced.
+//
+// The preflight evaluator does not need to tell those apart - it delegates on all
+// of them alike, which is what keeps the server wide fallback in force - but the
+// accessor still reports them distinctly, and the S3 GET handler depends on that
+// to answer NoSuchCORSConfiguration, so the distinction is asserted here.
+func isTestBucketCORSConfigNotFound(err error) bool {
+	var notFound BucketCORSConfigNotFound
+	return errors.As(err, &notFound)
+}
+
 // TestGetCORSConfigCachedIsCacheOnly pins the property the preflight evaluator
 // depends on. A preflight request carries no credentials and names its bucket in
 // a path the client chooses freely, so the lookup it performs must never read
@@ -2408,9 +2548,8 @@ func setTestBucketCORSConfig(sys *BucketMetadataSys, bucket string, cfg *miniogo
 // permanent, unbounded memory growth.
 //
 // The two absence answers must also stay distinguishable: a bucket missing from
-// a loaded cache definitively has no configuration, while a bucket missing from
-// a cache that is still loading is simply not known yet, and only the former may
-// be treated as an absence.
+// a loaded cache definitively has no configuration, while a bucket missing from a
+// cache that is still loading is simply not known yet.
 func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 	const (
 		knownBucket   = "blitzy-cors-known"
@@ -2434,7 +2573,7 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 		}
 		// An unknown state must not be reported as the concrete absence, which
 		// is the only error the preflight evaluator is allowed to fall back on.
-		if isBucketCORSConfigNotFound(err) {
+		if isTestBucketCORSConfigNotFound(err) {
 			t.Fatal("expected an unloaded cache not to report a definitive absence")
 		}
 		if sys.Count() != 0 {
@@ -2449,7 +2588,7 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
-		if !isBucketCORSConfigNotFound(err) {
+		if !isTestBucketCORSConfigNotFound(err) {
 			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
 		}
 		if sys.Count() != 0 {
@@ -2471,23 +2610,24 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 	})
 
 	t.Run("theTwoAbsenceSignalsStayDistinguishable", func(t *testing.T) {
-		// The whole preflight decision rests on telling these two apart, so the
-		// property is pinned on the decision function itself: a definitive
-		// absence must be recognized as one, and a bucket missing from a cache
-		// that is still loading must not be, or a configuration that is merely
-		// unavailable would fall back to the permissive server wide default.
+		// Both signals lead the preflight evaluator to the same disposition -
+		// there are no rules to answer from, so the request is delegated - but
+		// they are not the same fact, and the S3 GET handler reports only the
+		// definitive one as NoSuchCORSConfiguration. The property is pinned on
+		// the function the evaluator actually calls, so it also proves that
+		// neither answer is silently reshaped on the way out.
 		//
 		// The loading accessor is deliberately not exercised here. It reaches for
 		// the process wide object layer, so whether it reports that the server is
 		// uninitialized or goes on to consult a backend depends on what an
 		// earlier test in this package happened to leave installed. What keeps it
 		// out of the preflight path is asserted where it is deterministic
-		// instead: on a loaded cache an unknown bucket has to delegate, and only
-		// a lookup that stays in the cache can answer that way.
+		// instead: neither lookup below may add an entry to the metadata map, and
+		// only a lookup that stays in the cache can satisfy that.
 		loaded := installTestBucketMetadataSys(t, true)
 
 		_, err := preflightCORSConfig(unknownBucket)
-		if !isBucketCORSConfigNotFound(err) {
+		if !isTestBucketCORSConfigNotFound(err) {
 			t.Fatalf("expected a definitive absence on a loaded cache, got %v", err)
 		}
 		if errors.Is(err, errBucketMetadataNotInitialized) {
@@ -2497,14 +2637,17 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 			t.Fatalf("expected the lookup not to add a metadata entry, got %d", loaded.Count())
 		}
 
-		installTestBucketMetadataSys(t, false)
+		loading := installTestBucketMetadataSys(t, false)
 
 		_, err = preflightCORSConfig(unknownBucket)
 		if !errors.Is(err, errBucketMetadataNotInitialized) {
 			t.Fatalf("expected an unknown state while the cache is still loading, got %v", err)
 		}
-		if isBucketCORSConfigNotFound(err) {
+		if isTestBucketCORSConfigNotFound(err) {
 			t.Fatal("an unknown state must not read as a definitive absence")
+		}
+		if loading.Count() != 0 {
+			t.Fatalf("expected the lookup not to add a metadata entry, got %d", loading.Count())
 		}
 	})
 
@@ -2516,7 +2659,7 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
-		if !isBucketCORSConfigNotFound(err) {
+		if !isTestBucketCORSConfigNotFound(err) {
 			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
 		}
 		if sys.Count() != 1 {
@@ -2579,13 +2722,14 @@ func (o corsPreflightOutcome) String() string {
 // a genuine preflight for every state the target bucket's CORS configuration can
 // be in.
 //
-// The three dispositions carry very different security weight. Delegating hands
-// the request to the server wide handler, whose default allows every origin with
-// credentials, so it is reserved for the single case where the bucket
-// definitively has no configuration of its own - requirement R7's fallback.
-// Every state in which the server cannot establish the bucket's rules denies
-// instead, because falling back there would quietly relax a restrictive bucket
-// policy exactly when it matters.
+// The dividing line is whether the bucket's own rules are in hand. Until they
+// are - the bucket has none, the metadata subsystem is absent or still loading,
+// the stored document carries no rule, the lookup failed - the request is
+// delegated, which is what keeps the pre-existing server wide
+// MINIO_API_CORS_ALLOW_ORIGIN behavior in force unchanged for such a bucket on
+// every request type. Only once the rules have been loaded may this layer answer
+// on its own, allowing on the first matching rule and denying when none allows
+// the request.
 func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
@@ -2632,22 +2776,29 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 		wantHeaders map[string]string
 	}{
 		{
-			name: "nilMetadataSystemDenies",
+			// The metadata subsystem is not there to be asked, so the bucket has
+			// no rules of its own to answer from and the server wide handler
+			// answers exactly as it did before this feature existed.
+			name: "nilMetadataSystemDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
 				saved := globalBucketMetadataSys
 				t.Cleanup(func() { globalBucketMetadataSys = saved })
 				globalBucketMetadataSys = nil
 			},
-			want: corsOutcomeDenied,
+			want: corsOutcomeDelegated,
 		},
 		{
-			name: "unknownBucketWhileTheCacheIsStillLoadingDenies",
+			// The startup window: the cache cannot yet say whether the bucket
+			// has a configuration. Answering here would make a preflight's
+			// outcome depend on how far through startup the server happens to
+			// be, and a browser would cache that answer.
+			name: "unknownBucketWhileTheCacheIsStillLoadingDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
 				installTestBucketMetadataSys(t, false)
 			},
-			want: corsOutcomeDenied,
+			want: corsOutcomeDelegated,
 		},
 		{
 			name: "unknownBucketOnALoadedCacheDelegates",
@@ -2666,12 +2817,15 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			want: corsOutcomeDelegated,
 		},
 		{
-			name: "storedConfigurationWithZeroRulesDenies",
+			// A rule-less document cannot have come from PutBucketCors, which
+			// requires at least one rule, so there is nothing to match against
+			// and the bucket carries no rules of its own.
+			name: "storedConfigurationWithZeroRulesDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
 				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig())
 			},
-			want: corsOutcomeDenied,
+			want: corsOutcomeDelegated,
 		},
 		{
 			name: "syntacticallyInvalidBucketNameDelegates",
@@ -2817,7 +2971,8 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 		},
 		{
 			// Virtual-host-style addressing must resolve to the same bucket,
-			// because request2BucketObjectName handles both forms.
+			// because getResource turns the Host into a path-style resource
+			// before path2BucketObject splits the bucket off it.
 			name: "virtualHostStyleAddressingResolvesTheSameBucket",
 			setup: func(t *testing.T) {
 				t.Helper()
@@ -2918,6 +3073,93 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 					}
 					t.Errorf("expected %s to be %q, got %q", name, want, got)
 				}
+			}
+		})
+	}
+}
+
+// TestBucketCorsPreflightMiddlewareMalformedHost pins the disposition of a
+// preflight whose Host header does not parse. That is reachable only when
+// virtual-host-style addressing is configured, because only then does resolving
+// the bucket have to parse the Host at all.
+//
+// A preflight carries no credentials, so this middleware inspects a Host the
+// client chose freely before anything has authenticated the request. Resolving it
+// through request2BucketObjectName would report the parse failure through
+// logger.CriticalIf, which panics: the client would get a recovered HTTP 500
+// where before this feature existed it got a plain delegated preflight, and every
+// such unauthenticated request would append another stack trace, naming absolute
+// build paths, to the server log. A malformed Host identifies no bucket, so it
+// is delegated like any other request that does not resolve to one - and the
+// wrapped handler being reached at all is what proves nothing panicked on the way
+// there.
+func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
+	const (
+		bucket = "blitzy-cors-bucket"
+		domain = "qa.local"
+		origin = "https://www.example1.com"
+	)
+
+	overLongLabel := strings.Repeat("a", 70)
+
+	hosts := []struct {
+		name string
+		host string
+	}{
+		{name: "underscoreInALabel", host: "a_b." + domain},
+		{name: "leadingHyphenInALabel", host: "-bad." + domain},
+		{name: "overLongLabel", host: overLongLabel + "." + domain},
+		{name: "emptyLabel", host: "a..b." + domain},
+		{name: "malformedHostOutsideTheDomain", host: "a_b.other.tld"},
+		{name: "malformedHostCarryingAPort", host: "a_b." + domain + ":9000"},
+	}
+
+	for _, tc := range hosts {
+		t.Run(tc.name, func(t *testing.T) {
+			// The bucket is present and its single rule would match the probe,
+			// so delegation cannot be mistaken for the ordinary
+			// no-configuration fallback: the only thing standing in the way is
+			// the Host that does not parse.
+			sys := installTestBucketMetadataSys(t, true)
+			setTestBucketCORSConfig(sys, bucket, corsTestConfig(miniogocors.Rule{
+				ID:            "matching",
+				AllowedMethod: []string{http.MethodPut},
+				AllowedOrigin: []string{"*"},
+			}))
+
+			saved := globalDomainNames
+			t.Cleanup(func() { globalDomainNames = saved })
+			globalDomainNames = []string{domain}
+
+			delegated := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				delegated = true
+				w.WriteHeader(http.StatusTeapot)
+			})
+
+			req := httptest.NewRequest(http.MethodOptions, "/object", nil)
+			req.Host = tc.host
+			req.Header.Set("Origin", origin)
+			req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+			req.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
+			rec := httptest.NewRecorder()
+
+			bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+
+			if !delegated {
+				t.Fatalf("expected a preflight with a malformed Host to reach the wrapped handler, got status %d and headers %v",
+					rec.Code, rec.Header())
+			}
+			if rec.Code != http.StatusTeapot {
+				t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
+			}
+			for _, name := range corsPreflightAllowHeaders {
+				if value := rec.Header().Get(name); value != "" {
+					t.Errorf("expected the middleware not to set %s on a delegated request, got %q", name, value)
+				}
+			}
+			if value := rec.Header().Get("Vary"); value != "" {
+				t.Errorf("expected the middleware not to set Vary on a delegated request, got %q", value)
 			}
 		})
 	}
