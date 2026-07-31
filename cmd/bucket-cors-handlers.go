@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2025 MinIO, Inc.
+// Copyright (c) 2015-2026 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -26,11 +26,10 @@ import (
 	"github.com/minio/pkg/v3/policy"
 )
 
-// PutBucketCorsHandler - PUT Bucket cors.
+// PutBucketCorsHandler - PUT Bucket CORS.
 // ----------
-// Stores the supplied CORSConfiguration document as bucket metadata, replacing
-// any configuration previously stored on the bucket. Responds with HTTP 200 on
-// success, which the AWS and MinIO SDKs both accept.
+// Stores the bucket CORS configuration, replacing any previous one, and returns
+// HTTP 200.
 func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketCors")
 
@@ -45,7 +44,6 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Check if bucket exists.
 	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -56,11 +54,9 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	// The body is handed over as it is: validateBucketCorsConfig owns the size
-	// ceiling, reading one byte past maxBucketCORSConfigSize so that an
-	// oversized document is refused for its length instead of being accepted as
-	// a truncated prefix of itself. r.ContentLength is deliberately not
-	// consulted, it may be absent or negative on a chunked upload.
+	// validateBucketCorsConfig owns the fixed body limit and reads one byte past
+	// it, so chunked requests remain bounded when ContentLength is absent or
+	// negative.
 	cfg, err := validateBucketCorsConfig(r.Body)
 	if err != nil {
 		// Surface the specific validation cause to the client, the S3 error code
@@ -73,7 +69,7 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 
 	// Persist the re-marshaled configuration rather than the raw body so the
 	// stored document is canonical: the namespace is populated and every
-	// AllowedMethod is upper cased by the parser.
+	// AllowedMethod is uppercased by the parser.
 	configData, err := xml.Marshal(cfg)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -85,15 +81,13 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Write success response.
 	writeSuccessResponseHeadersOnly(w)
 }
 
-// GetBucketCorsHandler - GET Bucket cors.
+// GetBucketCorsHandler - GET Bucket CORS.
 // ----------
-// Returns the CORSConfiguration document stored on the bucket. A bucket with no
-// stored configuration yields NoSuchCORSConfiguration with HTTP 404, which the
-// BucketCORSConfigNotFound sentinel is mapped to by toAPIErrorCode.
+// Returns the stored bucket CORS configuration, or NoSuchCORSConfiguration with
+// HTTP 404 when the bucket has none.
 func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetBucketCors")
 
@@ -108,7 +102,6 @@ func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	// check if user has permissions to perform this operation
 	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketCorsAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -121,23 +114,21 @@ func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http
 	}
 
 	// The parsed model carries the CORSConfiguration root element and the S3
-	// namespace through its struct tags, so marshaling it reproduces the exact
-	// wire format the AWS SDK, "aws s3api ... cors" and "mc" expect.
+	// namespace through its struct tags, so marshaling it yields the
+	// AWS-compatible CORS XML expected by SDK and CLI clients.
 	configData, err := xml.Marshal(config)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	// Write success response.
 	writeSuccessResponseXML(w, configData)
 }
 
-// DeleteBucketCorsHandler - DELETE Bucket cors.
+// DeleteBucketCorsHandler - DELETE Bucket CORS.
 // ----------
-// Clears the CORS configuration stored on the bucket and responds with HTTP 204.
-// The operation is idempotent: BucketMetadataSys.Delete clears the field
-// unconditionally, so deleting a configuration that was never set succeeds too.
+// Removes the bucket CORS configuration and returns HTTP 204. The removal is
+// idempotent, so a bucket that never had one succeeds too.
 func (api objectAPIHandlers) DeleteBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DeleteBucketCors")
 
@@ -162,6 +153,5 @@ func (api objectAPIHandlers) DeleteBucketCorsHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Write success response.
 	writeSuccessNoContent(w)
 }
