@@ -36,6 +36,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	jwtgo "github.com/golang-jwt/jwt/v4"
+	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/signer"
 	xhttp "github.com/minio/minio/internal/http"
@@ -128,6 +129,10 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestBucketSQSNotificationWebHook(c)
 	suite.TestBucketSQSNotificationAMQP(c)
 	suite.TestUnsignedCVE(c)
+	suite.TestBucketCORSRoundTrip(c)
+	suite.TestBucketCORSNotFound(c)
+	suite.TestBucketCORSMalformedXML(c)
+	suite.TestBucketCORSPreflight(c)
 	suite.TearDownSuite(c)
 }
 
@@ -295,6 +300,355 @@ func (s *TestSuiteCommon) TestCors(c *check) {
 			gotSet := set.CreateStringSet(strings.Split(v[0], ", ")...)
 			if !expectedSet.Equals(gotSet) {
 				c.Errorf("Expected value %v, got %v", strings.Join(expectedMap[k], ", "), v)
+			}
+		}
+	}
+}
+
+// corsSuiteConfig is the multi-rule CORS configuration the round-trip
+// acceptance test stores and reads back. It deliberately exercises the whole
+// AWS element vocabulary - ID, several AllowedMethod values drawn from
+// {GET, PUT, POST, DELETE, HEAD}, several AllowedOrigin values including the
+// suffix wildcard form the canonical AWS fixture uses, AllowedHeader,
+// ExposeHeader and MaxAgeSeconds - so that a regression in any one element is
+// caught on the wire rather than only in the unit tests.
+const corsSuiteConfig = `<CORSConfiguration xmlns="` + s3CORSNamespace + `">
+  <CORSRule>
+    <ID>read-only-rule</ID>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>HEAD</AllowedMethod>
+    <AllowedOrigin>http://www.example1.com</AllowedOrigin>
+    <AllowedOrigin>http://www.example2.*</AllowedOrigin>
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>x-amz-request-id</ExposeHeader>
+    <MaxAgeSeconds>3000</MaxAgeSeconds>
+  </CORSRule>
+  <CORSRule>
+    <ID>write-rule</ID>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedMethod>POST</AllowedMethod>
+    <AllowedMethod>DELETE</AllowedMethod>
+    <AllowedOrigin>https://www.example3.com</AllowedOrigin>
+    <AllowedHeader>x-amz-meta-foo</AllowedHeader>
+    <AllowedHeader>content-type</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <ExposeHeader>x-amz-version-id</ExposeHeader>
+    <MaxAgeSeconds>600</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>`
+
+// corsSuitePreflightConfig allows exactly one origin, one method and one request
+// header, so a preflight that deviates on any single axis must be denied. The
+// ExposeHeader and MaxAgeSeconds elements are what the matched preflight
+// response has to echo back.
+const corsSuitePreflightConfig = `<CORSConfiguration xmlns="` + s3CORSNamespace + `">
+  <CORSRule>
+    <ID>preflight-rule</ID>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedOrigin>http://example.com</AllowedOrigin>
+    <AllowedHeader>x-amz-meta-foo</AllowedHeader>
+    <ExposeHeader>x-amz-request-id</ExposeHeader>
+    <MaxAgeSeconds>3000</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>`
+
+// TestBucketCORSRoundTrip - PutBucketCors accepts a valid multi-rule
+// configuration and answers HTTP 200, and a subsequent GetBucketCors returns an
+// equivalent configuration, round-tripping every rule, origin, method, header
+// and max-age on the exact wire shape the AWS SDK, "aws s3api ... cors" and "mc"
+// all expect.
+func (s *TestSuiteCommon) TestBucketCORSRoundTrip(c *check) {
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// Store the configuration. S3 answers a successful PutBucketCors with 200.
+	request, err = newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+		int64(len(corsSuiteConfig)), bytes.NewReader([]byte(corsSuiteConfig)),
+		s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// Read the configuration back.
+	request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	configData, err := io.ReadAll(response.Body)
+	c.Assert(err, nil)
+
+	// Client compatibility is a wire-format contract: the root element must be
+	// CORSConfiguration, it must carry the S3 namespace, and every child element
+	// name and its casing must be the AWS one.
+	gotBody := string(configData)
+	for _, want := range []string{
+		`<CORSConfiguration xmlns="` + s3CORSNamespace + `">`,
+		"<CORSRule>", "<ID>", "<AllowedMethod>", "<AllowedOrigin>",
+		"<AllowedHeader>", "<ExposeHeader>", "<MaxAgeSeconds>",
+	} {
+		if !strings.Contains(gotBody, want) {
+			c.Errorf("Expected the CORS configuration to contain %s, got %s", want, gotBody)
+		}
+	}
+
+	// The returned document must be structurally equivalent to the stored one.
+	// The server persists the re-marshaled configuration, so the comparison runs
+	// against the parsed form of the submitted document rather than its bytes.
+	expectedConfig, err := validateBucketCorsConfig(strings.NewReader(corsSuiteConfig))
+	c.Assert(err, nil)
+
+	gotConfig := &miniogocors.Config{}
+	err = xml.Unmarshal(configData, gotConfig)
+	c.Assert(err, nil)
+	c.Assert(gotConfig.XMLName.Local, "CORSConfiguration")
+	c.Assert(gotConfig.XMLNS, s3CORSNamespace)
+	c.Assert(len(gotConfig.CORSRules), len(expectedConfig.CORSRules))
+	for i := range expectedConfig.CORSRules {
+		c.Assert(gotConfig.CORSRules[i], expectedConfig.CORSRules[i])
+	}
+}
+
+// TestBucketCORSNotFound - GetBucketCors on a bucket with no configuration
+// returns 404 NoSuchCORSConfiguration, and so does a GetBucketCors issued after
+// a DeleteBucketCors. DeleteBucketCors answers 204 and is idempotent, including
+// on a bucket whose configuration was never set.
+//
+// These assertions deliberately drive raw HTTP rather than the MinIO Go SDK:
+// the SDK swallows NoSuchCORSConfiguration and hands back a nil configuration
+// with a nil error, so an SDK-based assertion would pass against a server that
+// answered with any other status.
+func (s *TestSuiteCommon) TestBucketCORSNotFound(c *check) {
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// A bucket that never had a CORS configuration reports the precise S3 code.
+	request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	verifyError(c, response, "NoSuchCORSConfiguration", "The CORS configuration does not exist", http.StatusNotFound)
+
+	// Deleting a configuration that was never set still succeeds with 204.
+	request, err = newTestSignedRequest(http.MethodDelete, getBucketCORSURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusNoContent)
+
+	// Store a configuration so that the delete below has something to clear.
+	request, err = newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+		int64(len(corsSuiteConfig)), bytes.NewReader([]byte(corsSuiteConfig)),
+		s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// Two deletes in a row must both answer 204, and the configuration must be
+	// gone after the first one.
+	for range 2 {
+		request, err = newTestSignedRequest(http.MethodDelete, getBucketCORSURL(s.endPoint, bucketName),
+			0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		response, err = s.client.Do(request)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusNoContent)
+
+		request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+			0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		response, err = s.client.Do(request)
+		c.Assert(err, nil)
+		verifyError(c, response, "NoSuchCORSConfiguration", "The CORS configuration does not exist", http.StatusNotFound)
+	}
+}
+
+// TestBucketCORSMalformedXML - PutBucketCors rejects a body that is not
+// well-formed XML, a body whose root element is not CORSConfiguration, and a
+// body that is well-formed but violates an S3 CORS constraint. Every rejection
+// is a MalformedXML error with HTTP 400 whose message names the specific cause,
+// and nothing is persisted by a rejected request.
+func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	malformedConfigs := []string{
+		// Not well-formed at all: the CORSRule element is never closed.
+		`<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>`,
+		// Well-formed XML whose root element is not CORSConfiguration.
+		`<NotACORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></NotACORSConfiguration>`,
+		// A CORSConfiguration carrying no rule at all.
+		`<CORSConfiguration></CORSConfiguration>`,
+		// A rule whose AllowedMethod falls outside {GET, PUT, POST, DELETE, HEAD}.
+		`<CORSConfiguration><CORSRule><AllowedMethod>PATCH</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+		// A rule with no AllowedOrigin.
+		`<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`,
+	}
+
+	for _, malformedConfig := range malformedConfigs {
+		// The handler carries the validator's own message into the error
+		// description, so the expected message is exactly what the validator
+		// reports for the same body.
+		_, expectedErr := validateBucketCorsConfig(strings.NewReader(malformedConfig))
+		if expectedErr == nil {
+			c.Fatalf("Expected the CORS validator to reject %s", malformedConfig)
+		}
+
+		badRequest, err := newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+			int64(len(malformedConfig)), bytes.NewReader([]byte(malformedConfig)),
+			s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		badResponse, err := s.client.Do(badRequest)
+		c.Assert(err, nil)
+		verifyError(c, badResponse, "MalformedXML", expectedErr.Error(), http.StatusBadRequest)
+	}
+
+	// A rejected configuration must never be persisted.
+	request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	verifyError(c, response, "NoSuchCORSConfiguration", "The CORS configuration does not exist", http.StatusNotFound)
+}
+
+// TestBucketCORSPreflight - an OPTIONS preflight whose origin, method and
+// requested headers are all allowed by a stored rule is answered with HTTP 200
+// and the five Access-Control-Allow-* header families derived from that rule,
+// while a preflight that deviates on any single axis receives no
+// Access-Control-Allow-* header at all, which is how a browser learns the
+// request is refused.
+func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	request, err = newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+		int64(len(corsSuitePreflightConfig)), bytes.NewReader([]byte(corsSuitePreflightConfig)),
+		s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// A browser preflight carries no credentials, so the OPTIONS request is
+	// unsigned. It is answered by the per-bucket evaluator that wraps the server
+	// wide CORS handler.
+	bucketURL := getMakeBucketURL(s.endPoint, bucketName)
+	preflight, err := http.NewRequest(http.MethodOptions, bucketURL, nil)
+	c.Assert(err, nil)
+	preflight.Header.Set("Origin", "http://example.com")
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPut)
+	preflight.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
+
+	allowed, err := s.client.Do(preflight)
+	c.Assert(err, nil)
+	c.Assert(allowed.StatusCode, http.StatusOK)
+
+	// Access-Control-Expose-Headers in particular can only come from the
+	// per-bucket evaluator, because the server wide handler never emits it on a
+	// preflight response, so its presence proves the matched rule answered.
+	c.Assert(allowed.Header.Get("Access-Control-Allow-Origin"), "http://example.com")
+	c.Assert(allowed.Header.Get("Access-Control-Allow-Methods"), http.MethodPut)
+	c.Assert(allowed.Header.Get("Access-Control-Allow-Headers"), "x-amz-meta-foo")
+	c.Assert(allowed.Header.Get("Access-Control-Max-Age"), "3000")
+	c.Assert(allowed.Header.Get("Access-Control-Expose-Headers"), "x-amz-request-id")
+	c.Assert(allowed.Header.Get("Vary"), "Origin")
+
+	// Origin, method and requested headers are each independently required.
+	deniedPreflights := []struct {
+		reason  string
+		origin  string
+		method  string
+		headers string
+	}{
+		{
+			reason:  "origin is not allowed",
+			origin:  "http://evil.com",
+			method:  http.MethodPut,
+			headers: "x-amz-meta-foo",
+		},
+		{
+			reason:  "method is not allowed",
+			origin:  "http://example.com",
+			method:  http.MethodDelete,
+			headers: "x-amz-meta-foo",
+		},
+		{
+			reason:  "requested header is not allowed",
+			origin:  "http://example.com",
+			method:  http.MethodPut,
+			headers: "x-amz-meta-bar",
+		},
+	}
+
+	for _, denied := range deniedPreflights {
+		deniedRequest, err := http.NewRequest(http.MethodOptions, bucketURL, nil)
+		c.Assert(err, nil)
+		deniedRequest.Header.Set("Origin", denied.origin)
+		deniedRequest.Header.Set("Access-Control-Request-Method", denied.method)
+		deniedRequest.Header.Set("Access-Control-Request-Headers", denied.headers)
+
+		deniedResponse, err := s.client.Do(deniedRequest)
+		c.Assert(err, nil)
+		c.Assert(deniedResponse.StatusCode, http.StatusOK)
+
+		for _, header := range []string{
+			"Access-Control-Allow-Origin",
+			"Access-Control-Allow-Methods",
+			"Access-Control-Allow-Headers",
+			"Access-Control-Max-Age",
+			"Access-Control-Expose-Headers",
+		} {
+			if got := deniedResponse.Header.Values(header); len(got) != 0 {
+				c.Errorf("Expected no %s header when the %s, got %v", header, denied.reason, got)
 			}
 		}
 	}

@@ -112,11 +112,6 @@ var rejectedBucketAPIs = []rejectedAPI{
 		queries: []string{"inventory", ""},
 	},
 	{
-		api:     "cors",
-		methods: []string{http.MethodPut, http.MethodDelete},
-		queries: []string{"cors", ""},
-	},
-	{
 		api:     "metrics",
 		methods: []string{http.MethodGet, http.MethodPut, http.MethodDelete},
 		queries: []string{"metrics", ""},
@@ -459,18 +454,6 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPut).
 			HandlerFunc(s3APIMiddleware(api.PutBucketACLHandler)).
 			Queries("acl", "")
-		// GetBucketCors - this is a dummy call.
-		router.Methods(http.MethodGet).
-			HandlerFunc(s3APIMiddleware(api.GetBucketCorsHandler)).
-			Queries("cors", "")
-		// PutBucketCors - this is a dummy call.
-		router.Methods(http.MethodPut).
-			HandlerFunc(s3APIMiddleware(api.PutBucketCorsHandler)).
-			Queries("cors", "")
-		// DeleteBucketCors - this is a dummy call.
-		router.Methods(http.MethodDelete).
-			HandlerFunc(s3APIMiddleware(api.DeleteBucketCorsHandler)).
-			Queries("cors", "")
 		// GetBucketWebsiteHandler - this is a dummy call.
 		router.Methods(http.MethodGet).
 			HandlerFunc(s3APIMiddleware(api.GetBucketWebsiteHandler)).
@@ -500,6 +483,19 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodDelete).
 			HandlerFunc(s3APIMiddleware(api.DeleteBucketTaggingHandler)).
 			Queries("tagging", "")
+
+		// GetBucketCors
+		router.Methods(http.MethodGet).
+			HandlerFunc(s3APIMiddleware(api.GetBucketCorsHandler)).
+			Queries("cors", "")
+		// PutBucketCors
+		router.Methods(http.MethodPut).
+			HandlerFunc(s3APIMiddleware(api.PutBucketCorsHandler)).
+			Queries("cors", "")
+		// DeleteBucketCors
+		router.Methods(http.MethodDelete).
+			HandlerFunc(s3APIMiddleware(api.DeleteBucketCorsHandler)).
+			Queries("cors", "")
 
 		// ListMultipartUploads
 		router.Methods(http.MethodGet).

@@ -317,9 +317,8 @@ func (b *BucketMetadata) parseAllConfigs(ctx context.Context, objectAPI ObjectLa
 		b.taggingConfig = nil
 	}
 
-	// The parser defaults the S3 namespace and upper-cases AllowedMethod values,
-	// so the parsed configuration is always canonical. The else branch is what
-	// makes a DELETE of the CORS configuration observable to readers.
+	// Clear the parsed configuration when the persisted XML is absent so
+	// deletion cannot leave stale CORS rules in memory.
 	if len(b.CORSConfigXML) != 0 {
 		b.corsConfig, err = miniogocors.ParseBucketCorsConfig(bytes.NewReader(b.CORSConfigXML))
 		if err != nil {

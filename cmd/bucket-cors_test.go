@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2025 MinIO, Inc.
+// Copyright (c) 2015-2026 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,7 +18,9 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,18 +29,17 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
+	"github.com/tinylib/msgp/msgp"
 )
 
-// s3CORSNamespace is the XML namespace every S3 CORS document carries. It
-// mirrors the unexported default of github.com/minio/minio-go/v7/pkg/cors, which
-// is not addressable from here, and pins the wire format that the AWS SDK, "aws
-// s3api ... cors" and "mc" all expect.
+// s3CORSNamespace is the namespace minio-go defaults and emits for S3 CORS
+// configurations.
 const s3CORSNamespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
-// corsMinimalRuleBody is the smallest set of child elements a valid CORSRule
-// needs: exactly one AllowedMethod and exactly one AllowedOrigin.
 const corsMinimalRuleBody = `<AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>`
 
 // corsCanonicalDocument is the canonical, AWS shaped CORS configuration. It is a
@@ -62,34 +63,25 @@ var allSupportedCORSMethods = []string{
 	http.MethodHead,
 }
 
-// corsTestDoc wraps the supplied CORSRule elements in a CORSConfiguration root
-// element carrying the S3 namespace, which is the shape every S3 client sends.
 func corsTestDoc(rules ...string) string {
 	return `<CORSConfiguration xmlns="` + s3CORSNamespace + `">` + strings.Join(rules, "") + `</CORSConfiguration>`
 }
 
-// corsTestRule wraps the supplied child elements in a single CORSRule element.
 func corsTestRule(children ...string) string {
 	return `<CORSRule>` + strings.Join(children, "") + `</CORSRule>`
 }
 
-// corsTestConfig builds a configuration from the supplied rules, in document
-// order, through the same constructor the SDK uses so that the namespace is
-// populated exactly as it would be on a parsed document.
 func corsTestConfig(rules ...miniogocors.Rule) *miniogocors.Config {
 	return miniogocors.NewConfig(rules)
 }
 
-// TestValidateBucketCorsConfig exercises every rejection reason the validator
-// enforces on top of the CORS schema, together with the documents that must be
-// accepted. Every input is read through the same io.LimitReader ceiling the PUT
-// handler applies, so the size case reproduces the production truncation rather
-// than approximating it.
+// TestValidateBucketCorsConfig covers accepted and rejected XML shapes, the
+// strict schema walk, the size boundary and duplicate scalar elements. Inputs
+// are handed over unbounded, exactly as the PUT handler hands over the request
+// body, because the validator owns the size ceiling.
 //
-// Failures are asserted with a distinctive substring rather than exact string
-// equality: the message is surfaced verbatim to the client as the description of
-// a MalformedXML error, so what matters is that it names the offending rule and
-// value, not its exact phrasing.
+// Failures are asserted with a distinctive substring: the message reaches the
+// client as the description of a MalformedXML error.
 func TestValidateBucketCorsConfig(t *testing.T) {
 	// corsPaddedDoc builds an otherwise valid single-rule document whose total
 	// length is driven purely by the length of its ID element. The two size
@@ -102,17 +94,14 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 
 	type validateCase struct {
 		name string
-		// xml is the request body handed to the validator.
-		xml string
+		xml  string
 		// wantErrSubstring is a distinctive fragment of the expected failure.
 		// An empty value means the document must be accepted.
 		wantErrSubstring string
-		// wantRules is the rule count expected on an accepted document.
-		wantRules int
+		wantRules        int
 	}
 
 	testCases := []validateCase{
-		// V1 - the document must be well-formed XML rooted at CORSConfiguration.
 		{
 			name:             "V1a/notWellFormedXML",
 			xml:              `<CORSConfiguration><CORSRule>`,
@@ -121,7 +110,12 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 		{
 			name:             "V1a/emptyBody",
 			xml:              ``,
-			wantErrSubstring: "decoding xml",
+			wantErrSubstring: "does not contain a CORSConfiguration element",
+		},
+		{
+			name:             "V1a/whitespaceOnlyBody",
+			xml:              "  \n\t ",
+			wantErrSubstring: "does not contain a CORSConfiguration element",
 		},
 		{
 			name:             "V1a/unclosedRuleElement",
@@ -131,15 +125,133 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 		{
 			name:             "V1b/rootElementNotCORSConfiguration",
 			xml:              `<NotCORSConfiguration/>`,
-			wantErrSubstring: "CORSConfiguration",
+			wantErrSubstring: `Unexpected root element "NotCORSConfiguration"`,
 		},
 		{
 			name:             "V1b/rootElementNotCORSConfigurationButCarriesRules",
 			xml:              `<AccessControlPolicy>` + corsTestRule(corsMinimalRuleBody) + `</AccessControlPolicy>`,
-			wantErrSubstring: "CORSConfiguration",
+			wantErrSubstring: `Unexpected root element "AccessControlPolicy"`,
 		},
 
-		// V2 - at least one rule is required.
+		// V1c - the body must be exactly one CORSConfiguration document. A
+		// single decode stops as soon as it has filled the root element and
+		// never asks for EOF, so anything trailing the closing tag would
+		// otherwise be accepted in silence.
+		{
+			name:             "V1c/trailingTextAfterTheDocument",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + `trailing`,
+			wantErrSubstring: "character data after the CORSConfiguration element",
+		},
+		{
+			name:             "V1c/trailingElementAfterTheDocument",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + `<Other/>`,
+			wantErrSubstring: `contains the element "Other" after the CORSConfiguration element`,
+		},
+		{
+			name:             "V1c/secondRootElement",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantErrSubstring: `contains the element "CORSConfiguration" after the CORSConfiguration element`,
+		},
+		{
+			name:             "V1c/trailingMalformedBytesAfterTheDocument",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + `<<<`,
+			wantErrSubstring: "XML syntax error",
+		},
+		{
+			name:             "V1c/textBetweenRules",
+			xml:              `<CORSConfiguration>trailing` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: "CORSConfiguration contains character data outside of a CORSRule element",
+		},
+		{
+			name:             "V1c/documentTypeDeclaration",
+			xml:              `<!DOCTYPE CORSConfiguration>` + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantErrSubstring: "Unexpected document type declaration",
+		},
+		{
+			// A declaration is refused wherever it appears, not only in the
+			// prolog, because the reason to refuse it - keeping entity handling
+			// out of the picture - does not depend on its position.
+			name:             "V1c/documentTypeDeclarationBetweenRules",
+			xml:              `<CORSConfiguration>` + corsTestRule(corsMinimalRuleBody) + `<!DOCTYPE x>` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: "Unexpected document type declaration",
+		},
+		{
+			name:             "V1c/documentTypeDeclarationInsideARule",
+			xml:              corsTestDoc(`<CORSRule><!DOCTYPE x/>` + corsMinimalRuleBody + `</CORSRule>`),
+			wantErrSubstring: "Unexpected document type declaration",
+		},
+		{
+			name:             "V1c/documentTypeDeclarationInsideAValueElement",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET<!DOCTYPE x></AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: "Unexpected document type declaration",
+		},
+		{
+			name:      "V1c/leadingXMLDeclarationIsAccepted",
+			xml:       xml.Header + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+		{
+			name:      "V1c/commentsAreAccepted",
+			xml:       `<!-- before -->` + corsTestDoc(`<!-- inside -->`+corsTestRule(corsMinimalRuleBody)) + `<!-- after -->`,
+			wantRules: 1,
+		},
+		{
+			name: "V1c/prettyPrintedDocumentIsAccepted",
+			xml: "<CORSConfiguration xmlns=\"" + s3CORSNamespace + "\">\n" +
+				"  <CORSRule>\n" +
+				"    <AllowedMethod>GET</AllowedMethod>\n" +
+				"    <AllowedOrigin>*</AllowedOrigin>\n" +
+				"  </CORSRule>\n" +
+				"</CORSConfiguration>\n",
+			wantRules: 1,
+		},
+
+		// V1d - element placement and cardinality. The document model would
+		// otherwise normalize a violation away: a repeated scalar keeps only
+		// its last value and an unknown element is skipped without comment.
+		{
+			name:             "V1d/unexpectedElementUnderRoot",
+			xml:              `<CORSConfiguration><NotARule/>` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `CORSConfiguration contains unsupported element "NotARule"`,
+		},
+		{
+			name:             "V1d/unexpectedElementInCORSRule",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<AllowedHeaders>x-a</AllowedHeaders>`)),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "AllowedHeaders"`,
+		},
+		{
+			name:             "V1d/unexpectedElementInSecondCORSRuleReportsItsOwnIndex",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody), corsTestRule(corsMinimalRuleBody+`<Bogus/>`)),
+			wantErrSubstring: `CORSRule 1 contains unsupported element "Bogus"`,
+		},
+		{
+			name:             "V1d/elementNestedInsideAValueElement",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod><GET/></AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: `CORSRule 0 has AllowedMethod containing the nested element "GET"`,
+		},
+		{
+			name:             "V1d/duplicateID",
+			xml:              corsTestDoc(corsTestRule(`<ID>first</ID><ID>second</ID>` + corsMinimalRuleBody)),
+			wantErrSubstring: "CORSRule 0 contains 2 ID elements, at most one is allowed",
+		},
+		{
+			name:             "V1d/duplicateMaxAgeSeconds",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>10</MaxAgeSeconds><MaxAgeSeconds>20</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements, at most one is allowed",
+		},
+		{
+			// Without the cardinality check the decoder would keep only the
+			// trailing, valid value and the negative one would never be seen.
+			name:             "V1d/duplicateMaxAgeSecondsCannotMaskANegativeValue",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>-1</MaxAgeSeconds><MaxAgeSeconds>3000</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements, at most one is allowed",
+		},
+		{
+			name:      "V1d/repeatedListElementsAreAccepted",
+			xml:       corsTestDoc(corsTestRule(`<AllowedHeader>x-a</AllowedHeader><AllowedHeader>x-b</AllowedHeader><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedOrigin>https://a.example.com</AllowedOrigin><AllowedOrigin>https://b.example.com</AllowedOrigin><ExposeHeader>ETag</ExposeHeader><ExposeHeader>x-amz-request-id</ExposeHeader>`)),
+			wantRules: 1,
+		},
+
 		{
 			name:             "V2/zeroCORSRule",
 			xml:              `<CORSConfiguration></CORSConfiguration>`,
@@ -151,8 +263,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: "must contain at least one CORSRule",
 		},
 
-		// V3 - at most maxBucketCORSRules rules are allowed, and the boundary
-		// itself must still be accepted.
 		{
 			name:      "V3/exactlyMaxRulesIsAccepted",
 			xml:       corsTestDoc(strings.Repeat(corsTestRule(corsMinimalRuleBody), maxBucketCORSRules)),
@@ -164,7 +274,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: fmt.Sprintf("at most %d are allowed", maxBucketCORSRules),
 		},
 
-		// V4 - every rule needs at least one AllowedMethod.
 		{
 			name:             "V4/ruleWithoutAllowedMethod",
 			xml:              corsTestDoc(corsTestRule(`<AllowedOrigin>*</AllowedOrigin>`)),
@@ -176,7 +285,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: "CORSRule 1 must contain at least one AllowedMethod",
 		},
 
-		// V5 - AllowedMethod is restricted to the five methods S3 accepts.
 		{
 			name:             "V5/unsupportedAllowedMethodPATCH",
 			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>PATCH</AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
@@ -198,14 +306,12 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: `unsupported AllowedMethod "TRACE"`,
 		},
 
-		// V6 - every rule needs at least one AllowedOrigin.
 		{
 			name:             "V6/ruleWithoutAllowedOrigin",
 			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod>`)),
 			wantErrSubstring: "CORSRule 0 must contain at least one AllowedOrigin",
 		},
 
-		// V7 - an origin may carry at most one wildcard.
 		{
 			name:             "V7/allowedOriginWithTwoWildcards",
 			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>http://*.example.*</AllowedOrigin>`)),
@@ -227,8 +333,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// V8 - an AllowedHeader may carry at most one wildcard, and none at all
-		// is equally valid.
 		{
 			name:             "V8/allowedHeaderWithTwoWildcards",
 			xml:              corsTestDoc(corsTestRule(`<AllowedHeader>x-*-*</AllowedHeader>` + corsMinimalRuleBody)),
@@ -250,21 +354,362 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// V9 - the body is bounded by maxBucketCORSConfigSize, so a document one
-		// byte over the ceiling is truncated and fails to decode while the same
-		// document one byte under it is accepted.
+		// V9 - the body is bounded by maxBucketCORSConfigSize. The boundary
+		// itself is accepted and one byte more is rejected as too large, which
+		// is only provable because the validator reads one byte past the ceiling
+		// instead of validating a truncated prefix of the body.
 		{
 			name:      "V9/oneByteUnderMaxConfigSizeIsAccepted",
 			xml:       corsPaddedDoc(maxBucketCORSConfigSize - sizeOverhead - 1),
 			wantRules: 1,
 		},
 		{
-			name:             "V9/oneByteOverMaxConfigSizeIsTruncatedAndRejected",
+			name:      "V9/exactlyMaxConfigSizeIsAccepted",
+			xml:       corsPaddedDoc(maxBucketCORSConfigSize - sizeOverhead),
+			wantRules: 1,
+		},
+		{
+			name:             "V9/oneByteOverMaxConfigSizeIsRejected",
 			xml:              corsPaddedDoc(maxBucketCORSConfigSize - sizeOverhead + 1),
-			wantErrSubstring: "unexpected EOF",
+			wantErrSubstring: fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize),
+		},
+		{
+			// A complete, valid document followed by enough padding to push the
+			// body over the ceiling: the decoder would stop at the root element
+			// and never see the padding, so only a size check on the whole body
+			// can reject it.
+			name: "V9/validDocumentFollowedByOversizePaddingIsRejected",
+			xml: corsTestDoc(corsTestRule(corsMinimalRuleBody)) +
+				strings.Repeat(" ", maxBucketCORSConfigSize),
+			wantErrSubstring: fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize),
+		},
+		{
+			// A document far over the ceiling must be rejected on its length
+			// too, rather than on whatever the truncated prefix happens to be.
+			name:             "V9/farOverMaxConfigSizeIsRejected",
+			xml:              corsPaddedDoc(2 * maxBucketCORSConfigSize),
+			wantErrSubstring: fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize),
+		},
+		{
+			// The worst case for a ceiling that only truncates: a small, valid
+			// document whose root element closes long before the limit,
+			// followed by an oversized tail. The request is over the ceiling
+			// and must be rejected on its length.
+			name:             "V9/validRootFollowedByAnOversizedTailIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + strings.Repeat("t", maxBucketCORSConfigSize),
+			wantErrSubstring: fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize),
 		},
 
-		// MaxAgeSeconds must be a non-negative integer when present.
+		// R8 - the wire format is the AWS one, so the document either omits the
+		// namespace or declares exactly the S3 namespace. Any other value would
+		// be preserved on the persisted document and handed back to clients that
+		// cannot read it.
+		{
+			name: "R8/wrongNamespaceIsRejected",
+			xml: `<CORSConfiguration xmlns="http://example.com/wrong">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `Unexpected XML namespace "http://example.com/wrong"`,
+		},
+		{
+			// The element namespace is the S3 one through its prefix, yet the
+			// default xmlns attribute is not, and it is the attribute that the
+			// marshaller emits. Neither check implies the other.
+			name: "R8/wrongDefaultNamespaceAttributeIsRejected",
+			xml: `<s3:CORSConfiguration xmlns:s3="` + s3CORSNamespace + `" xmlns="http://example.com/wrong">` +
+				`<s3:CORSRule><s3:AllowedMethod>GET</s3:AllowedMethod><s3:AllowedOrigin>*</s3:AllowedOrigin></s3:CORSRule>` +
+				`</s3:CORSConfiguration>`,
+			wantErrSubstring: `Unexpected xmlns attribute "http://example.com/wrong"`,
+		},
+		{
+			// A CORSRule in a foreign namespace is not a CORSRule. The document
+			// model would adopt it regardless, because it matches child elements
+			// by local name alone.
+			name:             "R8/foreignNamespaceOnCORSRuleIsRejected",
+			xml:              corsTestDoc(`<CORSRule xmlns="http://example.com/wrong">` + corsMinimalRuleBody + `</CORSRule>`),
+			wantErrSubstring: `unsupported element "{http://example.com/wrong}CORSRule"`,
+		},
+		{
+			name:      "R8/absentNamespaceIsAccepted",
+			xml:       `<CORSConfiguration>` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantRules: 1,
+		},
+		{
+			name:      "R8/emptyNamespaceAttributeIsAccepted",
+			xml:       `<CORSConfiguration xmlns="">` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantRules: 1,
+		},
+		{
+			// The S3 namespace bound to a prefix is the same namespace, so a
+			// document written that way is equally valid.
+			name: "R8/prefixedS3NamespaceIsAccepted",
+			xml: `<s3:CORSConfiguration xmlns:s3="` + s3CORSNamespace + `">` +
+				`<s3:CORSRule><s3:AllowedMethod>GET</s3:AllowedMethod><s3:AllowedOrigin>*</s3:AllowedOrigin></s3:CORSRule>` +
+				`</s3:CORSConfiguration>`,
+			wantRules: 1,
+		},
+
+		// R1 - ID and MaxAgeSeconds are single valued. They map to scalar fields
+		// of the document model, which silently keeps the last occurrence, so a
+		// repeated element can only be caught by validating the document itself.
+		{
+			name:             "R1/duplicateIDIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<ID>first</ID><ID>second</ID>` + corsMinimalRuleBody)),
+			wantErrSubstring: "CORSRule 0 contains 2 ID elements, at most one is allowed",
+		},
+		{
+			name: "R1/duplicateMaxAgeSecondsIsRejected",
+			xml: corsTestDoc(corsTestRule(corsMinimalRuleBody +
+				`<MaxAgeSeconds>3000</MaxAgeSeconds><MaxAgeSeconds>6000</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements, at most one is allowed",
+		},
+		{
+			name: "R1/duplicateIDInSecondRuleReportsItsOwnIndex",
+			xml: corsTestDoc(
+				corsTestRule(`<ID>only-one</ID>`+corsMinimalRuleBody),
+				corsTestRule(`<ID>first</ID><ID>second</ID>`+corsMinimalRuleBody),
+			),
+			wantErrSubstring: "CORSRule 1 contains 2 ID elements, at most one is allowed",
+		},
+		{
+			name:      "R1/singleIDIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<ID>only-one</ID>` + corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+
+		// R1/R2 - an element the document model does not know is discarded while
+		// decoding, so a client would be told a configuration was stored that
+		// the server never understood. Every unknown element is rejected, and so
+		// is a known element in an invalid position.
+		{
+			name:             "schema/unknownElementInCORSConfigurationIsRejected",
+			xml:              corsTestDoc(`<CORSPolicy/>`, corsTestRule(corsMinimalRuleBody)),
+			wantErrSubstring: `CORSConfiguration contains unsupported element "CORSPolicy"`,
+		},
+		{
+			name:             "schema/unknownElementInCORSRuleIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<AllowedCredentials>true</AllowedCredentials>`)),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "AllowedCredentials"`,
+		},
+		{
+			// The realistic failure this guards against: a plural spelling of a
+			// singular element name, silently dropped, leaving a rule that
+			// allows an origin the client never listed.
+			name:             "schema/misspelledAllowedOriginIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigins>*</AllowedOrigins>`)),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "AllowedOrigins"`,
+		},
+		{
+			name:             "schema/lowerCaseElementNameIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<allowedmethod>GET</allowedmethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "allowedmethod"`,
+		},
+		{
+			name:             "schema/nestedElementInsideAllowedMethodIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod><GET/></AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: `CORSRule 0 has AllowedMethod containing the nested element "GET"`,
+		},
+		{
+			name:             "schema/nestedCORSRuleIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + corsTestRule(corsMinimalRuleBody))),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "CORSRule"`,
+		},
+		{
+			name:             "schema/characterDataInsideCORSRuleIsRejected",
+			xml:              corsTestDoc(`<CORSRule>stray text` + corsMinimalRuleBody + `</CORSRule>`),
+			wantErrSubstring: "CORSRule 0 contains character data outside of a child element",
+		},
+		{
+			name:             "schema/characterDataInsideCORSConfigurationIsRejected",
+			xml:              `<CORSConfiguration>stray text` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: "CORSConfiguration contains character data outside of a CORSRule element",
+		},
+		{
+			name:             "schema/characterDataBeforeRootIsRejected",
+			xml:              `stray text` + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantErrSubstring: "character data before the CORSConfiguration element",
+		},
+		{
+			// A child element of a rule is only that child element when it
+			// belongs to the namespace of the document.
+			name: "schema/foreignNamespaceOnRuleChildIsRejected",
+			xml: corsTestDoc(corsTestRule(
+				`<AllowedMethod xmlns="http://example.com/wrong">GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: `CORSRule 0 contains unsupported element "{http://example.com/wrong}AllowedMethod"`,
+		},
+		{
+			// Whitespace between elements is insignificant, so the indented
+			// document every hand written and pretty-printed client sends must
+			// still be accepted.
+			name: "schema/indentedDocumentIsAccepted",
+			xml: "<CORSConfiguration xmlns=\"" + s3CORSNamespace + "\">\n" +
+				"\t<CORSRule>\n" +
+				"\t\t<AllowedMethod>GET</AllowedMethod>\n" +
+				"\t\t<AllowedOrigin>https://www.example1.com</AllowedOrigin>\n" +
+				"\t</CORSRule>\n" +
+				"</CORSConfiguration>\n",
+			wantRules: 1,
+		},
+		{
+			name: "schema/declarationAndCommentsAreAccepted",
+			xml: xml.Header + "<!-- written by hand -->" +
+				`<CORSConfiguration xmlns="` + s3CORSNamespace + `"><!-- first rule -->` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantRules: 1,
+		},
+
+		// R2 - the decoder stops at the end of the first root element and the
+		// document model never learns what followed it, so a trailing tail has
+		// to be rejected explicitly.
+		{
+			name:             "trailer/characterDataAfterRootIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + "trailing garbage",
+			wantErrSubstring: "character data after the CORSConfiguration element",
+		},
+		{
+			name: "trailer/secondRootElementIsRejected",
+			xml: corsTestDoc(corsTestRule(corsMinimalRuleBody)) +
+				corsTestDoc(corsTestRule(`<AllowedMethod>DELETE</AllowedMethod><AllowedOrigin>https://www.evil.example</AllowedOrigin>`)),
+			wantErrSubstring: `contains the element "CORSConfiguration" after the CORSConfiguration element`,
+		},
+		{
+			name:      "trailer/whitespaceAfterRootIsAccepted",
+			xml:       corsTestDoc(corsTestRule(corsMinimalRuleBody)) + "\n\t \n",
+			wantRules: 1,
+		},
+		{
+			name:      "trailer/commentAfterRootIsAccepted",
+			xml:       corsTestDoc(corsTestRule(corsMinimalRuleBody)) + "\n<!-- end of configuration -->\n",
+			wantRules: 1,
+		},
+
+		// ID and MaxAgeSeconds may each appear at most once per rule. The parsed
+		// model stores both in a scalar field, so a repeated element decodes
+		// without complaint and silently keeps only the value that appears last;
+		// these cases prove the document is rejected on the wire instead of being
+		// persisted as something the client did not send.
+		{
+			name:             "cardinality/duplicateIDIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<ID>first</ID><ID>second</ID>` + corsMinimalRuleBody)),
+			wantErrSubstring: "CORSRule 0 contains 2 ID elements, at most one is allowed",
+		},
+		{
+			name: "cardinality/duplicateIDInALaterRuleReportsItsOwnIndex",
+			xml: corsTestDoc(
+				corsTestRule(`<ID>only-once</ID>`+corsMinimalRuleBody),
+				corsTestRule(`<ID>a</ID><ID>b</ID><ID>c</ID>`+corsMinimalRuleBody),
+			),
+			wantErrSubstring: "CORSRule 1 contains 3 ID elements",
+		},
+		{
+			name:             "cardinality/duplicateMaxAgeSecondsIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>3000</MaxAgeSeconds><MaxAgeSeconds>6000</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements, at most one is allowed",
+		},
+		{
+			name: "cardinality/duplicateMaxAgeSecondsInALaterRuleReportsItsOwnIndex",
+			xml: corsTestDoc(
+				corsTestRule(corsMinimalRuleBody+`<MaxAgeSeconds>3000</MaxAgeSeconds>`),
+				corsTestRule(corsMinimalRuleBody+`<MaxAgeSeconds>10</MaxAgeSeconds><MaxAgeSeconds>20</MaxAgeSeconds>`),
+			),
+			wantErrSubstring: "CORSRule 1 contains 2 MaxAgeSeconds elements",
+		},
+		{
+			name:      "cardinality/singleIDAndMaxAgeSecondsAreAccepted",
+			xml:       corsTestDoc(corsTestRule(`<ID>only-once</ID>` + corsMinimalRuleBody + `<MaxAgeSeconds>3000</MaxAgeSeconds>`)),
+			wantRules: 1,
+		},
+		{
+			name: "cardinality/oneIDAndMaxAgeSecondsPerRuleAcrossRulesIsAccepted",
+			xml: corsTestDoc(
+				corsTestRule(`<ID>rule-zero</ID>`+corsMinimalRuleBody+`<MaxAgeSeconds>100</MaxAgeSeconds>`),
+				corsTestRule(`<ID>rule-one</ID>`+corsMinimalRuleBody+`<MaxAgeSeconds>200</MaxAgeSeconds>`),
+			),
+			wantRules: 2,
+		},
+		{
+			name: "cardinality/repeatedMultiValuedElementsAreAccepted",
+			xml: corsTestDoc(corsTestRule(
+				`<ID>repeats-what-it-may</ID>`,
+				`<AllowedHeader>x-a</AllowedHeader><AllowedHeader>x-b</AllowedHeader>`,
+				`<AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod>`,
+				`<AllowedOrigin>https://www.example1.com</AllowedOrigin><AllowedOrigin>https://www.example2.com</AllowedOrigin>`,
+				`<ExposeHeader>ETag</ExposeHeader><ExposeHeader>x-amz-request-id</ExposeHeader>`,
+			)),
+			wantRules: 1,
+		},
+		{
+			// The element count is scoped to the rules of the single document the
+			// parser decodes, so a second root element is never counted into
+			// them. It is refused by the trailing content check instead, which is
+			// the only reading under which the count and the parser agree.
+			name: "cardinality/elementsAfterTheRootElementAreRejectedRatherThanCounted",
+			xml: corsTestDoc(corsTestRule(`<ID>only-once</ID>`+corsMinimalRuleBody)) +
+				corsTestDoc(corsTestRule(`<ID>a</ID><ID>b</ID>`+corsMinimalRuleBody)),
+			wantErrSubstring: `contains the element "CORSConfiguration" after the CORSConfiguration element`,
+		},
+
+		// ID is optional and appears at most once per rule. A repeated element
+		// must be rejected rather than silently collapsed onto the single scalar
+		// field of the configuration model.
+		{
+			name:             "ID/duplicateIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<ID>first</ID><ID>second</ID>` + corsMinimalRuleBody)),
+			wantErrSubstring: "CORSRule 0 contains 2 ID elements",
+		},
+		{
+			name:             "ID/threeOccurrencesAreRejected",
+			xml:              corsTestDoc(corsTestRule(`<ID>first</ID><ID>second</ID><ID>third</ID>` + corsMinimalRuleBody)),
+			wantErrSubstring: "CORSRule 0 contains 3 ID elements",
+		},
+		{
+			name: "ID/duplicateInTheSecondRuleReportsItsOwnIndex",
+			xml: corsTestDoc(
+				corsTestRule(`<ID>only</ID>`+corsMinimalRuleBody),
+				corsTestRule(`<ID>first</ID>`+corsMinimalRuleBody+`<ID>second</ID>`),
+			),
+			wantErrSubstring: "CORSRule 1 contains 2 ID elements",
+		},
+		{
+			name:      "ID/singleOccurrenceIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<ID>only-one</ID>` + corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+		{
+			name:      "ID/omittedIsAccepted",
+			xml:       corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+
+		// MaxAgeSeconds appears at most once per rule and must be a
+		// non-negative integer when present.
+		{
+			name:             "maxAgeSeconds/duplicateIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>10</MaxAgeSeconds><MaxAgeSeconds>20</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements",
+		},
+		{
+			// The check counts elements instead of comparing their values, so
+			// two identical occurrences are a duplicate just the same.
+			name:             "maxAgeSeconds/duplicateWithIdenticalValuesIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>0</MaxAgeSeconds><MaxAgeSeconds>0</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements",
+		},
+		{
+			// Cardinality is validated before the value is converted to an
+			// integer, so the duplicate is reported rather than the fact that
+			// the second occurrence is not a number.
+			name:             "maxAgeSeconds/duplicateIsRejectedBeforeScalarConversion",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>10</MaxAgeSeconds><MaxAgeSeconds>not-a-number</MaxAgeSeconds>`)),
+			wantErrSubstring: "CORSRule 0 contains 2 MaxAgeSeconds elements",
+		},
+		{
+			name: "maxAgeSeconds/duplicateInTheSecondRuleReportsItsOwnIndex",
+			xml: corsTestDoc(
+				corsTestRule(corsMinimalRuleBody+`<MaxAgeSeconds>10</MaxAgeSeconds>`),
+				corsTestRule(corsMinimalRuleBody+`<MaxAgeSeconds>20</MaxAgeSeconds><MaxAgeSeconds>30</MaxAgeSeconds>`),
+			),
+			wantErrSubstring: "CORSRule 1 contains 2 MaxAgeSeconds elements",
+		},
 		{
 			name:             "maxAgeSeconds/negativeIsRejected",
 			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<MaxAgeSeconds>-1</MaxAgeSeconds>`)),
@@ -286,8 +731,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// A fully populated rule, and the canonical multi-rule document, must
-		// both be accepted.
 		{
 			name: "accepted/fullyPopulatedRule",
 			xml: corsTestDoc(corsTestRule(
@@ -307,9 +750,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 		},
 	}
 
-	// A rule naming any single method S3 accepts must validate. The matrix is
-	// generated from allSupportedCORSMethods so that all five cases share one
-	// document shape and differ only in the configured method.
 	for _, method := range allSupportedCORSMethods {
 		testCases = append(testCases, validateCase{
 			name:      "V5/supportedAllowedMethod" + method,
@@ -320,10 +760,10 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// PutBucketCorsHandler bounds the request body by
-			// maxBucketCORSConfigSize before handing it to the validator;
-			// mirroring that here keeps the size cases honest.
-			cfg, err := validateBucketCorsConfig(io.LimitReader(strings.NewReader(tc.xml), maxBucketCORSConfigSize))
+			// PutBucketCorsHandler hands the request body straight to the
+			// validator, which owns the size ceiling; feeding an unbounded
+			// reader here keeps the size cases honest.
+			cfg, err := validateBucketCorsConfig(strings.NewReader(tc.xml))
 
 			if tc.wantErrSubstring == "" {
 				if err != nil {
@@ -335,8 +775,6 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 				if len(cfg.CORSRules) != tc.wantRules {
 					t.Fatalf("expected %d rules, got %d", tc.wantRules, len(cfg.CORSRules))
 				}
-				// Requirement R8: the accepted configuration always carries the
-				// S3 namespace, whether or not the client sent one.
 				if cfg.XMLNS != s3CORSNamespace {
 					t.Fatalf("expected namespace %q, got %q", s3CORSNamespace, cfg.XMLNS)
 				}
@@ -355,22 +793,144 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			}
 		})
 	}
+
+	// A caller that bounds the body itself must not be able to turn an
+	// oversized document into an accepted one: truncating at the ceiling can
+	// close the root element early, so the shortened document has to fail the
+	// strict structural check instead of being persisted with its trailing
+	// rules silently dropped.
+	t.Run("callerSideLimitReaderStillRejectsAnOversizedDocument", func(t *testing.T) {
+		oversized := corsTestDoc(strings.Repeat(corsTestRule(corsMinimalRuleBody), maxBucketCORSRules))
+		for len(oversized) <= maxBucketCORSConfigSize {
+			oversized += corsTestRule(corsMinimalRuleBody)
+		}
+		bounded := io.LimitReader(strings.NewReader(oversized), maxBucketCORSConfigSize)
+		if cfg, err := validateBucketCorsConfig(bounded); err == nil {
+			t.Fatalf("expected a truncated oversized document to be rejected, got a configuration with %d rules",
+				len(cfg.CORSRules))
+		}
+	})
+
+	// An io.Reader failure must surface as an error rather than as an empty,
+	// and therefore invalid, document being blamed on the client's XML.
+	t.Run("readErrorIsReported", func(t *testing.T) {
+		wantErr := errors.New("connection reset by peer")
+		cfg, err := validateBucketCorsConfig(iotest.ErrReader(wantErr))
+		if err == nil {
+			t.Fatalf("expected the read error to be reported, got a configuration with %d rules", len(cfg.CORSRules))
+		}
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected the read error to be wrapped, got %q", err)
+		}
+	})
 }
 
-// TestValidateBucketCorsConfigCanonicalDocument pins the wire contract of
-// requirement R8 against the canonical, AWS shaped document: the parsed model,
-// the normalization the parser performs, the namespace, and the fact that
-// re-marshaling reproduces the input byte for byte. A client written against
-// AWS - the SDK, "aws s3api ... cors" or "mc" - can only interoperate if all
-// four hold.
+// corsCountingReader is an io.Reader that records how many bytes were consumed
+// from it, so a test can prove the validator stops reading rather than merely
+// prove that it rejects an oversized document.
+type corsCountingReader struct {
+	remaining int
+	read      int
+}
+
+func (r *corsCountingReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := range p[:n] {
+		p[i] = ' '
+	}
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+
+// TestValidateBucketCorsConfigBoundedRead proves the request body is bounded
+// rather than merely validated: the validator must consume at most one byte more
+// than maxBucketCORSConfigSize before rejecting an oversized document, because
+// reading an unbounded PUT body into memory is a denial-of-service vector.
+//
+// The extra byte is what makes the ceiling exact - it is the byte whose presence
+// proves the body is too long instead of merely as long as the limit allows.
+func TestValidateBucketCorsConfigBoundedRead(t *testing.T) {
+	body := &corsCountingReader{remaining: 64 * maxBucketCORSConfigSize}
+
+	cfg, err := validateBucketCorsConfig(body)
+	if err == nil {
+		t.Fatalf("expected an oversized body to be rejected, got a configuration with %d rules", len(cfg.CORSRules))
+	}
+	if cfg != nil {
+		t.Fatal("expected a nil configuration on failure")
+	}
+	want := fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected the error to mention %q, got %q", want, err)
+	}
+	if body.read != maxBucketCORSConfigSize+1 {
+		t.Fatalf("expected the validator to read exactly %d bytes, got %d",
+			maxBucketCORSConfigSize+1, body.read)
+	}
+}
+
+// TestValidateBucketCorsConfigReadFailure covers the body that cannot be read at
+// all, which is what a client disconnecting mid-upload looks like from here. The
+// failure must be reported as a rejection naming the document rather than
+// swallowed into an empty configuration.
+func TestValidateBucketCorsConfigReadFailure(t *testing.T) {
+	readErr := errors.New("connection reset by peer")
+
+	cfg, err := validateBucketCorsConfig(iotest.ErrReader(readErr))
+	if err == nil {
+		t.Fatalf("expected an unreadable body to be rejected, got a configuration with %d rules", len(cfg.CORSRules))
+	}
+	if cfg != nil {
+		t.Fatal("expected a nil configuration on failure")
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("expected the read failure to be wrapped, got %q", err)
+	}
+	if !strings.Contains(err.Error(), "Unable to read the CORSConfiguration document") {
+		t.Fatalf("expected the error to name the document it could not read, got %q", err)
+	}
+}
+
+// TestValidateBucketCorsConfigReadError proves that a request body which fails
+// part way through is reported as a read failure, instead of being validated as
+// though the client had sent a complete document.
+//
+// The validator reads the body into memory so that the schema walk can examine
+// exactly the bytes the parser decoded, which makes the read itself a failure
+// path the client has to be told about.
+func TestValidateBucketCorsConfigReadError(t *testing.T) {
+	wantErr := errors.New("connection reset by peer")
+	document := corsTestDoc(corsTestRule(corsMinimalRuleBody))
+	body := io.MultiReader(strings.NewReader(document[:len(document)/2]), iotest.ErrReader(wantErr))
+
+	cfg, err := validateBucketCorsConfig(body)
+	if err == nil {
+		t.Fatalf("expected the read failure to be reported, got a configuration with %d rules", len(cfg.CORSRules))
+	}
+	if cfg != nil {
+		t.Fatal("expected a nil configuration on failure")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the error to wrap %v, got %v", wantErr, err)
+	}
+}
+
+// TestValidateBucketCorsConfigCanonicalDocument verifies the pinned minio-go
+// fixture preserves rule values, method normalization, the S3 namespace, and
+// byte-identical re-marshaling.
 func TestValidateBucketCorsConfigCanonicalDocument(t *testing.T) {
-	cfg, err := validateBucketCorsConfig(io.LimitReader(strings.NewReader(corsCanonicalDocument), maxBucketCORSConfigSize))
+	cfg, err := validateBucketCorsConfig(strings.NewReader(corsCanonicalDocument))
 	if err != nil {
 		t.Fatalf("the canonical document must be accepted, got error: %v", err)
 	}
 
-	// The expected model, in document order. Element names and casing are those
-	// AWS uses; the parser maps them through the vendored struct tags.
 	wantRules := []miniogocors.Rule{
 		{
 			AllowedHeader: []string{"*"},
@@ -414,8 +974,6 @@ func TestValidateBucketCorsConfigCanonicalDocument(t *testing.T) {
 			}
 		}
 
-		// The parser normalizes methods in place, so a document written with
-		// mixed casing is stored - and later matched - as upper case.
 		mixedCase := corsTestDoc(corsTestRule(
 			`<AllowedMethod>get</AllowedMethod><AllowedMethod>Put</AllowedMethod><AllowedMethod>hEaD</AllowedMethod>`,
 			`<AllowedOrigin>*</AllowedOrigin>`,
@@ -509,6 +1067,143 @@ func TestCorsConfigLimits(t *testing.T) {
 		t.Errorf("expected the body ceiling to be at least the AWS document limit of %d bytes, got %d",
 			awsMaxCORSDocumentSize, maxBucketCORSConfigSize)
 	}
+	// Requirement R8: the namespace the validator enforces is the one every S3
+	// client sends and expects back, so it is pinned against a literal rather
+	// than against itself.
+	if corsConfigXMLNS != s3CORSNamespace {
+		t.Errorf("expected the enforced namespace to be %q, got %q", s3CORSNamespace, corsConfigXMLNS)
+	}
+	if corsConfigurationElement != "CORSConfiguration" {
+		t.Errorf("expected the root element to be %q, got %q", "CORSConfiguration", corsConfigurationElement)
+	}
+	if corsRuleElement != "CORSRule" {
+		t.Errorf("expected the rule element to be %q, got %q", "CORSRule", corsRuleElement)
+	}
+	// The child elements of a CORSRule are exactly those AWS defines, and only
+	// ID and MaxAgeSeconds are single valued.
+	wantRuleElements := map[string]bool{
+		"AllowedHeader": false,
+		"AllowedMethod": false,
+		"AllowedOrigin": false,
+		"ExposeHeader":  false,
+		"ID":            true,
+		"MaxAgeSeconds": true,
+	}
+	if !reflect.DeepEqual(corsRuleElements, wantRuleElements) {
+		t.Errorf("expected the CORSRule child elements %v, got %v", wantRuleElements, corsRuleElements)
+	}
+	// A browser lists only the headers the request it is about to make
+	// actually carries. The ceiling has to stay comfortably above that while
+	// remaining a bound.
+	if maxCORSPreflightRequestHeaders < 16 {
+		t.Errorf("expected the requested-header ceiling to leave room for a real client, got %d",
+			maxCORSPreflightRequestHeaders)
+	}
+}
+
+// TestCorsWildcardMatch pins the pattern language S3 defines for AllowedOrigin
+// and AllowedHeader: literal text plus at most one "*". Two properties matter as
+// much as the matches themselves. A "?" must be literal, because honoring it
+// would grant an origin the bucket owner never configured, and the match must be
+// non-recursive, because a preflight reaches this code before any authentication.
+func TestCorsWildcardMatch(t *testing.T) {
+	testCases := []struct {
+		pattern string
+		name    string
+		want    bool
+	}{
+		// No wildcard: the pattern matches only itself.
+		{pattern: "https://www.example1.com", name: "https://www.example1.com", want: true},
+		{pattern: "https://www.example1.com", name: "https://www.example2.com", want: false},
+		{pattern: "https://www.example1.com", name: "https://www.example1.com.evil.net", want: false},
+		{pattern: "https://www.example1.com", name: "", want: false},
+		{pattern: "", name: "", want: true},
+		{pattern: "", name: "x", want: false},
+
+		// The bare wildcard covers everything.
+		{pattern: "*", name: "https://www.example1.com", want: true},
+		{pattern: "*", name: "", want: true},
+
+		// A trailing wildcard is a prefix match.
+		{pattern: "http://www.example2.*", name: "http://www.example2.com", want: true},
+		{pattern: "http://www.example2.*", name: "http://www.example2.", want: true},
+		{pattern: "http://www.example2.*", name: "http://www.example3.com", want: false},
+		{pattern: "http://www.example2.*", name: "http://www.example2", want: false},
+
+		// A leading wildcard is a suffix match.
+		{pattern: "*.example.com", name: "https://a.example.com", want: true},
+		{pattern: "*.example.com", name: "https://a.example.com.evil.net", want: false},
+
+		// An embedded wildcard must match both sides, and the prefix and the
+		// suffix may not overlap on the same characters.
+		{pattern: "https://*.example.com", name: "https://a.example.com", want: true},
+		{pattern: "https://*.example.com", name: "http://a.example.com", want: false},
+		{pattern: "ab*cd", name: "abcd", want: true},
+		{pattern: "ab*cd", name: "abXcd", want: true},
+		{pattern: "ab*cd", name: "abc", want: false},
+		{pattern: "a*a", name: "a", want: false},
+		{pattern: "a*a", name: "aa", want: true},
+
+		// "?" carries no special meaning: it matches only itself.
+		{pattern: "https://www.example?.com", name: "https://www.example1.com", want: false},
+		{pattern: "https://www.example?.com", name: "https://www.example?.com", want: true},
+		{pattern: "https://www.example1.com?", name: "https://www.example1.com", want: false},
+		{pattern: "http://ex?mple.*", name: "http://example.com", want: false},
+		{pattern: "http://ex?mple.*", name: "http://ex?mple.com", want: true},
+
+		// A pattern with more than one wildcard cannot be persisted, and if one
+		// arrives anyway every wildcard after the first is literal - which can
+		// only ever narrow the match, never widen it.
+		{pattern: "http://*.example.*", name: "http://a.example.com", want: false},
+		{pattern: "http://*.example.*", name: "http://a.example.*", want: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%q~%q", tc.pattern, tc.name), func(t *testing.T) {
+			if got := corsWildcardMatch(tc.pattern, tc.name); got != tc.want {
+				t.Fatalf("corsWildcardMatch(%q, %q) = %v, expected %v", tc.pattern, tc.name, got, tc.want)
+			}
+		})
+	}
+
+	// A "*" followed by a suffix is the shape a recursive matcher backtracks
+	// on. A long, adversarial name must therefore still be answered by two
+	// bounded comparisons rather than by nested recursion.
+	t.Run("longAdversarialNameIsAnsweredWithoutRecursion", func(t *testing.T) {
+		const pattern = "http://*.example.com"
+		name := "http://" + strings.Repeat("a.", 100000) + "example.com"
+		if !corsWildcardMatch(pattern, name) {
+			t.Fatalf("expected %q to match the suffix wildcard pattern %q", truncateForError(name), pattern)
+		}
+		if corsWildcardMatch(pattern, name+"x") {
+			t.Fatalf("expected %q not to match the suffix wildcard pattern %q", truncateForError(name+"x"), pattern)
+		}
+	})
+}
+
+// TestGetBucketCORSURL pins the request target the test harness builds for the
+// three CORS operations. The sub-resource has to be the exact lowercase "cors"
+// query key with an empty value: that is what every S3 client sends, what the
+// router's Queries("cors", "") matcher selects on, and the sub-resource name the
+// V2 signature calculation already authorizes. The bucket the preflight
+// evaluator resolves from that target must be the same one.
+func TestGetBucketCORSURL(t *testing.T) {
+	const (
+		endPoint   = "http://127.0.0.1:9000"
+		bucketName = "blitzy-cors-bucket"
+	)
+
+	got := getBucketCORSURL(endPoint, bucketName)
+	want := endPoint + SlashSeparator + bucketName + SlashSeparator + "?cors="
+	if got != want {
+		t.Fatalf("expected the CORS sub-resource URL %q, got %q", want, got)
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, got, nil)
+	if bucket, object := request2BucketObjectName(req); bucket != bucketName || object != "" {
+		t.Fatalf("expected the request to resolve to bucket %q with no object, got bucket %q and object %q",
+			bucketName, bucket, object)
+	}
 }
 
 // truncateForError shortens a document for inclusion in a failure message, so a
@@ -540,8 +1235,6 @@ func TestCorsRuleFor(t *testing.T) {
 		wantRuleID string
 	}
 
-	// Two rules that both allow the same origin and method, differing only in
-	// the response they would produce. Only their order decides the answer.
 	firstRule := miniogocors.Rule{
 		ID:            "first",
 		AllowedMethod: []string{http.MethodPut},
@@ -557,7 +1250,6 @@ func TestCorsRuleFor(t *testing.T) {
 		MaxAgeSeconds: 200,
 	}
 
-	// A rule that allows every method S3 accepts, used by the method matrix.
 	allMethodsRule := miniogocors.Rule{
 		ID:            "all-methods",
 		AllowedMethod: slices.Clone(allSupportedCORSMethods),
@@ -565,7 +1257,6 @@ func TestCorsRuleFor(t *testing.T) {
 	}
 
 	testCases := []matchCase{
-		// First matching rule wins, in document order - requirement R5.
 		{
 			name:       "firstMatchWins/firstRuleInDocumentOrderIsSelected",
 			cfg:        corsTestConfig(firstRule, secondRule),
@@ -629,7 +1320,6 @@ func TestCorsRuleFor(t *testing.T) {
 			wantRuleID: "wildcard-headers",
 		},
 
-		// Origin predicate.
 		{
 			name: "origin/exactMatch",
 			cfg: corsTestConfig(miniogocors.Rule{
@@ -704,8 +1394,40 @@ func TestCorsRuleFor(t *testing.T) {
 			origin: "http://www.example3.com",
 			method: http.MethodGet,
 		},
+		{
+			// "?" is not a wildcard in the S3 pattern language. Treating it as
+			// one would allow an origin the bucket owner never configured.
+			name: "origin/questionMarkInAllowedOriginIsLiteral",
+			cfg: corsTestConfig(miniogocors.Rule{
+				ID:            "question-mark-origin",
+				AllowedMethod: []string{http.MethodGet},
+				AllowedOrigin: []string{"https://www.example?.com"},
+			}),
+			origin: "https://www.example1.com",
+			method: http.MethodGet,
+		},
+		{
+			name: "origin/questionMarkInAllowedOriginMatchesItself",
+			cfg: corsTestConfig(miniogocors.Rule{
+				ID:            "question-mark-origin",
+				AllowedMethod: []string{http.MethodGet},
+				AllowedOrigin: []string{"https://www.example?.com"},
+			}),
+			origin:     "https://www.example?.com",
+			method:     http.MethodGet,
+			wantRuleID: "question-mark-origin",
+		},
+		{
+			name: "origin/wildcardDoesNotSpanAnOverlappingPrefixAndSuffix",
+			cfg: corsTestConfig(miniogocors.Rule{
+				ID:            "embedded-origin",
+				AllowedMethod: []string{http.MethodGet},
+				AllowedOrigin: []string{"https://*.example.com"},
+			}),
+			origin: "https://example.com",
+			method: http.MethodGet,
+		},
 
-		// Method predicate.
 		{
 			name: "method/mismatchDeniesTheRequest",
 			cfg: corsTestConfig(miniogocors.Rule{
@@ -739,7 +1461,6 @@ func TestCorsRuleFor(t *testing.T) {
 			wantRuleID: "read-only",
 		},
 
-		// Header predicate.
 		{
 			name: "headers/everyRequestedHeaderCovered",
 			cfg: corsTestConfig(miniogocors.Rule{
@@ -818,6 +1539,33 @@ func TestCorsRuleFor(t *testing.T) {
 			reqHeaders: []string{"content-type"},
 		},
 		{
+			// "?" is literal for AllowedHeader too, so a rule naming it does
+			// not cover a header that merely differs in that one position.
+			name: "headers/questionMarkInAllowedHeaderIsLiteral",
+			cfg: corsTestConfig(miniogocors.Rule{
+				ID:            "question-mark-headers",
+				AllowedHeader: []string{"x-am?-acl"},
+				AllowedMethod: []string{http.MethodPut},
+				AllowedOrigin: []string{"https://www.example1.com"},
+			}),
+			origin:     "https://www.example1.com",
+			method:     http.MethodPut,
+			reqHeaders: []string{"x-amz-acl"},
+		},
+		{
+			name: "headers/questionMarkInAllowedHeaderMatchesItselfCaseInsensitively",
+			cfg: corsTestConfig(miniogocors.Rule{
+				ID:            "question-mark-headers",
+				AllowedHeader: []string{"x-am?-acl"},
+				AllowedMethod: []string{http.MethodPut},
+				AllowedOrigin: []string{"https://www.example1.com"},
+			}),
+			origin:     "https://www.example1.com",
+			method:     http.MethodPut,
+			reqHeaders: []string{"X-Am?-Acl"},
+			wantRuleID: "question-mark-headers",
+		},
+		{
 			name: "headers/partialCoverageDeniesTheRequest",
 			cfg: corsTestConfig(miniogocors.Rule{
 				ID:            "one-header",
@@ -891,7 +1639,6 @@ func TestCorsRuleFor(t *testing.T) {
 			reqHeaders: []string{"x-a", "x-b"},
 		},
 
-		// Degenerate configurations.
 		{
 			name:   "config/nilConfigurationMatchesNothing",
 			cfg:    nil,
@@ -912,9 +1659,6 @@ func TestCorsRuleFor(t *testing.T) {
 		},
 	}
 
-	// A rule allowing every supported method must match a preflight for each of
-	// them. The matrix is generated so that all five cases share one rule and
-	// differ only in the requested method.
 	for _, method := range allSupportedCORSMethods {
 		testCases = append(testCases, matchCase{
 			name:       "method/allows" + method,
@@ -966,9 +1710,7 @@ func TestCorsRuleFor(t *testing.T) {
 // of every value rather than just the first one.
 func TestCorsRequestHeadersUnion(t *testing.T) {
 	testCases := []struct {
-		name string
-		// values are the raw Access-Control-Request-Headers field values, in the
-		// order a client or gateway would present them.
+		name   string
 		values []string
 		want   []string
 	}{
@@ -1017,6 +1759,23 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 			values: []string{"X-Amz-Meta-Foo, Content-Type"},
 			want:   []string{"X-Amz-Meta-Foo", "Content-Type"},
 		},
+		{
+			name:   "duplicateNamesAreCollapsed",
+			values: []string{"x-a, x-a, x-b, x-a"},
+			want:   []string{"x-a", "x-b"},
+		},
+		{
+			// Header names are case-insensitive, so these are one header. The
+			// first casing seen is the one the response echoes back.
+			name:   "duplicateNamesDifferingOnlyInCaseAreCollapsed",
+			values: []string{"X-Amz-Meta-Foo, x-amz-meta-foo, X-AMZ-META-FOO"},
+			want:   []string{"X-Amz-Meta-Foo"},
+		},
+		{
+			name:   "duplicatesAcrossRepeatedFieldsAreCollapsed",
+			values: []string{"x-a, x-b", "X-A", "x-c ,x-b"},
+			want:   []string{"x-a", "x-b", "x-c"},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1026,7 +1785,10 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 				header.Add("Access-Control-Request-Headers", value)
 			}
 
-			got := parseCORSRequestHeaders(header)
+			got, ok := parseCORSRequestHeaders(header)
+			if !ok {
+				t.Fatalf("expected %v to be evaluable, got a refusal", tc.values)
+			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("expected %d requested headers %v, got %d %v", len(tc.want), tc.want, len(got), got)
 			}
@@ -1038,13 +1800,58 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 		})
 	}
 
+	// The ceiling is what stops an unauthenticated preflight from choosing how
+	// much matching work the server performs. Exactly the ceiling must still be
+	// evaluable, one header over it must not, and duplicates must not count
+	// towards it.
+	t.Run("requestedHeaderCeiling", func(t *testing.T) {
+		requestHeaders := func(count int) http.Header {
+			names := make([]string, 0, count)
+			for i := range count {
+				names = append(names, fmt.Sprintf("x-blitzy-%d", i))
+			}
+			header := http.Header{}
+			header.Set("Access-Control-Request-Headers", strings.Join(names, ","))
+			return header
+		}
+
+		got, ok := parseCORSRequestHeaders(requestHeaders(maxCORSPreflightRequestHeaders))
+		if !ok {
+			t.Fatalf("expected exactly %d requested headers to be evaluable", maxCORSPreflightRequestHeaders)
+		}
+		if len(got) != maxCORSPreflightRequestHeaders {
+			t.Fatalf("expected %d requested headers, got %d", maxCORSPreflightRequestHeaders, len(got))
+		}
+
+		if got, ok := parseCORSRequestHeaders(requestHeaders(maxCORSPreflightRequestHeaders + 1)); ok {
+			t.Fatalf("expected %d requested headers to be refused, got %d headers",
+				maxCORSPreflightRequestHeaders+1, len(got))
+		} else if got != nil {
+			t.Fatalf("expected no requested headers alongside a refusal, got %d", len(got))
+		}
+
+		// A single name repeated well past the ceiling collapses to one header
+		// and stays evaluable.
+		header := http.Header{}
+		header.Set("Access-Control-Request-Headers",
+			strings.TrimSuffix(strings.Repeat("X-A,x-a,", maxCORSPreflightRequestHeaders), ","))
+		got, ok = parseCORSRequestHeaders(header)
+		if !ok {
+			t.Fatal("expected a repeated header name to stay evaluable")
+		}
+		if len(got) != 1 || got[0] != "X-A" {
+			t.Fatalf("expected the repeated name to collapse to [X-A], got %v", got)
+		}
+	})
+
 	t.Run("unionIsEvaluatedAsAWholeByTheMatcher", func(t *testing.T) {
-		// The union is what the matcher must satisfy in full: a rule covering
-		// every member matches, and one covering only some of them does not.
 		header := http.Header{}
 		header.Add("Access-Control-Request-Headers", "x-a, x-b")
 		header.Add("Access-Control-Request-Headers", "x-c")
-		reqHeaders := parseCORSRequestHeaders(header)
+		reqHeaders, ok := parseCORSRequestHeaders(header)
+		if !ok {
+			t.Fatal("expected three requested headers to be evaluable")
+		}
 
 		const origin = "https://www.example1.com"
 
@@ -1070,23 +1877,16 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 	})
 }
 
-// TestBucketCorsPreflightMiddlewareDelegation covers the gate the middleware
-// applies before it consults any global state: a request that is not an OPTIONS
-// request, a preflight without Access-Control-Request-Method and a preflight
-// without an Origin to echo back are all delegated to the wrapped handler
-// untouched.
+// TestBucketCorsPreflightMiddlewareDelegation verifies non-OPTIONS,
+// incomplete-preflight and root-path requests reach the wrapped global CORS
+// handler without added CORS headers.
 //
 // That gate is what keeps the server wide MINIO_API_CORS_ALLOW_ORIGIN handler in
 // force, and it is the structural reason the existing TestCors regression guard -
 // which sends OPTIONS with only an Origin header - is unaffected by this feature.
-// The per-bucket paths beyond the gate need globalBucketMetadataSys and are
-// covered end to end by the server suite instead, so this test stays hermetic.
 func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 	const delegatedBody = "delegated"
 
-	// corsAllowHeaders are the headers a matched rule would produce. None of
-	// them may appear on a delegated response, otherwise the middleware would be
-	// answering requests it is supposed to pass through.
 	corsAllowHeaders := []string{
 		"Access-Control-Allow-Origin",
 		"Access-Control-Allow-Methods",
@@ -1145,6 +1945,25 @@ func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 			method: http.MethodOptions,
 			target: "/blitzy-cors-bucket",
 		},
+		{
+			name:   "rootPathPreflightIsDelegated",
+			method: http.MethodOptions,
+			target: "/",
+			headers: map[string]string{
+				"Origin":                        "https://www.example1.com",
+				"Access-Control-Request-Method": http.MethodPut,
+			},
+		},
+		{
+			name:   "rootPathPreflightWithRequestedHeadersIsDelegated",
+			method: http.MethodOptions,
+			target: "/",
+			headers: map[string]string{
+				"Origin":                         "https://www.example1.com",
+				"Access-Control-Request-Method":  http.MethodPut,
+				"Access-Control-Request-Headers": "x-amz-meta-foo, content-type",
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1185,4 +2004,825 @@ func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// corsPreflightAllowHeaders are the response headers a matched rule produces.
+// Not one of them may appear on a delegated or denied response: their absence is
+// exactly how a browser learns that a preflight was refused.
+var corsPreflightAllowHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Methods",
+	"Access-Control-Allow-Headers",
+	"Access-Control-Max-Age",
+	"Access-Control-Expose-Headers",
+}
+
+// installTestBucketMetadataSys replaces the global bucket metadata system with a
+// fresh, empty one for the duration of the test, restoring the previous value
+// afterwards. loaded reports whether the replacement presents itself as having
+// finished loading, which is what tells the preflight evaluator that a bucket
+// absent from the cache is a bucket without a configuration rather than an
+// answer that is not known yet.
+func installTestBucketMetadataSys(t *testing.T, loaded bool) *BucketMetadataSys {
+	t.Helper()
+
+	saved := globalBucketMetadataSys
+	t.Cleanup(func() { globalBucketMetadataSys = saved })
+
+	sys := NewBucketMetadataSys()
+	if loaded {
+		sys.Lock()
+		sys.initialized = true
+		sys.Unlock()
+	}
+	globalBucketMetadataSys = sys
+	return sys
+}
+
+// setTestBucketCORSConfig makes bucket known to sys carrying cfg as its parsed
+// CORS configuration. A nil cfg leaves the bucket present but without one.
+func setTestBucketCORSConfig(sys *BucketMetadataSys, bucket string, cfg *miniogocors.Config) {
+	meta := newBucketMetadata(bucket)
+	meta.corsConfig = cfg
+	sys.Set(bucket, meta)
+}
+
+// TestGetCORSConfigCachedIsCacheOnly pins the property the preflight evaluator
+// depends on. A preflight request carries no credentials and names its bucket in
+// a path the client chooses freely, so the lookup it performs must never read
+// from the backend and must never add an entry to the bucket metadata map -
+// otherwise a stream of made-up names turns into backend reads and into
+// permanent, unbounded memory growth.
+//
+// The two absence answers must also stay distinguishable: a bucket missing from
+// a loaded cache definitively has no configuration, while a bucket missing from
+// a cache that is still loading is simply not known yet, and only the former may
+// be treated as an absence.
+func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
+	const (
+		knownBucket   = "blitzy-cors-known"
+		unknownBucket = "blitzy-cors-unknown"
+	)
+	cfg := corsTestConfig(miniogocors.Rule{
+		ID:            "only",
+		AllowedMethod: []string{http.MethodPut},
+		AllowedOrigin: []string{"https://www.example1.com"},
+	})
+
+	t.Run("unknownBucketWhileTheCacheIsStillLoading", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, false)
+
+		got, _, err := sys.GetCORSConfigCached(unknownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if !errors.Is(err, errBucketMetadataNotInitialized) {
+			t.Fatalf("expected %v, got %v", errBucketMetadataNotInitialized, err)
+		}
+		// An unknown state must not be reported as the concrete absence, which
+		// is the only error the preflight evaluator is allowed to fall back on.
+		if isBucketCORSConfigNotFound(err) {
+			t.Fatal("expected an unloaded cache not to report a definitive absence")
+		}
+		if sys.Count() != 0 {
+			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
+		}
+	})
+
+	t.Run("unknownBucketOnALoadedCache", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+
+		got, _, err := sys.GetCORSConfigCached(unknownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if !isBucketCORSConfigNotFound(err) {
+			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
+		}
+		if sys.Count() != 0 {
+			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
+		}
+	})
+
+	t.Run("manyUnknownBucketsNeverGrowTheMetadataMap", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+
+		for i := range 512 {
+			if _, _, err := sys.GetCORSConfigCached(fmt.Sprintf("blitzy-cors-probe-%d", i)); err == nil {
+				t.Fatalf("expected an unknown bucket to have no configuration, got one for probe %d", i)
+			}
+		}
+		if sys.Count() != 0 {
+			t.Fatalf("expected 512 unknown lookups to add no metadata entries, got %d", sys.Count())
+		}
+	})
+
+	t.Run("theTwoAbsenceSignalsStayDistinguishable", func(t *testing.T) {
+		// The whole preflight decision rests on telling these two apart, so the
+		// property is pinned on the decision function itself: a definitive
+		// absence must be recognized as one, and a bucket missing from a cache
+		// that is still loading must not be, or a configuration that is merely
+		// unavailable would fall back to the permissive server wide default.
+		//
+		// The loading accessor is deliberately not exercised here. It reaches for
+		// the process wide object layer, so whether it reports that the server is
+		// uninitialized or goes on to consult a backend depends on what an
+		// earlier test in this package happened to leave installed. What keeps it
+		// out of the preflight path is asserted where it is deterministic
+		// instead: on a loaded cache an unknown bucket has to delegate, and only
+		// a lookup that stays in the cache can answer that way.
+		loaded := installTestBucketMetadataSys(t, true)
+
+		_, err := preflightCORSConfig(unknownBucket)
+		if !isBucketCORSConfigNotFound(err) {
+			t.Fatalf("expected a definitive absence on a loaded cache, got %v", err)
+		}
+		if errors.Is(err, errBucketMetadataNotInitialized) {
+			t.Fatalf("a definitive absence must not also read as an unknown state, got %v", err)
+		}
+		if loaded.Count() != 0 {
+			t.Fatalf("expected the lookup not to add a metadata entry, got %d", loaded.Count())
+		}
+
+		installTestBucketMetadataSys(t, false)
+
+		_, err = preflightCORSConfig(unknownBucket)
+		if !errors.Is(err, errBucketMetadataNotInitialized) {
+			t.Fatalf("expected an unknown state while the cache is still loading, got %v", err)
+		}
+		if isBucketCORSConfigNotFound(err) {
+			t.Fatal("an unknown state must not read as a definitive absence")
+		}
+	})
+
+	t.Run("knownBucketWithoutAConfiguration", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+		setTestBucketCORSConfig(sys, knownBucket, nil)
+
+		got, _, err := sys.GetCORSConfigCached(knownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if !isBucketCORSConfigNotFound(err) {
+			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
+		}
+		if sys.Count() != 1 {
+			t.Fatalf("expected exactly the one bucket that was stored, got %d", sys.Count())
+		}
+	})
+
+	t.Run("knownBucketWithAConfiguration", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+		setTestBucketCORSConfig(sys, knownBucket, cfg)
+
+		got, _, err := sys.GetCORSConfigCached(knownBucket)
+		if err != nil {
+			t.Fatalf("expected the stored configuration, got error: %v", err)
+		}
+		if got != cfg {
+			t.Fatalf("expected the stored configuration to be returned as-is, got %+v", got)
+		}
+	})
+
+	// A cold cache must not be reported as an absence even for a bucket it does
+	// hold, so the loaded flag may only ever be consulted on a cache miss.
+	t.Run("knownBucketIsAnsweredEvenWhileTheCacheIsStillLoading", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, false)
+		setTestBucketCORSConfig(sys, knownBucket, cfg)
+
+		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
+			t.Fatalf("expected the stored configuration, got %+v and error %v", got, err)
+		}
+	})
+}
+
+// corsPreflightOutcome is how the middleware disposed of a request.
+type corsPreflightOutcome int
+
+const (
+	// corsOutcomeDelegated means the wrapped, server wide handler answered.
+	corsOutcomeDelegated corsPreflightOutcome = iota
+	// corsOutcomeAllowed means a stored rule matched and the middleware
+	// answered with the Access-Control-Allow families.
+	corsOutcomeAllowed
+	// corsOutcomeDenied means the middleware answered without a single
+	// Access-Control-Allow-* header.
+	corsOutcomeDenied
+)
+
+func (o corsPreflightOutcome) String() string {
+	switch o {
+	case corsOutcomeDelegated:
+		return "delegated"
+	case corsOutcomeAllowed:
+		return "allowed"
+	case corsOutcomeDenied:
+		return "denied"
+	}
+	return "unknown"
+}
+
+// TestBucketCorsPreflightMiddlewareDisposition covers how the middleware answers
+// a genuine preflight for every state the target bucket's CORS configuration can
+// be in.
+//
+// The three dispositions carry very different security weight. Delegating hands
+// the request to the server wide handler, whose default allows every origin with
+// credentials, so it is reserved for the single case where the bucket
+// definitively has no configuration of its own - requirement R7's fallback.
+// Every state in which the server cannot establish the bucket's rules denies
+// instead, because falling back there would quietly relax a restrictive bucket
+// policy exactly when it matters.
+func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
+	const (
+		bucket = "blitzy-cors-bucket"
+		origin = "https://www.example1.com"
+	)
+
+	matchingRule := miniogocors.Rule{
+		ID:            "matching",
+		AllowedHeader: []string{"x-amz-*"},
+		AllowedMethod: []string{http.MethodPut, http.MethodPost},
+		AllowedOrigin: []string{origin},
+		ExposeHeader:  []string{"ETag", "x-amz-request-id"},
+		MaxAgeSeconds: 3000,
+	}
+	otherOriginRule := miniogocors.Rule{
+		ID:            "other-origin",
+		AllowedMethod: []string{http.MethodPut},
+		AllowedOrigin: []string{"https://www.example9.com"},
+	}
+
+	// A requested-header list one entry past the ceiling, which must be denied
+	// rather than evaluated against a shortened list.
+	overCeilingHeaders := make([]string, 0, maxCORSPreflightRequestHeaders+1)
+	for i := range maxCORSPreflightRequestHeaders + 1 {
+		overCeilingHeaders = append(overCeilingHeaders, fmt.Sprintf("x-amz-blitzy-%d", i))
+	}
+
+	testCases := []struct {
+		name string
+		// setup installs the bucket metadata state the case needs.
+		setup func(t *testing.T)
+		// target defaults to a path-style request for bucket.
+		target string
+		// host and domainNames drive virtual-host-style addressing; both are
+		// empty for the path-style default.
+		host        string
+		domainNames []string
+		origin      string
+		reqMethod   string
+		reqHeaders  string
+		want        corsPreflightOutcome
+		// wantHeaders is asserted on an allowed response. A header named with an
+		// empty value must be absent.
+		wantHeaders map[string]string
+	}{
+		{
+			name: "nilMetadataSystemDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				saved := globalBucketMetadataSys
+				t.Cleanup(func() { globalBucketMetadataSys = saved })
+				globalBucketMetadataSys = nil
+			},
+			want: corsOutcomeDenied,
+		},
+		{
+			name: "unknownBucketWhileTheCacheIsStillLoadingDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installTestBucketMetadataSys(t, false)
+			},
+			want: corsOutcomeDenied,
+		},
+		{
+			name: "unknownBucketOnALoadedCacheDelegates",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installTestBucketMetadataSys(t, true)
+			},
+			want: corsOutcomeDelegated,
+		},
+		{
+			name: "bucketWithoutAConfigurationDelegates",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+			},
+			want: corsOutcomeDelegated,
+		},
+		{
+			name: "storedConfigurationWithZeroRulesDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig())
+			},
+			want: corsOutcomeDenied,
+		},
+		{
+			name: "syntacticallyInvalidBucketNameDelegates",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installTestBucketMetadataSys(t, true)
+			},
+			target: "/Not_A_Bucket/object",
+			want:   corsOutcomeDelegated,
+		},
+		{
+			name: "rootPathPreflightDelegates",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installTestBucketMetadataSys(t, true)
+			},
+			target: "/",
+			want:   corsOutcomeDelegated,
+		},
+		{
+			name: "noRuleMatchesTheOriginDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(otherOriginRule))
+			},
+			want: corsOutcomeDenied,
+		},
+		{
+			name: "noRuleMatchesTheMethodDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			},
+			reqMethod: http.MethodDelete,
+			want:      corsOutcomeDenied,
+		},
+		{
+			name: "noRuleCoversTheRequestedHeadersDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			},
+			reqHeaders: "content-type",
+			want:       corsOutcomeDenied,
+		},
+		{
+			name: "tooManyRequestedHeadersDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+					miniogocors.Rule{
+						ID:            "everything",
+						AllowedHeader: []string{"*"},
+						AllowedMethod: []string{http.MethodPut},
+						AllowedOrigin: []string{"*"},
+					},
+				))
+			},
+			reqHeaders: strings.Join(overCeilingHeaders, ","),
+			want:       corsOutcomeDenied,
+		},
+		{
+			name: "matchingRuleAllowsAndEmitsEveryHeaderFamily",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			},
+			reqHeaders: "X-Amz-Meta-Foo, x-amz-acl",
+			want:       corsOutcomeAllowed,
+			wantHeaders: map[string]string{
+				"Access-Control-Allow-Origin":   origin,
+				"Access-Control-Allow-Methods":  http.MethodPut,
+				"Access-Control-Allow-Headers":  "X-Amz-Meta-Foo, x-amz-acl",
+				"Access-Control-Max-Age":        "3000",
+				"Access-Control-Expose-Headers": "ETag, x-amz-request-id",
+			},
+		},
+		{
+			name: "matchingRuleWithoutRequestedHeadersOmitsAllowHeaders",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			},
+			want: corsOutcomeAllowed,
+			wantHeaders: map[string]string{
+				"Access-Control-Allow-Origin":  origin,
+				"Access-Control-Allow-Methods": http.MethodPut,
+				"Access-Control-Allow-Headers": "",
+				"Access-Control-Max-Age":       "3000",
+			},
+		},
+		{
+			name: "matchingRuleWithoutMaxAgeOrExposeHeaderOmitsThem",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+					miniogocors.Rule{
+						ID:            "bare",
+						AllowedMethod: []string{http.MethodPut},
+						AllowedOrigin: []string{origin},
+					},
+				))
+			},
+			want: corsOutcomeAllowed,
+			wantHeaders: map[string]string{
+				"Access-Control-Allow-Origin":   origin,
+				"Access-Control-Allow-Methods":  http.MethodPut,
+				"Access-Control-Max-Age":        "",
+				"Access-Control-Expose-Headers": "",
+			},
+		},
+		{
+			// First matching rule wins: the earlier rule's max age and exposed
+			// headers are the ones that reach the client, even though a later
+			// rule would also have matched.
+			name: "firstMatchingRuleInDocumentOrderDeterminesTheResponse",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+					otherOriginRule,
+					miniogocors.Rule{
+						ID:            "first-match",
+						AllowedMethod: []string{http.MethodPut},
+						AllowedOrigin: []string{origin},
+						ExposeHeader:  []string{"ETag"},
+						MaxAgeSeconds: 100,
+					},
+					miniogocors.Rule{
+						ID:            "second-match",
+						AllowedMethod: []string{http.MethodPut},
+						AllowedOrigin: []string{"*"},
+						ExposeHeader:  []string{"x-amz-request-id"},
+						MaxAgeSeconds: 200,
+					},
+				))
+			},
+			want: corsOutcomeAllowed,
+			wantHeaders: map[string]string{
+				"Access-Control-Allow-Origin":   origin,
+				"Access-Control-Max-Age":        "100",
+				"Access-Control-Expose-Headers": "ETag",
+			},
+		},
+		{
+			// Virtual-host-style addressing must resolve to the same bucket,
+			// because request2BucketObjectName handles both forms.
+			name: "virtualHostStyleAddressingResolvesTheSameBucket",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			},
+			target:      "/object",
+			host:        bucket + ".s3.example.com",
+			domainNames: []string{"s3.example.com"},
+			want:        corsOutcomeAllowed,
+			wantHeaders: map[string]string{
+				"Access-Control-Allow-Origin": origin,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.setup(t)
+
+			target := tc.target
+			if target == "" {
+				target = "/" + bucket + "/object"
+			}
+			reqOrigin := tc.origin
+			if reqOrigin == "" {
+				reqOrigin = origin
+			}
+			reqMethod := tc.reqMethod
+			if reqMethod == "" {
+				reqMethod = http.MethodPut
+			}
+
+			delegated := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				delegated = true
+				w.WriteHeader(http.StatusTeapot)
+			})
+
+			req := httptest.NewRequest(http.MethodOptions, target, nil)
+			req.Header.Set("Origin", reqOrigin)
+			req.Header.Set("Access-Control-Request-Method", reqMethod)
+			if tc.reqHeaders != "" {
+				req.Header.Set("Access-Control-Request-Headers", tc.reqHeaders)
+			}
+			if tc.host != "" {
+				req.Host = tc.host
+				saved := globalDomainNames
+				t.Cleanup(func() { globalDomainNames = saved })
+				globalDomainNames = tc.domainNames
+			}
+			rec := httptest.NewRecorder()
+
+			bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+
+			got := corsOutcomeDenied
+			switch {
+			case delegated:
+				got = corsOutcomeDelegated
+			case rec.Header().Get("Access-Control-Allow-Origin") != "":
+				got = corsOutcomeAllowed
+			}
+			if got != tc.want {
+				t.Fatalf("expected the request to be %s, it was %s (status %d, headers %v)",
+					tc.want, got, rec.Code, rec.Header())
+			}
+
+			if tc.want == corsOutcomeDelegated {
+				if rec.Code != http.StatusTeapot {
+					t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
+				}
+				return
+			}
+
+			// Both answered dispositions are HTTP 200 and declare their
+			// variance on all three preflight request axes.
+			if rec.Code != http.StatusOK {
+				t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)
+			}
+			wantVary := []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"}
+			if gotVary := rec.Header().Values("Vary"); !slices.Equal(gotVary, wantVary) {
+				t.Errorf("expected Vary %v, got %v", wantVary, gotVary)
+			}
+
+			if tc.want == corsOutcomeDenied {
+				for _, name := range corsPreflightAllowHeaders {
+					if value := rec.Header().Get(name); value != "" {
+						t.Errorf("expected a denied preflight to carry no %s, got %q", name, value)
+					}
+				}
+				return
+			}
+
+			for name, want := range tc.wantHeaders {
+				if got := rec.Header().Get(name); got != want {
+					if want == "" {
+						t.Errorf("expected %s to be absent, got %q", name, got)
+						continue
+					}
+					t.Errorf("expected %s to be %q, got %q", name, want, got)
+				}
+			}
+		})
+	}
+}
+
+// TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace pins the resource half
+// of the preflight contract: a stream of preflights naming buckets that do not
+// exist must leave the bucket metadata map exactly as it found it. Without that
+// guarantee an unauthenticated client can grow the map without bound simply by
+// inventing a new name per request.
+func TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace(t *testing.T) {
+	sys := installTestBucketMetadataSys(t, true)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	middleware := bucketCORSPreflightMiddleware(next)
+
+	for i := range 1024 {
+		req := httptest.NewRequest(http.MethodOptions, fmt.Sprintf("/blitzy-cors-probe-%d/object", i), nil)
+		req.Header.Set("Origin", "https://www.example1.com")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+		middleware.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if sys.Count() != 0 {
+		t.Fatalf("expected 1024 preflights for non-existent buckets to add no metadata entries, got %d",
+			sys.Count())
+	}
+}
+
+// corsMetadataUpdatedAt is a fixed instant carrying nanoseconds. MessagePack
+// stores a time with nanosecond precision and normalizes it to UTC, so using a
+// value with a sub-second component proves the codec keeps the whole timestamp
+// instead of truncating it.
+var corsMetadataUpdatedAt = time.Date(2025, time.July, 4, 12, 30, 45, 123456789, time.UTC)
+
+// TestBucketMetadataCORSConfigRoundTrip verifies the CORS payload and nanosecond
+// timestamp survive both MessagePack codec paths, including a cleared payload.
+func TestBucketMetadataCORSConfigRoundTrip(t *testing.T) {
+	created := time.Date(2025, time.June, 1, 8, 0, 0, 0, time.UTC)
+
+	meta := newBucketMetadata("blitzy-cors-round-trip")
+	meta.Created = created
+	meta.CORSConfigXML = []byte(corsCanonicalDocument)
+	meta.CORSConfigUpdatedAt = corsMetadataUpdatedAt
+
+	assertRoundTrip := func(t *testing.T, decoded BucketMetadata) {
+		t.Helper()
+		if decoded.Name != meta.Name {
+			t.Errorf("expected Name %q, got %q", meta.Name, decoded.Name)
+		}
+		if !decoded.Created.Equal(created) {
+			t.Errorf("expected Created %s, got %s", created, decoded.Created)
+		}
+		if !bytes.Equal(decoded.CORSConfigXML, meta.CORSConfigXML) {
+			t.Errorf("expected CORSConfigXML %q, got %q",
+				truncateForError(string(meta.CORSConfigXML)), truncateForError(string(decoded.CORSConfigXML)))
+		}
+		if !decoded.CORSConfigUpdatedAt.Equal(corsMetadataUpdatedAt) {
+			t.Errorf("expected CORSConfigUpdatedAt %s, got %s", corsMetadataUpdatedAt, decoded.CORSConfigUpdatedAt)
+		}
+	}
+
+	t.Run("marshalUnmarshal", func(t *testing.T) {
+		data, err := meta.MarshalMsg(nil)
+		if err != nil {
+			t.Fatalf("marshaling the metadata must succeed, got error: %v", err)
+		}
+
+		var decoded BucketMetadata
+		left, err := decoded.UnmarshalMsg(data)
+		if err != nil {
+			t.Fatalf("unmarshaling the metadata must succeed, got error: %v", err)
+		}
+		if len(left) > 0 {
+			t.Errorf("expected the whole payload to be consumed, %d bytes left over", len(left))
+		}
+		assertRoundTrip(t, decoded)
+	})
+
+	t.Run("encodeDecode", func(t *testing.T) {
+		var buf bytes.Buffer
+		writer := msgp.NewWriter(&buf)
+		if err := meta.EncodeMsg(writer); err != nil {
+			t.Fatalf("encoding the metadata must succeed, got error: %v", err)
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatalf("flushing the encoded metadata must succeed, got error: %v", err)
+		}
+
+		var decoded BucketMetadata
+		if err := decoded.DecodeMsg(msgp.NewReader(&buf)); err != nil {
+			t.Fatalf("decoding the metadata must succeed, got error: %v", err)
+		}
+		assertRoundTrip(t, decoded)
+	})
+
+	t.Run("clearedPayloadRoundTripsAsCleared", func(t *testing.T) {
+		// A bucket whose CORS configuration was deleted carries no payload, and
+		// that absence has to survive the round trip as an absence too, while the
+		// timestamp recording the deletion is still carried.
+		cleared := meta
+		cleared.CORSConfigXML = nil
+
+		data, err := cleared.MarshalMsg(nil)
+		if err != nil {
+			t.Fatalf("marshaling the metadata must succeed, got error: %v", err)
+		}
+
+		var decoded BucketMetadata
+		if _, err := decoded.UnmarshalMsg(data); err != nil {
+			t.Fatalf("unmarshaling the metadata must succeed, got error: %v", err)
+		}
+		if len(decoded.CORSConfigXML) != 0 {
+			t.Errorf("expected no CORS payload, got %q", truncateForError(string(decoded.CORSConfigXML)))
+		}
+		if !decoded.CORSConfigUpdatedAt.Equal(corsMetadataUpdatedAt) {
+			t.Errorf("expected CORSConfigUpdatedAt %s, got %s", corsMetadataUpdatedAt, decoded.CORSConfigUpdatedAt)
+		}
+	})
+}
+
+// TestBucketMetadataParseCORSConfig proves parseAllConfigs turns the persisted
+// payload into the parsed configuration that readers are served, and clears that
+// configuration again once the payload is removed.
+//
+// Both directions matter: the populated branch is what makes a stored
+// configuration observable, and the nil branch is what makes a DELETE observable,
+// since without it a deleted configuration would keep answering preflight
+// requests from a stale pointer.
+func TestBucketMetadataParseCORSConfig(t *testing.T) {
+	meta := newBucketMetadata("blitzy-cors-parse")
+
+	t.Run("payloadIsParsedIntoTheConfiguration", func(t *testing.T) {
+		meta.CORSConfigXML = []byte(corsCanonicalDocument)
+		if err := meta.parseAllConfigs(t.Context(), nil); err != nil {
+			t.Fatalf("parsing the bucket configurations must succeed, got error: %v", err)
+		}
+
+		if meta.corsConfig == nil {
+			t.Fatal("expected the parsed CORS configuration to be populated")
+		}
+		if len(meta.corsConfig.CORSRules) != 4 {
+			t.Fatalf("expected %d rules, got %d", 4, len(meta.corsConfig.CORSRules))
+		}
+		if meta.corsConfig.XMLNS != s3CORSNamespace {
+			t.Errorf("expected namespace %q, got %q", s3CORSNamespace, meta.corsConfig.XMLNS)
+		}
+		wantFirstRule := miniogocors.Rule{
+			AllowedHeader: []string{"*"},
+			AllowedMethod: []string{http.MethodPut, http.MethodPost, http.MethodDelete},
+			AllowedOrigin: []string{"http://www.example1.com"},
+		}
+		if !reflect.DeepEqual(meta.corsConfig.CORSRules[0], wantFirstRule) {
+			t.Errorf("expected the first rule to be %+v, got %+v", wantFirstRule, meta.corsConfig.CORSRules[0])
+		}
+	})
+
+	t.Run("removingThePayloadClearsTheConfiguration", func(t *testing.T) {
+		meta.CORSConfigXML = nil
+		if err := meta.parseAllConfigs(t.Context(), nil); err != nil {
+			t.Fatalf("parsing the bucket configurations must succeed, got error: %v", err)
+		}
+		if meta.corsConfig != nil {
+			t.Fatalf("expected the parsed CORS configuration to be cleared, got %+v", meta.corsConfig)
+		}
+	})
+
+	t.Run("malformedPayloadIsReported", func(t *testing.T) {
+		broken := newBucketMetadata("blitzy-cors-parse-malformed")
+		broken.CORSConfigXML = []byte(`<CORSConfiguration><CORSRule>`)
+		if err := broken.parseAllConfigs(t.Context(), nil); err == nil {
+			t.Fatal("expected a malformed stored payload to be reported as an error")
+		}
+	})
+}
+
+// TestBucketMetadataLastUpdateCORS proves lastUpdate accounts for the CORS
+// timestamp. That value is how the rest of the cluster learns its cached bucket
+// metadata is stale, so a timestamp left out of the comparison would let a CORS
+// change go unnoticed.
+func TestBucketMetadataLastUpdateCORS(t *testing.T) {
+	base := time.Date(2025, time.July, 4, 12, 0, 0, 0, time.UTC)
+	earlier, later := base.Add(-time.Hour), base.Add(time.Hour)
+
+	testCases := []struct {
+		name string
+		meta BucketMetadata
+		want time.Time
+	}{
+		{
+			name: "corsIsTheOnlyTimestamp",
+			meta: BucketMetadata{CORSConfigUpdatedAt: base},
+			want: base,
+		},
+		{
+			name: "corsIsTheLatestTimestamp",
+			meta: BucketMetadata{
+				PolicyConfigUpdatedAt:  earlier,
+				TaggingConfigUpdatedAt: base,
+				CORSConfigUpdatedAt:    later,
+			},
+			want: later,
+		},
+		{
+			name: "aSiblingTimestampIsLaterThanCors",
+			meta: BucketMetadata{
+				CORSConfigUpdatedAt:        base,
+				ReplicationConfigUpdatedAt: later,
+			},
+			want: later,
+		},
+		{
+			name: "noTimestampIsSet",
+			meta: BucketMetadata{},
+			want: time.Time{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.meta.lastUpdate(); !got.Equal(tc.want) {
+				t.Fatalf("expected the last update to be %s, got %s", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestBucketMetadataDefaultTimestampsCORS proves defaultTimestamps back-fills an
+// unset CORS timestamp from the bucket creation time and leaves a set one alone.
+//
+// Metadata written before this field existed decodes with a zero timestamp, and
+// reporting that zero value as the configuration's age is exactly what the
+// back-fill exists to prevent.
+func TestBucketMetadataDefaultTimestampsCORS(t *testing.T) {
+	created := time.Date(2025, time.June, 1, 8, 0, 0, 0, time.UTC)
+
+	t.Run("unsetTimestampIsBackFilledFromCreated", func(t *testing.T) {
+		meta := newBucketMetadata("blitzy-cors-timestamps")
+		meta.Created = created
+
+		meta.defaultTimestamps()
+
+		if !meta.CORSConfigUpdatedAt.Equal(created) {
+			t.Fatalf("expected the CORS timestamp to default to %s, got %s", created, meta.CORSConfigUpdatedAt)
+		}
+	})
+
+	t.Run("setTimestampIsPreserved", func(t *testing.T) {
+		meta := newBucketMetadata("blitzy-cors-timestamps")
+		meta.Created = created
+		meta.CORSConfigUpdatedAt = corsMetadataUpdatedAt
+
+		meta.defaultTimestamps()
+
+		if !meta.CORSConfigUpdatedAt.Equal(corsMetadataUpdatedAt) {
+			t.Fatalf("expected the CORS timestamp to stay %s, got %s", corsMetadataUpdatedAt, meta.CORSConfigUpdatedAt)
+		}
+	})
 }

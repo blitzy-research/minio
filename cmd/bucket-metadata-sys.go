@@ -379,6 +379,44 @@ func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config,
 	return meta.corsConfig, meta.CORSConfigUpdatedAt, nil
 }
 
+// GetCORSConfigCached returns the configured CORS config of a bucket strictly
+// from the in-memory bucket metadata, without ever reading from the backend.
+// The returned object may not be modified.
+//
+// Unlike GetCORSConfig it neither loads metadata on a cache miss nor inserts a
+// new entry, so it is safe to call with an arbitrary, client-supplied bucket
+// name on a request that has not been authenticated yet: an unknown name can
+// trigger neither backend I/O nor growth of the in-memory map. That is what the
+// CORS preflight evaluator needs, because a browser preflight carries no
+// credentials and its path is entirely attacker controlled.
+//
+// The two absence cases are reported distinctly, and the caller must treat them
+// differently:
+//
+//   - BucketCORSConfigNotFound means the bucket definitively has no CORS
+//     configuration, either because its metadata is loaded and carries none or
+//     because a fully loaded cache does not know the bucket at all. A caller may
+//     safely fall back to whatever behavior applies without a configuration.
+//   - errBucketMetadataNotInitialized means the answer is simply not known yet,
+//     because the bucket is absent from a cache that has not finished loading.
+//     A caller must not read that as an absence.
+func (sys *BucketMetadataSys) GetCORSConfigCached(bucket string) (*miniogocors.Config, time.Time, error) {
+	meta, err := sys.Get(bucket)
+	if err != nil {
+		if errors.Is(err, errConfigNotFound) {
+			if !sys.Initialized() {
+				return nil, time.Time{}, errBucketMetadataNotInitialized
+			}
+			return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
+		}
+		return nil, time.Time{}, err
+	}
+	if meta.corsConfig == nil {
+		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
+	}
+	return meta.corsConfig, meta.CORSConfigUpdatedAt, nil
+}
+
 // CreatedAt returns the time of creation of bucket
 func (sys *BucketMetadataSys) CreatedAt(bucket string) (time.Time, error) {
 	meta, _, err := sys.GetConfig(GlobalContext, bucket)

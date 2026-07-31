@@ -1373,7 +1373,6 @@ func getBucketLifecycleURL(endPoint, bucketName string) (ret string) {
 	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
 }
 
-// return URL For set/get/delete CORS configuration of the bucket.
 func getBucketCORSURL(endPoint, bucketName string) string {
 	queryValue := url.Values{}
 	queryValue.Set("cors", "")
