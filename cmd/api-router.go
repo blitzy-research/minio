@@ -689,8 +689,11 @@ func corsHandler(handler http.Handler) http.Handler {
 		ExposedHeaders:   commonS3Headers,
 		AllowCredentials: true,
 	}
-	// Per-bucket CORS rules take precedence for browser preflight requests,
-	// the server wide configuration above remains the fallback for every
-	// bucket without a stored CORS configuration.
+	// The per-bucket CORS evaluator wraps the handler built above instead of
+	// being installed on the mux, because no mux route is registered for
+	// OPTIONS: only an outer HTTP layer sees a browser preflight at all.
+	// It answers preflights for buckets that carry a stored CORS configuration
+	// and delegates every other request, so the server-wide allow-origin
+	// behavior configured above stays in force for buckets without one.
 	return bucketCORSPreflightMiddleware(cors.New(opts).Handler(handler))
 }
