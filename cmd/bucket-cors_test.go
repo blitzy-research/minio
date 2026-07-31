@@ -205,6 +205,42 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 				"</CORSConfiguration>\n",
 			wantRules: 1,
 		},
+		{
+			// A byte order mark at the very start of a UTF-8 entity is an
+			// encoding signature that XML 1.0 explicitly permits, so the
+			// document is well formed and must be accepted. Editors on some
+			// platforms write one into every file they save, which is how a
+			// hand authored cors.xml acquires it.
+			name:      "V1c/leadingUTF8BOMIsAccepted",
+			xml:       utf8BOM + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+		{
+			name:      "V1c/leadingUTF8BOMBeforeTheXMLDeclarationIsAccepted",
+			xml:       utf8BOM + xml.Header + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantRules: 1,
+		},
+		{
+			// Only the first mark is a signature. A second one is an ordinary
+			// character standing before the root element, which is content the
+			// document may not carry.
+			name:             "V1c/repeatedLeadingUTF8BOMIsRejected",
+			xml:              utf8BOM + utf8BOM + corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+			wantErrSubstring: "character data before the CORSConfiguration element",
+		},
+		{
+			name:             "V1c/utf8BOMFollowedByNoDocumentIsRejected",
+			xml:              utf8BOM,
+			wantErrSubstring: "does not contain a CORSConfiguration element",
+		},
+		{
+			// Consuming the signature must not turn into tolerating U+FEFF
+			// anywhere: after the root element it is a trailing character like
+			// any other.
+			name:             "V1c/utf8BOMAfterTheDocumentIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + utf8BOM,
+			wantErrSubstring: "character data after the CORSConfiguration element",
+		},
 
 		// V1d - element placement and cardinality. The document model would
 		// otherwise normalize a violation away: a repeated scalar keeps only
@@ -748,6 +784,115 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			xml:       corsCanonicalDocument,
 			wantRules: 4,
 		},
+
+		// normalization - a hand written document indents its values, and XML
+		// carries that indentation into the text of the element. The values are
+		// trimmed, so such a document is accepted and, crucially, means what it
+		// says; TestValidateBucketCorsConfigNormalizesValues asserts the values
+		// themselves.
+		{
+			name: "normalization/valuesOnTheirOwnLinesAreAccepted",
+			xml: "<CORSConfiguration>\n" +
+				"  <CORSRule>\n" +
+				"    <AllowedOrigin>\n      https://app.example.com\n    </AllowedOrigin>\n" +
+				"    <AllowedMethod>\n      GET\n    </AllowedMethod>\n" +
+				"    <AllowedHeader>\n      x-amz-acl\n    </AllowedHeader>\n" +
+				"    <ExposeHeader>\n      ETag\n    </ExposeHeader>\n" +
+				"    <ID>\n      hand written\n    </ID>\n" +
+				"  </CORSRule>\n" +
+				"</CORSConfiguration>\n",
+			wantRules: 1,
+		},
+		{
+			// Without normalization this document is rejected outright, for
+			// naming a method that it does in fact name correctly.
+			name:      "normalization/paddedAllowedMethodIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<AllowedMethod>  GET  </AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantRules: 1,
+		},
+		{
+			name:      "normalization/paddedAllowedOriginIsAccepted",
+			xml:       corsTestDoc(corsTestRule(corsMinimalRuleBody + `<AllowedOrigin>  https://app.example.com  </AllowedOrigin>`)),
+			wantRules: 1,
+		},
+		{
+			name:      "normalization/cdataPaddedAllowedOriginIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin><![CDATA[  https://app.example.com  ]]></AllowedOrigin>`)),
+			wantRules: 1,
+		},
+		{
+			// Trimming a value to nothing leaves the rule matching nothing,
+			// which is the same outcome an explicitly empty AllowedOrigin has
+			// and is therefore accepted rather than refused: a rule that
+			// matches nothing can only ever deny.
+			name:      "normalization/whitespaceOnlyAllowedOriginIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>   </AllowedOrigin>`)),
+			wantRules: 1,
+		},
+		{
+			// Normalization must not reach inside a value: an interior space is
+			// part of the value and still makes the method unsupported.
+			name:             "normalization/allowedMethodWithAnInteriorSpaceIsStillRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GE T</AllowedMethod><AllowedOrigin>*</AllowedOrigin>`)),
+			wantErrSubstring: `unsupported AllowedMethod "GE T"`,
+		},
+		{
+			// Trimming may not widen a rule either: only the whitespace around
+			// the value is removed, never a character of the value, so a
+			// two-wildcard origin stays refused.
+			name:             "normalization/paddedAllowedOriginWithTwoWildcardsIsStillRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>  *a*  </AllowedOrigin>`)),
+			wantErrSubstring: `AllowedOrigin "*a*" with more than one wildcard`,
+		},
+
+		// control characters - the XML decoder refuses every control character
+		// the XML specification forbids, so what has to be refused here is a
+		// tab, carriage return or line feed sitting inside a value, where it
+		// survives trimming. Such a value is meaningless as an origin, and as a
+		// header name it would reach a response header, where the HTTP writer
+		// silently replaces it with a space.
+		{
+			name:             "control/allowedOriginWithALineFeedIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>https://a&#10;.example.com</AllowedOrigin>`)),
+			wantErrSubstring: "AllowedOrigin \"https://a\\n.example.com\" containing a control character",
+		},
+		{
+			name:             "control/allowedHeaderWithATabIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + "<AllowedHeader>x-amz-a\tb</AllowedHeader>")),
+			wantErrSubstring: "AllowedHeader \"x-amz-a\\tb\" containing a control character",
+		},
+		{
+			// The response splitting attempt: a stored ExposeHeader carrying
+			// CRLF and a header of its own. It is refused at the door rather
+			// than relied upon to be defused when it is written out.
+			name:             "control/exposeHeaderWithCarriageReturnLineFeedIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + "<ExposeHeader>ETag\r\nX-Injected: yes</ExposeHeader>")),
+			wantErrSubstring: "ExposeHeader \"ETag\\nX-Injected: yes\" containing a control character",
+		},
+		{
+			name:             "control/exposeHeaderWithACharacterReferenceLineFeedIsRejected",
+			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody + `<ExposeHeader>ETag&#10;X-Injected: yes</ExposeHeader>`)),
+			wantErrSubstring: "containing a control character",
+		},
+		{
+			name:             "control/allowedOriginWithADeleteCharacterIsRejected",
+			xml:              corsTestDoc(corsTestRule("<AllowedMethod>GET</AllowedMethod><AllowedOrigin>https://a\u007f.example.com</AllowedOrigin>")),
+			wantErrSubstring: "containing a control character",
+		},
+		{
+			// A value whose only control characters surround it is trimmed, so
+			// it is accepted: the check applies to what is left after trimming.
+			name:      "control/exposeHeaderSurroundedByControlCharactersIsAccepted",
+			xml:       corsTestDoc(corsTestRule(corsMinimalRuleBody + "<ExposeHeader>\r\n\tETag\t\r\n</ExposeHeader>")),
+			wantRules: 1,
+		},
+		{
+			// ID is never matched and never emitted as a header, so it is
+			// deliberately exempt: it is handed back exactly as it was stored.
+			name:      "control/idWithALineFeedIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<ID>first&#10;second</ID>` + corsMinimalRuleBody)),
+			wantRules: 1,
+		},
 	}
 
 	for _, method := range allSupportedCORSMethods {
@@ -1024,6 +1169,214 @@ func TestValidateBucketCorsConfigCanonicalDocument(t *testing.T) {
 		}
 		if string(got) != corsCanonicalDocument {
 			t.Errorf("expected the round trip to be byte identical\n got: %s\nwant: %s", got, corsCanonicalDocument)
+		}
+	})
+}
+
+// TestValidateBucketCorsConfigCanonicalSizeCeiling covers the document that
+// fits the ceiling as it arrives but not as it is stored.
+//
+// What is persisted is the canonical re-marshaling of what was received, and it
+// is longer whenever the client omits the xmlns attribute, because the canonical
+// form declares the S3 namespace. The parser that reads the stored document back
+// stops at exactly maxBucketCORSConfigSize bytes, so a canonical document past
+// the ceiling would be written and then fail to decode - which surfaces to the
+// client as an internal error rather than as the oversized input it is.
+//
+// The boundary is computed rather than hard coded, so the test stays exact if the
+// canonical form ever gains or loses a byte.
+func TestValidateBucketCorsConfigCanonicalSizeCeiling(t *testing.T) {
+	// A document without an xmlns attribute whose total length is driven purely
+	// by the length of its ID element.
+	namespacelessDoc := func(total int) string {
+		document := `<CORSConfiguration><CORSRule><ID></ID>` + corsMinimalRuleBody + `</CORSRule></CORSConfiguration>`
+		return strings.Replace(document, `<ID></ID>`,
+			`<ID>`+strings.Repeat("p", total-len(document))+`</ID>`, 1)
+	}
+
+	// How many bytes the canonical form adds, measured on a document short
+	// enough that neither length is anywhere near the ceiling.
+	probe := namespacelessDoc(256)
+	probeCfg, err := validateBucketCorsConfig(strings.NewReader(probe))
+	if err != nil {
+		t.Fatalf("the probe document must be accepted, got error: %v", err)
+	}
+	probeCanonical, err := xml.Marshal(probeCfg)
+	if err != nil {
+		t.Fatalf("marshaling the probe configuration must succeed, got error: %v", err)
+	}
+	growth := len(probeCanonical) - len(probe)
+	if growth <= 0 {
+		t.Fatalf("expected the canonical form of a namespace-less document to be longer, grew by %d bytes", growth)
+	}
+
+	t.Run("aBodyWhoseCanonicalFormExactlyFitsIsAccepted", func(t *testing.T) {
+		document := namespacelessDoc(maxBucketCORSConfigSize - growth)
+		cfg, err := validateBucketCorsConfig(strings.NewReader(document))
+		if err != nil {
+			t.Fatalf("expected the document to be accepted, got error: %v", err)
+		}
+		canonical, err := xml.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshaling the validated configuration must succeed, got error: %v", err)
+		}
+		if len(canonical) != maxBucketCORSConfigSize {
+			t.Fatalf("expected a canonical document of exactly %d bytes, got %d",
+				maxBucketCORSConfigSize, len(canonical))
+		}
+		// The stored document has to decode again, which is the invariant this
+		// whole ceiling exists to protect.
+		if _, err := miniogocors.ParseBucketCorsConfig(bytes.NewReader(canonical)); err != nil {
+			t.Fatalf("expected the canonical document to decode, got error: %v", err)
+		}
+	})
+
+	t.Run("aBodyThatFitsButWhoseCanonicalFormDoesNotIsRejected", func(t *testing.T) {
+		// One byte longer than the case above, so the body is still within the
+		// ceiling while the document that would be stored is one byte over it.
+		document := namespacelessDoc(maxBucketCORSConfigSize - growth + 1)
+		if len(document) > maxBucketCORSConfigSize {
+			t.Fatalf("the body itself must remain within the ceiling, got %d bytes", len(document))
+		}
+		cfg, err := validateBucketCorsConfig(strings.NewReader(document))
+		if err == nil {
+			t.Fatalf("expected the document to be rejected, got a configuration with %d rules", len(cfg.CORSRules))
+		}
+		if cfg != nil {
+			t.Fatal("expected a nil configuration on failure")
+		}
+		if !strings.Contains(err.Error(), "once stored in its canonical form") {
+			t.Fatalf("expected the error to name the canonical form, got %q", err)
+		}
+	})
+
+	t.Run("aBodyAtTheCeilingWithTheNamespaceDeclaredIsStillAccepted", func(t *testing.T) {
+		// Declaring the namespace is what keeps the canonical form from growing,
+		// so the plain ceiling still holds for a document that declares it.
+		document := corsTestDoc(corsTestRule(`<ID></ID>` + corsMinimalRuleBody))
+		document = strings.Replace(document, `<ID></ID>`,
+			`<ID>`+strings.Repeat("p", maxBucketCORSConfigSize-len(document))+`</ID>`, 1)
+		if len(document) != maxBucketCORSConfigSize {
+			t.Fatalf("expected a body of exactly %d bytes, got %d", maxBucketCORSConfigSize, len(document))
+		}
+		if _, err := validateBucketCorsConfig(strings.NewReader(document)); err != nil {
+			t.Fatalf("expected the document to be accepted, got error: %v", err)
+		}
+	})
+}
+
+// TestValidateBucketCorsConfigNormalizesValues covers the hand authored
+// document: one saved with a byte order mark, indented so that every value sits
+// on a line of its own.
+//
+// Accepting such a document is not enough - it has to mean what it says. The
+// values that reach the configuration are therefore asserted exactly, the
+// document that would be persisted is asserted to carry them, and the rule is
+// asserted to match the preflight request the author was configuring for. That
+// last assertion is the point of the whole test: an untrimmed origin is one no
+// browser can ever send, so the configuration would be stored, reported as
+// accepted, and then deny the request it was written to allow.
+func TestValidateBucketCorsConfigNormalizesValues(t *testing.T) {
+	// Written the way an editor that emits a byte order mark would save it.
+	document := utf8BOM + xml.Header +
+		"<CORSConfiguration>\n" +
+		"  <CORSRule>\n" +
+		"    <ID>\n      hand written\n    </ID>\n" +
+		"    <AllowedOrigin>\n      https://app.example.com\n    </AllowedOrigin>\n" +
+		"    <AllowedOrigin>\thttps://admin.example.com\t</AllowedOrigin>\n" +
+		"    <AllowedMethod>\n      GET\n    </AllowedMethod>\n" +
+		"    <AllowedMethod>  put  </AllowedMethod>\n" +
+		"    <AllowedHeader>\n      x-amz-acl\n    </AllowedHeader>\n" +
+		"    <ExposeHeader>\n      ETag\n    </ExposeHeader>\n" +
+		"    <MaxAgeSeconds> 3000 </MaxAgeSeconds>\n" +
+		"  </CORSRule>\n" +
+		"</CORSConfiguration>\n"
+
+	cfg, err := validateBucketCorsConfig(strings.NewReader(document))
+	if err != nil {
+		t.Fatalf("a hand authored document must be accepted, got error: %v", err)
+	}
+	if len(cfg.CORSRules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cfg.CORSRules))
+	}
+
+	want := miniogocors.Rule{
+		AllowedHeader: []string{"x-amz-acl"},
+		AllowedMethod: []string{http.MethodGet, http.MethodPut},
+		AllowedOrigin: []string{"https://app.example.com", "https://admin.example.com"},
+		ExposeHeader:  []string{"ETag"},
+		ID:            "hand written",
+		MaxAgeSeconds: 3000,
+	}
+
+	t.Run("everyValueIsTrimmed", func(t *testing.T) {
+		if !reflect.DeepEqual(cfg.CORSRules[0], want) {
+			t.Fatalf("expected rule %+v, got %+v", want, cfg.CORSRules[0])
+		}
+	})
+
+	t.Run("theRuleMatchesThePreflightItWasWrittenFor", func(t *testing.T) {
+		// The origin and the header are spelled the way a browser sends them,
+		// with no indentation to be forgiving about.
+		rule := corsRuleFor(cfg, "https://app.example.com", http.MethodGet, []string{"x-amz-acl"})
+		if rule == nil {
+			t.Fatal("expected the trimmed rule to match the preflight request it allows")
+		}
+		if rule.MaxAgeSeconds != want.MaxAgeSeconds {
+			t.Errorf("expected MaxAgeSeconds %d, got %d", want.MaxAgeSeconds, rule.MaxAgeSeconds)
+		}
+		if second := corsRuleFor(cfg, "https://admin.example.com", http.MethodPut, nil); second == nil {
+			t.Error("expected the second trimmed origin and method to match as well")
+		}
+		if denied := corsRuleFor(cfg, "https://evil.example.com", http.MethodGet, nil); denied != nil {
+			t.Error("expected an origin the document does not name to match no rule")
+		}
+	})
+
+	t.Run("thePersistedDocumentCarriesTheTrimmedValues", func(t *testing.T) {
+		// PutBucketCorsHandler marshals exactly this configuration, so what is
+		// asserted here is what a subsequent GetBucketCors returns.
+		configData, err := xml.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshaling the validated configuration must succeed, got error: %v", err)
+		}
+		got := string(configData)
+		for _, fragment := range []string{
+			`<ID>hand written</ID>`,
+			`<AllowedOrigin>https://app.example.com</AllowedOrigin>`,
+			`<AllowedOrigin>https://admin.example.com</AllowedOrigin>`,
+			`<AllowedMethod>GET</AllowedMethod>`,
+			`<AllowedMethod>PUT</AllowedMethod>`,
+			`<AllowedHeader>x-amz-acl</AllowedHeader>`,
+			`<ExposeHeader>ETag</ExposeHeader>`,
+			`<MaxAgeSeconds>3000</MaxAgeSeconds>`,
+			`<CORSConfiguration xmlns="` + s3CORSNamespace + `">`,
+		} {
+			if !strings.Contains(got, fragment) {
+				t.Errorf("expected the persisted document to contain %s, got %s", fragment, truncateForError(got))
+			}
+		}
+		// Re-reading what would be stored has to produce the same
+		// configuration, so persistence cannot reintroduce what was trimmed.
+		reparsed, err := validateBucketCorsConfig(bytes.NewReader(configData))
+		if err != nil {
+			t.Fatalf("the persisted document must validate, got error: %v", err)
+		}
+		if !reflect.DeepEqual(reparsed.CORSRules, cfg.CORSRules) {
+			t.Fatalf("expected the persisted document to round trip, got %+v", reparsed.CORSRules)
+		}
+	})
+
+	t.Run("theByteOrderMarkIsNotStored", func(t *testing.T) {
+		configData, err := xml.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshaling the validated configuration must succeed, got error: %v", err)
+		}
+		if bytes.Contains(configData, []byte(utf8BOM)) {
+			t.Fatal("expected the byte order mark not to survive into the persisted document")
+		}
+		if cfg.XMLName.Local != corsConfigurationElement {
+			t.Fatalf("expected root element %q, got %q", corsConfigurationElement, cfg.XMLName.Local)
 		}
 	})
 }

@@ -40,6 +40,10 @@ const (
 	// so the same ceiling is applied to the request body here. The ceiling is
 	// enforced by validateBucketCorsConfig itself, which refuses a body that
 	// exceeds it instead of validating a truncated prefix of it.
+	//
+	// It is therefore more permissive than the documented AWS limit, never
+	// stricter: a document AWS accepts is always within it. Documented for
+	// operators in docs/bucket/cors/README.md.
 	maxBucketCORSConfigSize = 128 * humanize.KiByte
 
 	maxBucketCORSRules = 100
@@ -49,6 +53,11 @@ const (
 	// actually carries, so this ceiling is far above what any real client
 	// sends, while it bounds the work an unauthenticated preflight can ask the
 	// rule matcher to perform.
+	//
+	// A request naming more is denied rather than truncated - the one
+	// deliberately stricter-than-AWS limit of this implementation, chosen so
+	// that the failure direction is refusal rather than an unchecked header
+	// slipping through. Documented for operators in docs/bucket/cors/README.md.
 	maxCORSPreflightRequestHeaders = 64
 
 	// corsConfigXMLNS is the XML namespace of every S3 CORS document. A client
@@ -61,6 +70,12 @@ const (
 	// Element names of a CORS document, spelled exactly as AWS spells them.
 	corsConfigurationElement = "CORSConfiguration"
 	corsRuleElement          = "CORSRule"
+
+	// utf8BOM is the UTF-8 encoding of U+FEFF, the byte order mark. XML 1.0
+	// permits a single one at the very start of a UTF-8 entity, where it is an
+	// encoding signature rather than content, and editors on some platforms
+	// write it into every file they save.
+	utf8BOM = "\ufeff"
 )
 
 // supportedCORSMethods is the exact set of HTTP methods that S3 accepts in an
@@ -103,6 +118,11 @@ var corsRuleElementOrder = []string{
 // top of it, mirroring the S3 PutBucketCors contract. It returns the parsed
 // configuration, which is the canonical form that is persisted.
 //
+// Two forms of insignificant markup a hand written document carries are
+// normalized away before the configuration is validated, so that what is
+// validated is also what is stored and later matched: a leading byte order mark,
+// and the whitespace surrounding every element value.
+//
 // Callers hand the request body over directly: the size ceiling is enforced
 // here, by reading one byte more than maxBucketCORSConfigSize and refusing a
 // body that long, so an oversized document is rejected outright rather than
@@ -123,6 +143,20 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 		return nil, fmt.Errorf("%s document is larger than the maximum of %d bytes",
 			corsConfigurationElement, maxBucketCORSConfigSize)
 	}
+
+	// A leading byte order mark is an encoding signature, not content, so it is
+	// consumed here rather than validated below: the XML decoder reports it as
+	// character data ahead of the root element, and character data ahead of the
+	// root element is exactly what the strict walk refuses. Only the first mark
+	// is consumed, because only the first one is a signature - anywhere else
+	// U+FEFF is an ordinary character, and a second one really is content
+	// before the root element.
+	//
+	// The mark is removed after the ceiling has been applied, since the bytes
+	// were part of the body the client sent, and it is removed from the bytes
+	// both the walk and the document model read, so the two cannot disagree
+	// about where the document starts.
+	data = bytes.TrimPrefix(data, []byte(utf8BOM))
 
 	// The document model cannot express element cardinality, silently discards
 	// elements it does not know and ignores everything that follows the root
@@ -170,7 +204,13 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 			len(cfg.CORSRules), maxBucketCORSRules)
 	}
 
-	for i, rule := range cfg.CORSRules {
+	for i := range cfg.CORSRules {
+		// The rule is addressed rather than copied so that normalizing it
+		// reaches the configuration that is validated below, persisted by the
+		// handler and later matched against preflight requests.
+		rule := &cfg.CORSRules[i]
+		normalizeCORSRuleValues(rule)
+
 		if len(rule.AllowedMethod) == 0 {
 			return nil, fmt.Errorf("CORSRule %d must contain at least one AllowedMethod", i)
 		}
@@ -183,11 +223,19 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 		if len(rule.AllowedOrigin) == 0 {
 			return nil, fmt.Errorf("CORSRule %d must contain at least one AllowedOrigin", i)
 		}
+		// An AllowedOrigin element that carries no value, whether it was
+		// written empty or held nothing but whitespace, is accepted as AWS
+		// accepts it. It names the empty origin, which no browser can send, so
+		// such a value can only ever fail to match: the rule denies, and being
+		// permissive here cannot widen anything.
 		for _, origin := range rule.AllowedOrigin {
 			// A bare "*" and a single embedded wildcard such as
 			// "http://www.example.*" are both legal, more than one is not.
 			if strings.Count(origin, "*") > 1 {
 				return nil, fmt.Errorf("CORSRule %d has AllowedOrigin %q with more than one wildcard", i, origin)
+			}
+			if corsValueHasControlCharacter(origin) {
+				return nil, fmt.Errorf("CORSRule %d has AllowedOrigin %q containing a control character", i, origin)
 			}
 		}
 
@@ -195,14 +243,101 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 			if strings.Count(header, "*") > 1 {
 				return nil, fmt.Errorf("CORSRule %d has AllowedHeader %q with more than one wildcard", i, header)
 			}
+			if corsValueHasControlCharacter(header) {
+				return nil, fmt.Errorf("CORSRule %d has AllowedHeader %q containing a control character", i, header)
+			}
 		}
 
+		for _, header := range rule.ExposeHeader {
+			if corsValueHasControlCharacter(header) {
+				return nil, fmt.Errorf("CORSRule %d has ExposeHeader %q containing a control character", i, header)
+			}
+		}
+
+		// MaxAgeSeconds is decoded as an integer, so an element that carries no
+		// value means zero - the same as omitting it, which is how a browser is
+		// told not to cache the answer - while a value that is not a number, or
+		// one too large for the type, has already been refused by the decoder.
+		// Only a negative age remains to be refused here.
 		if rule.MaxAgeSeconds < 0 {
 			return nil, fmt.Errorf("CORSRule %d has negative MaxAgeSeconds %d", i, rule.MaxAgeSeconds)
 		}
 	}
 
+	// The document that is stored is the canonical re-marshaling of the one that
+	// was received, and it can be longer than what arrived: an omitted xmlns
+	// attribute is filled in with the S3 namespace, and a value carrying a
+	// character the encoder escapes grows with it. The ceiling has to hold for
+	// that document as well, because it is the document that is read back, and
+	// the parser reading it stops after exactly this many bytes. Without this
+	// check a body that only just fits is accepted, and the write then fails
+	// while decoding what it just built - reporting an internal error for what
+	// is a client's oversized input.
+	canonical, err := xml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to encode the %s document: %w", corsConfigurationElement, err)
+	}
+	if len(canonical) > maxBucketCORSConfigSize {
+		return nil, fmt.Errorf("%s document is larger than the maximum of %d bytes once stored in its canonical form",
+			corsConfigurationElement, maxBucketCORSConfigSize)
+	}
+
 	return cfg, nil
+}
+
+// normalizeCORSRuleValues trims the whitespace surrounding every text value of
+// a rule, in place.
+//
+// XML carries the indentation of a hand written document into the text of its
+// elements, so an AllowedOrigin written on a line of its own arrives as a value
+// no browser can ever send. Without this, such a rule is either stored and
+// silently never matched - the client is told its configuration was accepted -
+// or, for AllowedMethod, refused for being unsupported when the method it names
+// is in fact supported. Neither outcome tells the bucket owner what is wrong,
+// and both are avoided by validating and storing the value the document means.
+//
+// Only the surrounding whitespace is removed. The value itself is never
+// otherwise rewritten, so a rule can never be widened into permitting an origin
+// or a header the document does not name.
+func normalizeCORSRuleValues(rule *miniogocors.Rule) {
+	rule.ID = strings.TrimSpace(rule.ID)
+	// The slices are trimmed through their backing arrays, which is what makes
+	// the normalization visible to the caller's configuration.
+	for _, values := range [][]string{
+		rule.AllowedHeader,
+		rule.AllowedMethod,
+		rule.AllowedOrigin,
+		rule.ExposeHeader,
+	} {
+		for i, value := range values {
+			values[i] = strings.TrimSpace(value)
+		}
+	}
+}
+
+// corsValueHasControlCharacter reports whether a value contains a control
+// character, which no origin and no header name may.
+//
+// The XML decoder already refuses every control character the XML specification
+// forbids, so what reaches here is a tab, a carriage return or a line feed that
+// survived normalization by sitting inside a value rather than around it. Such a
+// value is meaningless as an origin, and as a header name it would be written
+// into an Access-Control-Expose-Headers or Access-Control-Allow-Headers
+// response header, where the HTTP writer replaces the character with a space -
+// so the bucket owner would receive neither the header they configured nor any
+// indication that it had been altered. Refusing the document instead keeps what
+// is stored and what is emitted identical, and keeps line breaks out of a
+// response header even if a future writer were less careful than the current
+// one.
+//
+// ID is deliberately not subjected to this check: it is never matched and never
+// emitted as a header, only carried through the stored document and handed back
+// verbatim, so refusing it would add strictness that AWS does not have without
+// protecting anything.
+func corsValueHasControlCharacter(value string) bool {
+	return strings.ContainsFunc(value, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	})
 }
 
 // validateCorsDocumentSchema walks the received document token by token and
@@ -348,6 +483,11 @@ func validateCorsRuleElement(dec *xml.Decoder, space string, index int) error {
 // enforces that it carries a text value only. A nested element would be
 // discarded by the document model, leaving the client no way to learn that the
 // value it configured was ignored.
+//
+// An attribute on the element is neither rejected nor interpreted, matching AWS,
+// which likewise ignores attributes on a CORS rule and its children. Unlike a
+// nested element, an attribute cannot be mistaken for a configured value, so
+// ignoring it cannot mislead the client about what was stored.
 func validateCorsRuleValueElement(dec *xml.Decoder, space string, index int, name string) error {
 	for {
 		tok, err := dec.Token()
