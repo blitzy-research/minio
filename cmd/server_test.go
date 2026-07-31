@@ -405,21 +405,40 @@ func (s *TestSuiteCommon) TestBucketCORSRoundTrip(c *check) {
 		}
 	}
 
-	// The returned document must be structurally equivalent to the stored one.
-	// The server persists the re-marshaled configuration, so the comparison runs
-	// against the parsed form of the submitted document rather than its bytes.
-	expectedConfig, err := validateBucketCorsConfig(strings.NewReader(corsSuiteConfig))
-	c.Assert(err, nil)
+	// The returned document must be equivalent to the stored one, rule for rule
+	// and in the same order. The expectation is spelled out literally rather
+	// than derived by running the submitted document back through the server's
+	// own validator, so a validator that dropped or rewrote an element could not
+	// hide behind agreeing with itself. The only transformation the round trip
+	// is allowed to perform is the one the S3 contract mandates: AllowedMethod
+	// values are upper-cased, and the document below already submits them so.
+	expectedRules := []miniogocors.Rule{
+		{
+			AllowedHeader: []string{"*"},
+			AllowedMethod: []string{http.MethodGet, http.MethodHead},
+			AllowedOrigin: []string{"http://www.example1.com", "http://www.example2.*"},
+			ExposeHeader:  []string{"x-amz-request-id"},
+			ID:            "read-only-rule",
+			MaxAgeSeconds: 3000,
+		},
+		{
+			AllowedHeader: []string{"x-amz-meta-foo", "content-type"},
+			AllowedMethod: []string{http.MethodPut, http.MethodPost, http.MethodDelete},
+			AllowedOrigin: []string{"https://www.example3.com"},
+			ExposeHeader:  []string{"ETag", "x-amz-version-id"},
+			ID:            "write-rule",
+			MaxAgeSeconds: 600,
+		},
+	}
 
 	gotConfig := &miniogocors.Config{}
 	err = xml.Unmarshal(configData, gotConfig)
 	c.Assert(err, nil)
 	c.Assert(gotConfig.XMLName.Local, "CORSConfiguration")
+	c.Assert(gotConfig.XMLName.Space, s3CORSNamespace)
 	c.Assert(gotConfig.XMLNS, s3CORSNamespace)
-	c.Assert(len(gotConfig.CORSRules), len(expectedConfig.CORSRules))
-	for i := range expectedConfig.CORSRules {
-		c.Assert(gotConfig.CORSRules[i], expectedConfig.CORSRules[i])
-	}
+	c.Assert(len(gotConfig.CORSRules), len(expectedRules))
+	c.Assert(gotConfig.CORSRules, expectedRules)
 }
 
 // TestBucketCORSNotFound - GetBucketCors on a bucket with no configuration
@@ -509,36 +528,61 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	malformedConfigs := []string{
-		// Not well-formed at all: the CORSRule element is never closed.
-		`<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>`,
-		// Well-formed XML whose root element is not CORSConfiguration.
-		`<NotACORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></NotACORSConfiguration>`,
-		// A CORSConfiguration carrying no rule at all.
-		`<CORSConfiguration></CORSConfiguration>`,
-		// A rule whose AllowedMethod falls outside {GET, PUT, POST, DELETE, HEAD}.
-		`<CORSConfiguration><CORSRule><AllowedMethod>PATCH</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
-		// A rule with no AllowedOrigin.
-		`<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`,
+	// Every expected message is spelled out literally, because the description
+	// is part of the wire contract a client reads to find out what is wrong with
+	// the document it sent.
+	malformedConfigs := []struct {
+		reason  string
+		config  string
+		message string
+	}{
+		{
+			reason:  "the document is not well-formed XML: the CORSRule element is never closed",
+			config:  `<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>`,
+			message: "decoding xml: XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			reason:  "the document is well-formed XML but its root element is not CORSConfiguration",
+			config:  `<NotACORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></NotACORSConfiguration>`,
+			message: `Unexpected root element "NotACORSConfiguration", expected CORSConfiguration`,
+		},
+		{
+			reason:  "the configuration carries no rule at all",
+			config:  `<CORSConfiguration></CORSConfiguration>`,
+			message: "CORSConfiguration must contain at least one CORSRule",
+		},
+		{
+			reason:  "a rule has an AllowedMethod outside {GET, PUT, POST, DELETE, HEAD}",
+			config:  `<CORSConfiguration><CORSRule><AllowedMethod>PATCH</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			message: `CORSRule 0 has unsupported AllowedMethod "PATCH"`,
+		},
+		{
+			reason:  "a rule has no AllowedOrigin",
+			config:  `<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`,
+			message: "CORSRule 0 must contain at least one AllowedOrigin",
+		},
 	}
 
-	for _, malformedConfig := range malformedConfigs {
-		// The handler carries the validator's own message into the error
-		// description, so the expected message is exactly what the validator
-		// reports for the same body.
-		_, expectedErr := validateBucketCorsConfig(strings.NewReader(malformedConfig))
-		if expectedErr == nil {
-			c.Fatalf("Expected the CORS validator to reject %s", malformedConfig)
+	for _, malformed := range malformedConfigs {
+		// The handler is required to carry the validator's own message into the
+		// error description unchanged, so the literal above must also be what
+		// the validator reports for the very same body. Checking both pins the
+		// text a client sees and proves the handler does not rewrite it.
+		_, validationErr := validateBucketCorsConfig(strings.NewReader(malformed.config))
+		if validationErr == nil {
+			c.Fatalf("Expected the CORS validator to reject the configuration where %s: %s",
+				malformed.reason, malformed.config)
 		}
+		c.Assert(validationErr.Error(), malformed.message)
 
 		badRequest, err := newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
-			int64(len(malformedConfig)), bytes.NewReader([]byte(malformedConfig)),
+			int64(len(malformed.config)), bytes.NewReader([]byte(malformed.config)),
 			s.accessKey, s.secretKey, s.signer)
 		c.Assert(err, nil)
 
 		badResponse, err := s.client.Do(badRequest)
 		c.Assert(err, nil)
-		verifyError(c, badResponse, "MalformedXML", expectedErr.Error(), http.StatusBadRequest)
+		verifyError(c, badResponse, "MalformedXML", malformed.message, http.StatusBadRequest)
 	}
 
 	// A rejected configuration must never be persisted.
@@ -556,7 +600,9 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 // and the five Access-Control-Allow-* header families derived from that rule,
 // while a preflight that deviates on any single axis receives no
 // Access-Control-Allow-* header at all, which is how a browser learns the
-// request is refused.
+// request is refused. A bucket that carries no configuration of its own keeps
+// being answered by the pre-existing server wide handler, so the global
+// allow-origin setting remains the fallback it has always been.
 func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
 	bucketName := getRandomBucketName()
 
@@ -569,6 +615,32 @@ func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
+	// A browser preflight carries no credentials, so every OPTIONS request below
+	// is unsigned, and it addresses the bucket itself rather than a
+	// sub-resource, exactly as a browser would.
+	bucketURL := getMakeBucketURL(s.endPoint, bucketName)
+
+	// The bucket has no CORS configuration yet, so this preflight has to be
+	// answered by the server wide handler and not by the per-bucket evaluator.
+	// The two are told apart by their answers: the server wide handler replies
+	// 204 with Access-Control-Allow-Credentials and never emits
+	// Access-Control-Expose-Headers on a preflight response, while the
+	// per-bucket evaluator replies 200 and does emit it.
+	fallback, err := http.NewRequest(http.MethodOptions, bucketURL, nil)
+	c.Assert(err, nil)
+	fallback.Header.Set("Origin", "http://example.com")
+	fallback.Header.Set("Access-Control-Request-Method", http.MethodPut)
+	fallback.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
+
+	delegated, err := s.client.Do(fallback)
+	c.Assert(err, nil)
+	c.Assert(delegated.StatusCode, http.StatusNoContent)
+	c.Assert(delegated.Header.Get("Access-Control-Allow-Origin"), "http://example.com")
+	c.Assert(delegated.Header.Get("Access-Control-Allow-Credentials"), "true")
+	if got := delegated.Header.Values("Access-Control-Expose-Headers"); len(got) != 0 {
+		c.Errorf("Expected the server wide handler not to expose headers on a preflight response, got %v", got)
+	}
+
 	request, err = newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
 		int64(len(corsSuitePreflightConfig)), bytes.NewReader([]byte(corsSuitePreflightConfig)),
 		s.accessKey, s.secretKey, s.signer)
@@ -578,10 +650,8 @@ func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	// A browser preflight carries no credentials, so the OPTIONS request is
-	// unsigned. It is answered by the per-bucket evaluator that wraps the server
-	// wide CORS handler.
-	bucketURL := getMakeBucketURL(s.endPoint, bucketName)
+	// The stored rule now answers the very same preflight, which is what makes
+	// the two outcomes directly comparable.
 	preflight, err := http.NewRequest(http.MethodOptions, bucketURL, nil)
 	c.Assert(err, nil)
 	preflight.Header.Set("Origin", "http://example.com")
@@ -640,15 +710,19 @@ func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
 		c.Assert(err, nil)
 		c.Assert(deniedResponse.StatusCode, http.StatusOK)
 
-		for _, header := range []string{
-			"Access-Control-Allow-Origin",
-			"Access-Control-Allow-Methods",
-			"Access-Control-Allow-Headers",
-			"Access-Control-Max-Age",
-			"Access-Control-Expose-Headers",
-		} {
-			if got := deniedResponse.Header.Values(header); len(got) != 0 {
-				c.Errorf("Expected no %s header when the %s, got %v", header, denied.reason, got)
+		// Access-Control-Allow-Origin is the header a browser looks for, so it
+		// is asserted absent by name first.
+		if got := deniedResponse.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			c.Errorf("Expected no Access-Control-Allow-Origin header when the %s, got %v", denied.reason, got)
+		}
+
+		// A denial carries no Access-Control-* header at all: neither the five
+		// families a matched rule would have produced, nor the
+		// Access-Control-Allow-Credentials the server wide handler would have
+		// added had the request been delegated to it instead of denied here.
+		for header, values := range deniedResponse.Header {
+			if strings.HasPrefix(header, "Access-Control-") {
+				c.Errorf("Expected no %s header when the %s, got %v", header, denied.reason, values)
 			}
 		}
 	}
