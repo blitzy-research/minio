@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2026 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
