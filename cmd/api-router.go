@@ -695,5 +695,17 @@ func corsHandler(handler http.Handler) http.Handler {
 	// It answers preflights for buckets that carry a stored CORS configuration
 	// and delegates every other request, so the server-wide allow-origin
 	// behavior configured above stays in force for buckets without one.
+	//
+	// That placement puts it ahead of the middlewares the mux applies, so it
+	// cannot rely on them having screened the request and applies the same
+	// admission rules itself: a request carrying more header bytes than
+	// setRequestLimitMiddleware admits, and a Host that
+	// setRequestValidityMiddleware answers 400 for, are refused here too.
+	// Delegating either would answer, out of the permissive settings configured
+	// above, a preflight for a request the server itself would never serve -
+	// while the generic path-style route registered for /{bucket} does resolve
+	// such a request to a real bucket whose own rules may be restrictive. Those
+	// same limits are what bound the lists the evaluator then parses and
+	// compares, since a preflight is unauthenticated and both come from it.
 	return bucketCORSPreflightMiddleware(cors.New(opts).Handler(handler))
 }

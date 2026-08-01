@@ -19,10 +19,15 @@ package cmd
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"io"
 	"net/http"
 
+	"github.com/minio/minio/internal/etag"
+	"github.com/minio/minio/internal/hash"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
 	"github.com/minio/pkg/v3/policy"
@@ -56,10 +61,18 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Verify whatever the client declared about the bytes it is sending before
+	// any of them is turned into stored configuration.
+	body, s3Error := corsConfigBody(ctx, r)
+	if s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	// validateBucketCorsConfig owns the fixed body limit and reads one byte past
 	// it, so chunked requests remain bounded when ContentLength is absent or
 	// negative.
-	cfg, err := validateBucketCorsConfig(r.Body)
+	cfg, err := validateBucketCorsConfig(body)
 	if err != nil {
 		writeErrorResponse(ctx, w, corsConfigAPIError(ctx, err), r.URL)
 		return
@@ -82,6 +95,70 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 	writeSuccessResponseHeadersOnly(w)
 }
 
+// corsConfigBody returns the reader the configuration document is read from: the
+// request body, wrapped so that everything the client declared about the bytes it
+// is sending is verified while they are consumed.
+//
+// The verification cannot be left to authentication, because what each
+// authentication path installs differs and none of them covers everything:
+//
+//   - A SigV4 or presigned-SigV4 request reaches this handler with its body
+//     already replaced by a reader that verifies Content-MD5 and
+//     x-amz-content-sha256, installed by isReqAuthenticated. Such a body is not
+//     wrapped again - re-deriving the expected values from the headers would
+//     discard the ones a presigned request carries in its query string, and
+//     hashing the same bytes twice would be pure waste.
+//   - A SigV2 or presigned-SigV2 request reaches it with its body untouched.
+//     isReqAuthenticatedV2 verifies the signature and nothing else, and the V2
+//     signature covers the Content-MD5 header rather than the body, so a client's
+//     declared digest is authenticated while the bytes it describes are not. An
+//     on-path attacker can therefore replace the document and leave the signed
+//     digest in place unless the digest is checked here.
+//   - An anonymous request authorized by a bucket policy reaches it with its body
+//     untouched as well, since no signature was presented to install anything.
+//   - No authentication path installs x-amz-checksum-* verification for any
+//     signature version; handlers that accept one do it themselves.
+//
+// Verifying only what the client declared keeps this compatible with clients that
+// declare nothing: an absent Content-MD5, x-amz-content-sha256 and
+// x-amz-checksum-* leave the body unverified and accepted, which is what the SDKs
+// that send a CORS configuration without a digest rely on. A declared value that
+// cannot be parsed is refused here, and one that does not match the bytes is
+// refused by the read, each with the S3 error code that names it.
+func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCode) {
+	reader, verified := r.Body.(*hash.Reader)
+	if !verified {
+		clientETag, err := etag.FromContentMD5(r.Header)
+		if err != nil {
+			return nil, ErrInvalidDigest
+		}
+
+		// skipContentSha256Cksum decides whether the header carries a digest to
+		// verify at all, so the values S3 defines in its place - UNSIGNED-PAYLOAD
+		// and the streaming forms - are not mistaken for a malformed one.
+		var contentSHA256 []byte
+		if !skipContentSha256Cksum(r) {
+			contentSHA256, err = hex.DecodeString(r.Header.Get(xhttp.AmzContentSha256))
+			if err != nil || len(contentSHA256) == 0 {
+				return nil, ErrContentSHA256Mismatch
+			}
+		}
+
+		reader, err = hash.NewReader(ctx, r.Body, -1, clientETag.String(), hex.EncodeToString(contentSHA256), -1)
+		if err != nil {
+			return nil, toAPIErrorCode(ctx, err)
+		}
+	}
+
+	// The one verification no authentication path installs. AddChecksum also
+	// wires up the request trailer, so a checksum a client sends after the body
+	// is verified against the bytes rather than reported as missing.
+	if err := reader.AddChecksum(r, false); err != nil {
+		return nil, toAPIErrorCode(ctx, err)
+	}
+	return reader, ErrNone
+}
+
 // corsConfigAPIError maps a failure reported by validateBucketCorsConfig to the
 // S3 error the client is answered with.
 //
@@ -92,13 +169,13 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 // A body that could not be read did not fail to validate, and answering
 // MalformedXML for it would be wrong twice over: the client is told its XML is at
 // fault when it may be perfectly well-formed, and the real fault is hidden.
-// checkRequestAuthType replaces the body of an authenticated request with a
-// reader that verifies Content-MD5, x-amz-content-sha256 and any trailing
-// checksum while the document is consumed, so a mismatch surfaces from the read
-// and already has an S3 error code of its own - BadDigest,
-// XAmzContentSHA256Mismatch or XAmzContentChecksumMismatch. Such a failure is
-// therefore unwrapped and mapped like any other server error, which also keeps a
-// disconnecting client from being reported as having sent bad XML.
+// corsConfigBody hands the handler a body that verifies Content-MD5,
+// x-amz-content-sha256 and any x-amz-checksum-* the client declared while the
+// document is consumed, so a mismatch surfaces from the read and already has an
+// S3 error code of its own - BadDigest, XAmzContentSHA256Mismatch or
+// XAmzContentChecksumMismatch. Such a failure is therefore unwrapped and mapped
+// like any other server error, which also keeps a disconnecting client from being
+// reported as having sent bad XML.
 func corsConfigAPIError(ctx context.Context, err error) APIError {
 	var readErr corsConfigReadError
 	if errors.As(err, &readErr) {

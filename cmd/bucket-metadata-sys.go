@@ -52,19 +52,29 @@ type BucketMetadataSys struct {
 	group       *singleflight.Group
 	metadataMap map[string]BucketMetadata
 
-	// unavailableBuckets holds the buckets that are known to exist, because
-	// they were listed from the backend, but whose metadata could not be
-	// loaded, so nothing about their configuration is known.
+	// unavailableBuckets holds the buckets whose metadata this cache cannot
+	// vouch for, because the most recent attempt to load it failed. Whatever
+	// metadataMap holds for such a bucket - an entry from an earlier load, or
+	// no entry at all - is of unknown currency until a load succeeds again.
 	//
-	// Without it a bucket skipped by a failed load is indistinguishable from a
-	// bucket that does not exist: both are simply missing from metadataMap. A
-	// cache-only reader would then answer for such a bucket out of whatever
-	// default applies when no configuration is set, which for CORS means the
-	// permissive server-wide origin list, relaxing a restrictive bucket for as
-	// long as its metadata stays unreadable. An entry is added when a load
-	// fails and no metadata for the bucket is already in hand, and removed as
-	// soon as metadata for it reaches metadataMap or the bucket is gone, so the
-	// map only ever holds buckets whose answer is genuinely unknown.
+	// The distinction matters because a bucket whose metadata cannot be read is
+	// otherwise indistinguishable from a bucket that has no configuration: both
+	// answer "nothing set". A cache-only reader would then answer for it out of
+	// whatever default applies when no configuration is set, which for CORS
+	// means the permissive server-wide origin list, relaxing a restrictive
+	// bucket for as long as its metadata stays unreadable. Nor is an entry that
+	// is merely present enough to vouch for: a bucket whose owner has just
+	// tightened or removed its rules on another node keeps answering from the
+	// superseded copy if the reload this node was asked to perform failed, so
+	// an entry from before a failed load is treated as unknown rather than
+	// authoritative.
+	//
+	// An entry is therefore added on every failed load, whether or not metadata
+	// for the bucket is already in hand, and removed only once a load succeeds
+	// or the bucket's metadata is set or replaced outright - never merely
+	// because something is cached. Its growth is bounded by the set of buckets
+	// the backend reports, since only loads of listed buckets and reloads a
+	// peer asks for are recorded.
 	unavailableBuckets map[string]struct{}
 }
 
@@ -125,21 +135,21 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 	}
 }
 
-// markMetadataUnavailable records that the metadata of a bucket known to exist
-// could not be loaded, so that a cache-only reader can tell the bucket apart
-// from one that does not exist instead of answering for it out of a default it
-// may never have chosen.
+// markMetadataUnavailable records that the metadata of a bucket could not be
+// loaded, so that a cache-only reader can tell the bucket apart from one whose
+// configuration is genuinely known instead of answering for it out of a default
+// it may never have chosen.
 //
-// Metadata already in hand takes precedence: a load that fails for a bucket the
-// cache still holds leaves that bucket answerable from what it holds, so it is
-// not recorded as unavailable.
+// It is recorded unconditionally, including for a bucket whose metadata is
+// already in hand. An entry left by an earlier load says what the bucket's
+// configuration was, not what it is: the load that just failed is precisely the
+// one that would have told this node that the bucket's rules changed. Treating
+// that copy as authoritative is what would let a tightened or deleted
+// configuration keep being served from the copy it replaced.
 func (sys *BucketMetadataSys) markMetadataUnavailable(bucket string) {
 	sys.Lock()
 	defer sys.Unlock()
 
-	if _, ok := sys.metadataMap[bucket]; ok {
-		return
-	}
 	sys.unavailableBuckets[bucket] = struct{}{}
 }
 
@@ -444,12 +454,15 @@ func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config,
 //   - errBucketMetadataNotInitialized means the answer is simply not known yet,
 //     because the bucket is absent from a cache that has not finished loading.
 //     A caller must not read that as an absence.
-//   - errBucketMetadataUnavailable means the bucket is known to exist but its
-//     metadata could not be loaded, so the answer is not known and will not
-//     become known until a later load succeeds. A caller must not read that as
-//     an absence either.
+//   - errBucketMetadataUnavailable means the most recent attempt to load the
+//     bucket's metadata failed, so the answer is not known and will not become
+//     known until a later load succeeds. A caller must not read that as an
+//     absence either, and must not answer from any copy this cache still holds:
+//     that copy predates the load that failed, so it cannot show a change the
+//     failed load was meant to bring in.
 //
-// The three states are read under a single lock, so a bucket whose metadata
+// Unavailability is therefore decided before anything cached is consulted, and
+// all three states are read under a single lock, so a bucket whose metadata
 // arrives while this runs is never reported as definitively absent.
 func (sys *BucketMetadataSys) GetCORSConfigCached(bucket string) (*miniogocors.Config, time.Time, error) {
 	if isMinioMetaBucketName(bucket) {
@@ -463,12 +476,13 @@ func (sys *BucketMetadataSys) GetCORSConfigCached(bucket string) (*miniogocors.C
 	sys.RUnlock()
 
 	switch {
-	case loaded:
-		// The bucket's metadata is in hand; answer from it below.
-	case !initialized:
-		return nil, time.Time{}, errBucketMetadataNotInitialized
 	case unavailable:
 		return nil, time.Time{}, fmt.Errorf("bucket %s: %w", bucket, errBucketMetadataUnavailable)
+	case loaded:
+		// The bucket's metadata is in hand and no load has failed since it
+		// arrived; answer from it below.
+	case !initialized:
+		return nil, time.Time{}, errBucketMetadataNotInitialized
 	default:
 		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
 	}
@@ -668,13 +682,13 @@ func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []stri
 	for i, meta := range bucketMetas {
 		if errs[i] != nil {
 			// The bucket exists - it was listed from the backend - but its
-			// metadata could not be read, so it must not be left looking like a
-			// bucket that never existed once loading is declared finished.
-			// Remembering it keeps a cache-only reader from answering for it out
-			// of a default the bucket may never have chosen.
-			if _, ok := sys.metadataMap[buckets[i]]; !ok {
-				sys.unavailableBuckets[buckets[i]] = struct{}{}
-			}
+			// metadata could not be read, so nothing this cache holds for it is
+			// known to be current: it must not be left looking like a bucket
+			// that never existed once loading is declared finished, nor be
+			// answered for out of a copy an earlier load left behind.
+			// Remembering it keeps a cache-only reader from answering out of a
+			// default, or a superseded copy, the bucket may never have chosen.
+			sys.unavailableBuckets[buckets[i]] = struct{}{}
 			continue
 		}
 		sys.metadataMap[buckets[i]] = meta
@@ -728,9 +742,10 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 				if err != nil {
 					internalLogIf(ctx, err, logger.WarningKind)
 					// A refresh that cannot read a bucket leaves whatever
-					// metadata is already in hand in place; a bucket with none
-					// is remembered as unavailable rather than left
-					// indistinguishable from a bucket that does not exist.
+					// metadata is already in hand in place, but that copy is no
+					// longer known to be current - this refresh is exactly what
+					// would have brought in a change made elsewhere - so the
+					// bucket is remembered as unavailable until a load succeeds.
 					sys.markMetadataUnavailable(bucket)
 					wait() // wait to proceed to next entry.
 					continue
@@ -742,12 +757,10 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 					updated = true
 					sys.metadataMap[bucket] = meta
 				}
-				// Clear the pending state exactly when the bucket's metadata is
-				// in hand, whether this refresh installed it or an earlier load
-				// did.
-				if _, ok := sys.metadataMap[bucket]; ok {
-					delete(sys.unavailableBuckets, bucket)
-				}
+				// This refresh read the bucket, so whatever answer the cache now
+				// gives for it - the metadata just installed, or the copy already
+				// held that the read found no newer than itself - is current.
+				delete(sys.unavailableBuckets, bucket)
 				sys.Unlock()
 
 				if updated {

@@ -46,13 +46,37 @@ const (
 
 	maxBucketCORSRules = 100
 
+	// Most comparisons one preflight evaluation may perform before it is refused
+	// instead of completed.
+	//
+	// Evaluating a preflight compares every header it asks about against the
+	// AllowedHeader values of the rules whose origin and method match, so the
+	// work is the product of two lists a bucket owner and a client choose
+	// separately. Both are individually bounded - a stored document is at most
+	// maxBucketCORSConfigSize, which holds on the order of four thousand
+	// AllowedHeader values, and a request admitted by isHTTPHeaderSizeTooLarge
+	// carries at most eight kilobytes of headers, which names on the order of
+	// four thousand of them - but their product is on the order of sixteen
+	// million, and a preflight is unauthenticated, so nothing else stands between
+	// a client and that product being spent per request.
+	//
+	// This ceiling is an order of magnitude below that product and two orders
+	// above what any real preflight costs: a browser asks about a handful of
+	// headers, and even a request naming thirty-two of them against a document
+	// holding four thousand patterns spends an eighth of it. Exceeding it
+	// therefore says the evaluation is not one a browser would drive, and the
+	// request is refused - fail closed, since a request whose rules were never
+	// fully evaluated cannot be known to be allowed by them.
+	maxCORSPreflightMatchCost = 1 << 20
+
 	// Shortest interval between two reports that preflight requests are being
-	// refused because the bucket they name has CORS rules this layer cannot
-	// establish. The condition is reported so that an operator can tell it apart
-	// from a rule that simply did not match, and it is reported no more often
-	// than this because a preflight is unauthenticated: reporting every one of
-	// them would let whoever sends them decide how much a deployment logs.
-	corsPreflightUnavailableReportInterval = time.Minute
+	// refused for a reason other than the bucket's own rules - rules this layer
+	// cannot establish, or a request it will not evaluate at all. The reason is
+	// reported so that an operator can tell such a refusal apart from a rule that
+	// simply did not match, and it is reported no more often than this because a
+	// preflight is unauthenticated: reporting every one of them would let
+	// whoever sends them decide how much a deployment logs.
+	corsPreflightRefusalReportInterval = time.Minute
 
 	// corsConfigXMLNS is the XML namespace of every S3 CORS document. A client
 	// either omits the namespace, in which case the parser defaults it to this
@@ -99,14 +123,14 @@ var corsRuleElements = map[string]bool{
 // not be read to its end, as opposed to a document that was read and did not
 // validate. The distinction decides which S3 error the client is answered with.
 //
-// It matters because the body of an authenticated request is not a plain reader:
-// checkRequestAuthType replaces it with one that verifies Content-MD5,
-// x-amz-content-sha256 and any trailing checksum as the document is consumed, so
-// a digest that does not match what the client declared surfaces from the read
-// rather than from the document. Such a failure has its own S3 error code, which
-// tells the client exactly what to correct, and reporting it as a schema
-// violation would hide that behind a complaint about XML that was in fact
-// well-formed.
+// It matters because the body PutBucketCorsHandler hands over is not a plain
+// reader: corsConfigBody wraps it in one that verifies the Content-MD5,
+// x-amz-content-sha256 and x-amz-checksum-* values the client declared as the
+// document is consumed, so a digest that does not match what was declared
+// surfaces from the read rather than from the document. Such a failure has its
+// own S3 error code, which tells the client exactly what to correct, and
+// reporting it as a schema violation would hide that behind a complaint about XML
+// that was in fact well-formed.
 type corsConfigReadError struct {
 	cause error
 }
@@ -118,6 +142,35 @@ func (e corsConfigReadError) Error() string {
 // Unwrap exposes the underlying failure so that a caller can classify it, which
 // is what routes a digest or checksum mismatch to its own S3 error code.
 func (e corsConfigReadError) Unwrap() error { return e.cause }
+
+// errCORSPreflightHostNotAccepted is the reason reported when a preflight is
+// refused because its Host header is not one this server accepts, and so cannot
+// be attributed to a bucket the way the router would attribute it.
+//
+// It carries no part of the request. The Host is client chosen, unauthenticated
+// and only bounded by the maximum header size, and the parse failure it produces
+// quotes it back, so reporting that failure verbatim would put an arbitrary
+// client string into the server's log.
+var errCORSPreflightHostNotAccepted = errors.New(
+	"its Host header is not one this server accepts, so it could not be attributed to a bucket")
+
+// errCORSPreflightHeadersTooLarge is the reason reported when a preflight is
+// refused because it carries more header bytes than this server admits, which is
+// the same limit setRequestLimitMiddleware applies to every other request.
+//
+// It names no header and no size, because both come from the request.
+var errCORSPreflightHeadersTooLarge = errors.New(
+	"it carries more header bytes than this server admits")
+
+// errCORSPreflightEvaluationTooCostly is the reason reported when a preflight is
+// refused because evaluating it against the bucket's rules would cost more
+// comparisons than maxCORSPreflightMatchCost allows.
+//
+// It is the one refusal that says nothing about whether the rules allow the
+// request: they were never fully consulted, which is precisely why the request
+// cannot be allowed.
+var errCORSPreflightEvaluationTooCostly = errors.New(
+	"evaluating it against the bucket's CORS rules would cost more comparisons than this server performs for one preflight")
 
 // corsRuleElementOrder lists the child elements of a CORSRule in the order a
 // cardinality violation is reported, so a rule that repeats more than one
@@ -150,8 +203,8 @@ var corsRuleElementOrder = []string{
 //
 // A body that cannot be read to its end is reported as a corsConfigReadError
 // wrapping the reason, so that a caller can tell a failure of the transfer -
-// including the digest and checksum verification the authenticated body reader
-// performs - from a document that failed to validate.
+// including the digest and checksum verification corsConfigBody installs on the
+// body it hands over - from a document that failed to validate.
 func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 	// Reading one byte past the ceiling is what makes the limit provable: a
 	// document of exactly maxBucketCORSConfigSize bytes is still accepted,
@@ -572,25 +625,71 @@ func corsElementName(name xml.Name, space string) string {
 	return "{" + name.Space + "}" + name.Local
 }
 
+// corsMatchBudget bounds the comparisons one preflight evaluation performs, so
+// that the cost of answering a request a client chose freely is a cost this
+// server chose.
+//
+// It is spent across the whole evaluation rather than reset per rule, because
+// what has to be bounded is the work one request causes, and it is carried by
+// pointer so every rule the evaluation walks draws on the same allowance.
+type corsMatchBudget struct {
+	// remaining is how many comparisons are still allowed.
+	remaining int
+	// exhausted records that the allowance ran out. It is sticky: once the
+	// evaluation is incomplete, no later comparison can complete it, so the
+	// outcome is a refusal however the remaining predicates would have answered.
+	exhausted bool
+}
+
+// spend claims n comparisons, reporting whether the allowance covered them. A
+// caller that is refused must stop comparing and let the evaluation end: its
+// answer is no longer the one the rules give.
+func (b *corsMatchBudget) spend(n int) bool {
+	if b.exhausted {
+		return false
+	}
+	if b.remaining < n {
+		b.exhausted = true
+		return false
+	}
+	b.remaining -= n
+	return true
+}
+
 // corsRuleFor returns the first rule of cfg, in document order, that allows the
-// supplied origin, the requested method and every requested header. It returns
-// nil when no rule allows the request.
+// supplied origin, the requested method and every requested header. It returns a
+// nil rule and a nil error when the rules were fully evaluated and none of them
+// allows the request.
 //
 // S3 semantics are first matching rule wins: rules are never merged and never
-// reordered, so the returned rule alone determines the preflight response.
-func corsRuleFor(cfg *miniogocors.Config, origin, method string, reqHeaders []string) *miniogocors.Rule {
+// reordered, so the returned rule alone determines the preflight response. Every
+// rule is examined until one matches, and every requested header is compared
+// against a rule before that rule is accepted, because a rule that covers all but
+// one requested header does not allow the request.
+//
+// The evaluation is bounded by maxCORSPreflightMatchCost, since its cost is the
+// product of a list the bucket owner chose and a list the client chose. Exceeding
+// the bound returns errCORSPreflightEvaluationTooCostly rather than "no rule
+// matched": the two lead to the same answer on the wire, but only the second is
+// something the bucket's rules actually say, and the first is worth reporting.
+func corsRuleFor(cfg *miniogocors.Config, origin, method string, reqHeaders []string) (*miniogocors.Rule, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
+	budget := &corsMatchBudget{remaining: maxCORSPreflightMatchCost}
 	for i := range cfg.CORSRules {
 		rule := &cfg.CORSRules[i]
-		if corsRuleAllowsOrigin(rule, origin) &&
-			corsRuleAllowsMethod(rule, method) &&
-			corsRuleAllowsHeaders(rule, reqHeaders) {
-			return rule
+		matched := corsRuleAllowsOrigin(rule, origin, budget) &&
+			corsRuleAllowsMethod(rule, method, budget) &&
+			corsRuleAllowsHeaders(rule, reqHeaders, budget)
+		if budget.exhausted {
+			return nil, errCORSPreflightEvaluationTooCostly
+		}
+		if matched {
+			return rule, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // corsWildcardMatch reports whether name satisfies pattern under the pattern
@@ -629,8 +728,14 @@ func corsWildcardMatch(pattern, name string) bool {
 // request origin. An origin matches when it is equal to the configured value or
 // when it satisfies the single wildcard S3 permits, so a bare "*" covers every
 // origin and "http://www.example2.*" covers every origin with that prefix.
-func corsRuleAllowsOrigin(rule *miniogocors.Rule, origin string) bool {
+//
+// Each configured value examined costs one comparison from budget, so a document
+// that lists a great many of them cannot be walked for free.
+func corsRuleAllowsOrigin(rule *miniogocors.Rule, origin string, budget *corsMatchBudget) bool {
 	for _, allowedOrigin := range rule.AllowedOrigin {
+		if !budget.spend(1) {
+			return false
+		}
 		if corsWildcardMatch(allowedOrigin, origin) {
 			return true
 		}
@@ -640,9 +745,12 @@ func corsRuleAllowsOrigin(rule *miniogocors.Rule, origin string) bool {
 
 // corsRuleAllowsMethod reports whether the rule contains the requested method.
 // Case-insensitive comparison also supports configurations constructed without
-// parser normalization.
-func corsRuleAllowsMethod(rule *miniogocors.Rule, method string) bool {
+// parser normalization. Each value examined costs one comparison from budget.
+func corsRuleAllowsMethod(rule *miniogocors.Rule, method string, budget *corsMatchBudget) bool {
 	for _, allowedMethod := range rule.AllowedMethod {
+		if !budget.spend(1) {
+			return false
+		}
 		if strings.EqualFold(allowedMethod, method) {
 			return true
 		}
@@ -658,15 +766,24 @@ func corsRuleAllowsMethod(rule *miniogocors.Rule, method string) bool {
 // Every requested header is evaluated, however many there are, because a rule
 // that covers all but one of them does not allow the request. The rule's
 // AllowedHeader values are indexed once here rather than rescanned for each
-// requested header, so the comparison costs one pass over each of the two lists
-// instead of a pass over their product.
-func corsRuleAllowsHeaders(rule *miniogocors.Rule, reqHeaders []string) bool {
+// requested header, so a header the rule names literally costs a single map
+// lookup no matter how many values the rule lists.
+//
+// What that index cannot flatten is a rule listing wildcard patterns: those have
+// to be compared one by one, so the cost of the pairing is the product of the two
+// lists. That product is what budget bounds, and running out of it refuses the
+// request rather than reporting the rule as not matching, because a header list
+// that was not compared in full says nothing about whether the rule covers it.
+func corsRuleAllowsHeaders(rule *miniogocors.Rule, reqHeaders []string, budget *corsMatchBudget) bool {
 	if len(reqHeaders) == 0 {
 		return true
 	}
-	allowed := newCORSHeaderMatcher(rule.AllowedHeader)
+	allowed, ok := newCORSHeaderMatcher(rule.AllowedHeader, budget)
+	if !ok {
+		return false
+	}
 	for _, reqHeader := range reqHeaders {
-		if !allowed.allows(reqHeader) {
+		if !allowed.allows(reqHeader, budget) {
 			return false
 		}
 	}
@@ -694,11 +811,20 @@ type corsHeaderMatcher struct {
 // lookups. The values are lower-cased once, here, so that the case-insensitive
 // comparison does not have to re-fold the same configured value for every
 // requested header.
-func newCORSHeaderMatcher(allowedHeaders []string) corsHeaderMatcher {
+//
+// Indexing one value costs one comparison from budget, since a rule may list as
+// many of them as a stored document holds. It reports false when the allowance
+// ran out, in which case the matcher it returns must not be used: it indexes only
+// a prefix of the rule's values and would answer for the rest as though the rule
+// did not list them.
+func newCORSHeaderMatcher(allowedHeaders []string, budget *corsMatchBudget) (corsHeaderMatcher, bool) {
 	matcher := corsHeaderMatcher{}
 	for _, allowedHeader := range allowedHeaders {
+		if !budget.spend(1) {
+			return corsHeaderMatcher{}, false
+		}
 		if allowedHeader == "*" {
-			return corsHeaderMatcher{all: true}
+			return corsHeaderMatcher{all: true}, true
 		}
 		lowerAllowedHeader := strings.ToLower(allowedHeader)
 		if strings.IndexByte(lowerAllowedHeader, '*') >= 0 {
@@ -710,13 +836,21 @@ func newCORSHeaderMatcher(allowedHeaders []string) corsHeaderMatcher {
 		}
 		matcher.exact[lowerAllowedHeader] = struct{}{}
 	}
-	return matcher
+	return matcher, true
 }
 
 // allows reports whether a single requested header is covered.
-func (m corsHeaderMatcher) allows(reqHeader string) bool {
+//
+// The map lookup costs one comparison from budget and each wildcard pattern
+// compared costs one more, so the allowance is drawn down in proportion to the
+// work actually performed. Running out reports the header as not covered, which
+// the caller turns into a refusal rather than a verdict of the rules.
+func (m corsHeaderMatcher) allows(reqHeader string, budget *corsMatchBudget) bool {
 	if m.all {
 		return true
+	}
+	if !budget.spend(1) {
+		return false
 	}
 	// Lower-casing the requested name makes the comparison case-insensitive for
 	// the literal parts of a pattern as well as for a plain header name, so no
@@ -726,6 +860,9 @@ func (m corsHeaderMatcher) allows(reqHeader string) bool {
 		return true
 	}
 	for _, pattern := range m.patterns {
+		if !budget.spend(1) {
+			return false
+		}
 		if corsWildcardMatch(pattern, lowerReqHeader) {
 			return true
 		}
@@ -747,20 +884,22 @@ func (m corsHeaderMatcher) allows(reqHeader string) bool {
 //
 //   - Delegated, which keeps the server-wide MINIO_API_CORS_ALLOW_ORIGIN setting
 //     in force for it: the request is not a preflight, carries no origin to echo
-//     back, names no syntactically valid bucket, or names a bucket that
-//     definitively has no CORS configuration of its own. That definitive absence
-//     is the only lookup outcome the fallback rests on.
+//     back, addresses the server root, names no syntactically valid bucket, or
+//     names a bucket that definitively has no CORS configuration of its own. That
+//     definitive absence is the only lookup outcome the fallback rests on.
 //   - Allowed, on the first rule that matches: HTTP 200 with the CORS response
 //     headers that rule configures.
 //   - Denied, HTTP 200 carrying no Access-Control-Allow-* header, which is how a
 //     browser learns the request is refused: the bucket has rules and none of
-//     them allows this request, or the bucket's own rules cannot be established
-//     at all. Rules that are merely unavailable - an absent or still loading
+//     them allows this request, or this layer will not answer for the request at
+//     all. Rules that are merely unavailable - an absent or still loading
 //     metadata subsystem, a bucket whose metadata could not be loaded, an
 //     unusable stored document, a failed lookup - are refused rather than
 //     delegated, because the server-wide default allows every origin with
 //     credentials and would relax a restrictive bucket for as long as they stay
-//     unavailable.
+//     unavailable. So is a request the server itself would refuse outright, for
+//     the same reason: delegating it would answer a request that never reaches a
+//     bucket handler out of the most permissive setting the server has.
 func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match the rs/cors preflight gate, plus the Origin that a matched rule
@@ -777,6 +916,36 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// A request carrying more header bytes than this server admits is refused
+		// here for the same reason a Host it does not accept is, just below:
+		// setRequestLimitMiddleware answers HTTP 413 for it, so the request this
+		// preflight asks about could never be served, and delegating the
+		// preflight would answer it out of the most permissive setting the server
+		// has. Checking it before anything else is read from the headers is also
+		// what bounds every step that follows, since the lists this layer parses
+		// and compares are the ones those bytes carry.
+		if isHTTPHeaderSizeTooLarge(r.Header) {
+			corsPreflightRefused.report(errCORSPreflightHeadersTooLarge)
+			writeCORSPreflightDenied(w)
+			return
+		}
+
+		// A Host this server does not accept is refused here, because it is
+		// refused everywhere else: setRequestValidityMiddleware answers HTTP 400
+		// for it before any bucket handler runs, so the request this preflight
+		// asks about could never be served. Delegating it instead would answer
+		// the one request the server does respond to - the preflight - out of the
+		// most permissive setting the server has, and the router does still route
+		// such a request, so the bucket it would have reached may well have
+		// restrictive rules of its own. hasBadHost is the very check that
+		// middleware applies, including its allowance for an empty Host under
+		// CI/CD, so the two layers agree by construction.
+		if hasBadHost(r.Host) != nil {
+			corsPreflightRefused.report(errCORSPreflightHostNotAccepted)
+			writeCORSPreflightDenied(w)
+			return
+		}
+
 		// Resolve the target bucket the same way the rest of the server does,
 		// so both path-style and virtual-host-style addressing are handled:
 		// getResource turns a virtual-host-style Host into a path-style
@@ -785,16 +954,23 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		// These are the two halves of request2BucketObjectName, spelled out
 		// rather than called through it, because that wrapper reports a Host it
 		// cannot parse through logger.CriticalIf, which panics - and the Host
-		// here is client controlled and unauthenticated. A Host that does not
-		// parse identifies no bucket, and neither does a preflight for the
-		// server root, so both are delegated.
+		// here is client controlled and unauthenticated.
 		resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
 		if err != nil {
-			next.ServeHTTP(w, r)
-			return
+			// The only Host getResource rejects is one hasBadHost rejects too,
+			// so reaching this is the empty Host that check allows under CI/CD
+			// while virtual-host-style addressing is configured. An empty Host
+			// names no virtual host, so the router resolves such a request
+			// path-style off the request path, and so does this: the bucket
+			// evaluated here stays the bucket the request would reach, which is
+			// the whole point of resolving it the same way.
+			resource = r.URL.Path
 		}
 		bucket, _ := path2BucketObject(resource)
 		if bucket == "" {
+			// A preflight for the server root names no bucket, so there are no
+			// per-bucket rules to apply and the server-wide setting answers it,
+			// exactly as it did before this layer existed.
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -839,17 +1015,31 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 			// which say the request was evaluated against the bucket's rules and
 			// not allowed by them, so the reason for this one is reported - at a
 			// bounded rate, and carrying nothing the unauthenticated request
-			// brought with it.
-			corsPreflightUnavailable.report(bucket, err)
+			// brought with it beyond the bucket name validated just above.
+			corsPreflightRefused.report(fmt.Errorf(
+				"the CORS configuration of bucket %s could not be established: %w", bucket, err))
 			writeCORSPreflightDenied(w)
 			return
 		}
 
 		reqHeaders := parseCORSRequestHeaders(r.Header)
 
-		rule := corsRuleFor(cfg, origin, reqMethod, reqHeaders)
-		if rule == nil {
-			// The bucket has rules but none of them allows this request.
+		rule, err := corsRuleFor(cfg, origin, reqMethod, reqHeaders)
+		switch {
+		case err != nil:
+			// The rules could not be evaluated in full, so whether they allow
+			// the request is unknown and the request is refused. Like the
+			// refusals above this says something about how this request was
+			// handled rather than what the bucket's rules say, so it is
+			// reported at the same bounded rate, naming only the validated
+			// bucket.
+			corsPreflightRefused.report(fmt.Errorf("for bucket %s, %w", bucket, err))
+			writeCORSPreflightDenied(w)
+			return
+		case rule == nil:
+			// The bucket has rules, they were evaluated in full, and none of
+			// them allows this request. That is the configuration working as
+			// written, so it is not reported.
 			writeCORSPreflightDenied(w)
 			return
 		}
@@ -922,34 +1112,39 @@ func preflightCORSConfig(bucket string) (*miniogocors.Config, error) {
 // wrapped, and recognizes nothing else. In particular neither
 // errBucketMetadataNotInitialized, which GetCORSConfigCached returns for a bucket
 // missing from a cache that has not finished loading, nor
-// errBucketMetadataUnavailable, which it returns for a bucket that exists but
-// whose metadata could not be loaded, is an absence - both are answers that are
-// not known yet.
+// errBucketMetadataUnavailable, which it returns for a bucket whose metadata
+// could not be loaded on the most recent attempt and so has nothing left that is
+// known to be current, is an absence - both are answers that are not known yet.
 func isBucketCORSConfigNotFound(err error) bool {
 	var notFound BucketCORSConfigNotFound
 	return errors.As(err, &notFound)
 }
 
-// corsPreflightUnavailableReporter reports that preflight requests are being
-// refused because the bucket they name has CORS rules this layer cannot
-// establish, at a rate that does not depend on how many such requests arrive.
+// corsPreflightRefusalReporter reports that preflight requests are being refused
+// for a reason other than the bucket's own rules, at a rate that does not depend
+// on how many such requests arrive.
 //
 // The refusal is deliberately indistinguishable on the wire from the one a rule
 // that did not match produces - both are a preflight response carrying no
 // Access-Control-Allow-* header - and a preflight is answered ahead of the
 // router, so none of the per-request audit, trace or metric plumbing covers it.
 // Without a report the two are indistinguishable to an operator as well, and the
-// one that means this deployment cannot read its own bucket metadata is the one
-// worth acting on.
+// ones that say this deployment cannot read its own bucket metadata, or that a
+// request was turned away before its rules were consulted, are the ones worth
+// acting on.
+//
+// Every such reason shares this one reporter, and therefore one rate limit,
+// because they are all reachable by an unauthenticated request and a client that
+// could pick between them could otherwise multiply the volume a deployment logs
+// by choosing several.
 //
 // The report is rate limited rather than emitted per request because a preflight
 // carries no credentials, so its rate is chosen by whoever sends it. Both the
 // state kept here and the volume emitted are therefore fixed, whatever arrives:
-// one counter, and at most one report per
-// corsPreflightUnavailableReportInterval. The number of refusals that went
-// unreported travels with the next report, so the condition never reads as rarer
-// than it is.
-type corsPreflightUnavailableReporter struct {
+// one counter, and at most one report per corsPreflightRefusalReportInterval. The
+// number of refusals that went unreported travels with the next report, so the
+// condition never reads as rarer than it is.
+type corsPreflightRefusalReporter struct {
 	mu sync.Mutex
 	// reportedAt is when the last report was emitted. The zero value means none
 	// has been, which is what makes the first refusal report immediately.
@@ -958,47 +1153,52 @@ type corsPreflightUnavailableReporter struct {
 	unreported uint64
 }
 
-// corsPreflightUnavailable reports the condition for the running server. It is
-// held as a pointer so that a test can install a reporter of its own without
-// copying a mutex.
-var corsPreflightUnavailable = &corsPreflightUnavailableReporter{}
+// corsPreflightRefused reports the condition for the running server. It is held
+// as a pointer so that a test can install a reporter of its own without copying
+// a mutex.
+var corsPreflightRefused = &corsPreflightRefusalReporter{}
 
-// report records that a preflight naming bucket was refused because cause
-// prevented that bucket's own CORS rules from being established, and emits a
-// diagnostic when one is due.
+// report records that a preflight request was refused because of reason, and
+// emits a diagnostic when one is due.
 //
-// Only server authored text reaches the log: the cause, which this package and
-// the bucket metadata layer produce, and the bucket name, which the caller has
-// already validated as a bucket name and which is therefore bounded in both
-// length and alphabet. Nothing else the request carries is logged - not the
-// origin, not the headers it asks about, not the Host it was addressed to -
-// because the request is unauthenticated and every one of those values is chosen
-// by the client.
-func (r *corsPreflightUnavailableReporter) report(bucket string, cause error) {
+// Only server authored text may reach the log, so a caller composes reason from
+// errors this package and the bucket metadata layer produce, and interpolates
+// nothing the request carried except a bucket name it has already validated as
+// one - which is therefore bounded in both length and alphabet. Nothing else is
+// ever logged - not the origin, not the headers the request asks about, not the
+// Host it was addressed to - because the request is unauthenticated and every one
+// of those values is chosen by the client.
+func (r *corsPreflightRefusalReporter) report(reason error) {
 	unreported, due := r.due(time.Now())
 	if !due {
 		return
 	}
 
-	err := fmt.Errorf("Refused a CORS preflight request for bucket %s, its CORS configuration could not be established: %w",
-		bucket, cause)
-	if unreported > 0 {
-		err = fmt.Errorf("%w (%d further refusal(s) went unreported since the previous report)", err, unreported)
-	}
 	// A warning, and not an audit entry: the condition describes the state of
 	// this server rather than the outcome of an authenticated operation, and the
 	// preflight it refused reaches no audit path to begin with.
-	internalLogIf(GlobalContext, err, logger.WarningKind)
+	internalLogIf(GlobalContext, corsPreflightRefusalReport(reason, unreported), logger.WarningKind)
+}
+
+// corsPreflightRefusalReport composes the diagnostic a report emits, carrying the
+// reason and however many refusals went unreported before it, so that the
+// condition never reads as rarer than it is.
+func corsPreflightRefusalReport(reason error, unreported uint64) error {
+	err := fmt.Errorf("Refused a CORS preflight request: %w", reason)
+	if unreported > 0 {
+		err = fmt.Errorf("%w (%d further refusal(s) went unreported since the previous report)", err, unreported)
+	}
+	return err
 }
 
 // due reports whether a refusal observed at now is to be reported, together with
 // how many refusals went unreported since the previous report. A refusal that is
 // not reported is counted instead, so nothing about it is lost but its timing.
-func (r *corsPreflightUnavailableReporter) due(now time.Time) (unreported uint64, report bool) {
+func (r *corsPreflightRefusalReporter) due(now time.Time) (unreported uint64, report bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.reportedAt.IsZero() && now.Sub(r.reportedAt) < corsPreflightUnavailableReportInterval {
+	if !r.reportedAt.IsZero() && now.Sub(r.reportedAt) < corsPreflightRefusalReportInterval {
 		r.unreported++
 		return 0, false
 	}
@@ -1039,9 +1239,14 @@ func writeCORSPreflightDenied(w http.ResponseWriter) {
 // The complete list is always returned, however long it is, because a rule only
 // matches when it covers every header the request asks about and a header that
 // was never compared against the rules cannot be known to be covered. Nothing
-// about the length is refused here: the request has already been bounded by the
-// server's maximum header size, and the matcher evaluates the list in one pass
-// over it.
+// about the length is refused here, and nothing needs to be: the caller admits
+// only requests that carry no more header bytes than isHTTPHeaderSizeTooLarge
+// allows, which caps this list at a few thousand names however they are spread
+// across repeated fields, and the cost of comparing them against the rules is
+// bounded separately by maxCORSPreflightMatchCost. Both of those bounds are the
+// caller's to apply, so passing an unbounded header here is a programming error
+// rather than something to be silently truncated - truncating would drop names
+// that a rule then would not have to cover.
 func parseCORSRequestHeaders(h http.Header) []string {
 	values := h.Values("Access-Control-Request-Headers")
 	if len(values) == 0 {

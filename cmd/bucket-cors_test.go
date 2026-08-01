@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -1311,17 +1312,17 @@ func TestValidateBucketCorsConfigNormalizesValues(t *testing.T) {
 	})
 
 	t.Run("theRuleMatchesThePreflightItWasWrittenFor", func(t *testing.T) {
-		rule := corsRuleFor(cfg, "https://app.example.com", http.MethodGet, []string{"x-amz-acl"})
+		rule := mustCORSRuleFor(t, cfg, "https://app.example.com", http.MethodGet, []string{"x-amz-acl"})
 		if rule == nil {
 			t.Fatal("expected the trimmed rule to match the preflight request it allows")
 		}
 		if rule.MaxAgeSeconds != want.MaxAgeSeconds {
 			t.Errorf("expected MaxAgeSeconds %d, got %d", want.MaxAgeSeconds, rule.MaxAgeSeconds)
 		}
-		if second := corsRuleFor(cfg, "https://admin.example.com", http.MethodPut, nil); second == nil {
+		if second := mustCORSRuleFor(t, cfg, "https://admin.example.com", http.MethodPut, nil); second == nil {
 			t.Error("expected the second trimmed origin and method to match as well")
 		}
-		if denied := corsRuleFor(cfg, "https://evil.example.com", http.MethodGet, nil); denied != nil {
+		if denied := mustCORSRuleFor(t, cfg, "https://evil.example.com", http.MethodGet, nil); denied != nil {
 			t.Error("expected an origin the document does not name to match no rule")
 		}
 	})
@@ -2010,7 +2011,7 @@ func TestCorsRuleFor(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := corsRuleFor(tc.cfg, tc.origin, tc.method, tc.reqHeaders)
+			rule := mustCORSRuleFor(t, tc.cfg, tc.origin, tc.method, tc.reqHeaders)
 
 			if tc.wantRuleID == "" {
 				if rule != nil {
@@ -2183,7 +2184,7 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 			AllowedMethod: []string{http.MethodPut},
 			AllowedOrigin: []string{origin},
 		})
-		if rule := corsRuleFor(covering, origin, http.MethodPut, reqHeaders); rule == nil {
+		if rule := mustCORSRuleFor(t, covering, origin, http.MethodPut, reqHeaders); rule == nil {
 			t.Errorf("expected the rule covering every header of %v to match", reqHeaders)
 		}
 
@@ -2193,7 +2194,7 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 			AllowedMethod: []string{http.MethodPut},
 			AllowedOrigin: []string{origin},
 		})
-		if rule := corsRuleFor(partial, origin, http.MethodPut, reqHeaders); rule != nil {
+		if rule := mustCORSRuleFor(t, partial, origin, http.MethodPut, reqHeaders); rule != nil {
 			t.Errorf("expected no match when %v is only partially covered, got rule %q", reqHeaders, rule.ID)
 		}
 	})
@@ -2224,19 +2225,294 @@ func TestCorsRequestHeadersUnion(t *testing.T) {
 		}
 
 		wildcard := rule("wildcard", []string{"x-blitzy-*"})
-		if matched := corsRuleFor(wildcard, origin, http.MethodPut, reqHeaders); matched == nil {
+		if matched := mustCORSRuleFor(t, wildcard, origin, http.MethodPut, reqHeaders); matched == nil {
 			t.Errorf("expected a wildcard AllowedHeader to cover all %d requested headers", count)
 		}
 
 		enumerated := rule("enumerated", slices.Clone(reqHeaders))
-		if matched := corsRuleFor(enumerated, origin, http.MethodPut, reqHeaders); matched == nil {
+		if matched := mustCORSRuleFor(t, enumerated, origin, http.MethodPut, reqHeaders); matched == nil {
 			t.Errorf("expected %d enumerated AllowedHeader values to cover all %d requested headers", count, count)
 		}
 
 		short := rule("one-short", slices.Clone(reqHeaders[:count-1]))
-		if matched := corsRuleFor(short, origin, http.MethodPut, reqHeaders); matched != nil {
+		if matched := mustCORSRuleFor(t, short, origin, http.MethodPut, reqHeaders); matched != nil {
 			t.Errorf("expected no match when the last of %d requested headers is uncovered, got rule %q",
 				count, matched.ID)
+		}
+	})
+}
+
+// mustCORSRuleFor evaluates a preflight against a configuration and fails the
+// test if the evaluation could not be completed.
+//
+// Every ordinary matcher assertion goes through it, so each one also asserts that
+// the evaluation budget was not a factor: a configuration and a header list of
+// the shapes real clients and real bucket owners produce must always be evaluated
+// in full, and a bound that refused any of them would be a bound set too low. The
+// cases that deliberately exceed it call corsRuleFor directly.
+func mustCORSRuleFor(t *testing.T, cfg *miniogocors.Config, origin, method string, reqHeaders []string) *miniogocors.Rule {
+	t.Helper()
+
+	rule, err := corsRuleFor(cfg, origin, method, reqHeaders)
+	if err != nil {
+		t.Fatalf("evaluating %d requested header(s) against the configuration must complete, got error: %v",
+			len(reqHeaders), err)
+	}
+	return rule
+}
+
+// TestCorsMatchBudget pins the accounting the bounded evaluation rests on.
+//
+// The allowance is spent across a whole evaluation rather than per rule, and
+// exhaustion is sticky, because an evaluation that stopped comparing cannot be
+// resumed into a verdict: whatever the remaining predicates would have answered,
+// the rules were not fully consulted.
+func TestCorsMatchBudget(t *testing.T) {
+	t.Run("spendsDownToZeroAndThenRefuses", func(t *testing.T) {
+		budget := &corsMatchBudget{remaining: 3}
+
+		for i := range 3 {
+			if !budget.spend(1) {
+				t.Fatalf("expected comparison %d of 3 to be covered by the allowance", i)
+			}
+			if budget.exhausted {
+				t.Fatalf("expected the allowance not to be exhausted after %d of 3 comparisons", i+1)
+			}
+		}
+		if budget.spend(1) {
+			t.Fatal("expected the comparison past the allowance to be refused")
+		}
+		if !budget.exhausted {
+			t.Fatal("expected the refused comparison to mark the allowance exhausted")
+		}
+		if budget.remaining != 0 {
+			t.Fatalf("expected no allowance to remain, got %d", budget.remaining)
+		}
+	})
+
+	// Sticky, so a later cheap comparison cannot make an incomplete evaluation
+	// look complete.
+	t.Run("exhaustionIsSticky", func(t *testing.T) {
+		budget := &corsMatchBudget{remaining: 1}
+
+		if budget.spend(2) {
+			t.Fatal("expected a claim larger than the allowance to be refused")
+		}
+		if budget.spend(0) {
+			t.Fatal("expected an exhausted allowance to refuse even a free claim")
+		}
+		if !budget.exhausted {
+			t.Fatal("expected exhaustion to persist")
+		}
+	})
+
+	// The production allowance has to sit far above what a real preflight costs
+	// and far below the product it exists to bound, or it would either refuse
+	// legitimate requests or fail to bound anything.
+	t.Run("theProductionAllowanceLeavesRoomForRealRequests", func(t *testing.T) {
+		// A generous real request: a browser asks about a handful of headers,
+		// so thirty-two of them against a document packed with patterns is
+		// already far beyond anything observed.
+		const generousRealCost = 32 * 4096
+		if maxCORSPreflightMatchCost <= generousRealCost {
+			t.Fatalf("expected the allowance to exceed a generous real evaluation of %d comparisons, it is %d",
+				generousRealCost, maxCORSPreflightMatchCost)
+		}
+		// The product the bound exists to cut down: the widest header list an
+		// admitted request can name against the most patterns a stored document
+		// can hold.
+		const adversarialCost = 4096 * 4096
+		if maxCORSPreflightMatchCost >= adversarialCost {
+			t.Fatalf("expected the allowance to be well below the adversarial product of %d comparisons, it is %d",
+				adversarialCost, maxCORSPreflightMatchCost)
+		}
+	})
+}
+
+// TestCorsRuleForBoundedWork pins that evaluating a preflight costs at most the
+// allowance, whatever a bucket owner stored and whatever a client asks about.
+//
+// The two lists whose product decides the cost are chosen separately: the bucket
+// owner fills a stored document with wildcard AllowedHeader patterns, which no
+// index can flatten, and an unauthenticated client names as many headers as the
+// server's header limit admits. Neither is illegitimate on its own, and nothing
+// authenticates the request that pairs them, so the pairing has to be bounded or a
+// single request buys hundreds of millions of comparisons.
+func TestCorsRuleForBoundedWork(t *testing.T) {
+	const origin = "https://www.example1.com"
+
+	requested := func(count int) []string {
+		names := make([]string, 0, count)
+		for i := range count {
+			names = append(names, fmt.Sprintf("x-amz-blitzy-%d", i))
+		}
+		return names
+	}
+
+	// The costliest AllowedHeader list a stored document can express: decoy
+	// wildcard patterns that match nothing the request asks about, followed by one
+	// that covers all of it.
+	//
+	// The trailing pattern is what makes the list expensive rather than merely
+	// long. A rule stops being evaluated at the first requested header it does not
+	// cover, so a list of decoys alone is abandoned after one header; a list whose
+	// last entry covers every header instead forces each of them through every
+	// decoy before matching. That is the product the allowance exists to bound,
+	// and it is a document a bucket owner can legitimately store.
+	patterns := func(decoys int) []string {
+		values := make([]string, 0, decoys+1)
+		for i := range decoys {
+			values = append(values, fmt.Sprintf("x-never-%d-*", i))
+		}
+		return append(values, "x-amz-blitzy-*")
+	}
+
+	t.Run("anEvaluationWithinTheAllowanceCompletes", func(t *testing.T) {
+		// 64 requested headers, each compared against 4096 decoys before the
+		// covering pattern: roughly 262144 comparisons, a quarter of the
+		// allowance. It is not a request a browser makes, yet it is answered
+		// rather than refused, which is what keeps the bound from deciding
+		// ordinary outcomes.
+		cfg := corsTestConfig(miniogocors.Rule{
+			ID:            "costly-but-affordable",
+			AllowedHeader: patterns(4096),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		})
+
+		rule, err := corsRuleFor(cfg, origin, http.MethodPut, requested(64))
+		if err != nil {
+			t.Fatalf("expected an evaluation within the allowance to complete, got error: %v", err)
+		}
+		if rule == nil {
+			t.Fatal("expected the covering pattern to allow the request")
+		}
+	})
+
+	t.Run("anEvaluationBeyondTheAllowanceIsRefused", func(t *testing.T) {
+		// 4096 decoys against 4096 requested headers is roughly sixteen million
+		// comparisons, sixteen times the allowance - and the covering pattern
+		// means every one of them is performed before a verdict is reached.
+		cfg := corsTestConfig(miniogocors.Rule{
+			ID:            "unaffordable",
+			AllowedHeader: patterns(4096),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		})
+
+		rule, err := corsRuleFor(cfg, origin, http.MethodPut, requested(4096))
+		if !errors.Is(err, errCORSPreflightEvaluationTooCostly) {
+			t.Fatalf("expected %v, got %v", errCORSPreflightEvaluationTooCostly, err)
+		}
+		// Refusing is fail-closed: no rule is returned, so no allow header can
+		// be produced from one - even though this rule would have matched had the
+		// evaluation been allowed to finish.
+		if rule != nil {
+			t.Fatalf("expected a refused evaluation to return no rule, got %q", rule.ID)
+		}
+	})
+
+	// The allowance is spent across the whole document rather than per rule, so
+	// spreading the same patterns over the hundred rules a document may hold buys
+	// no more work than packing them into one.
+	t.Run("theAllowanceIsNotResetPerRule", func(t *testing.T) {
+		const decoysPerRule = 4096 / maxBucketCORSRules
+
+		rules := make([]miniogocors.Rule, 0, maxBucketCORSRules)
+		for i := range maxBucketCORSRules {
+			rules = append(rules, miniogocors.Rule{
+				ID:            fmt.Sprintf("rule-%d", i),
+				AllowedHeader: patterns(decoysPerRule),
+				AllowedMethod: []string{http.MethodPut},
+				// Only the last rule's origin matches, so every rule before it
+				// is walked and the header comparisons of the matching one are
+				// reached with the allowance already drawn down.
+				AllowedOrigin: []string{"https://www.example9.com"},
+			})
+		}
+		rules[len(rules)-1].AllowedOrigin = []string{origin}
+		cfg := corsTestConfig(rules...)
+
+		// Reachable at all: the same document answers a modest request.
+		if _, err := corsRuleFor(cfg, origin, http.MethodPut, requested(8)); err != nil {
+			t.Fatalf("expected a modest request against the spread document to complete, got error: %v", err)
+		}
+
+		// Twelve rules' worth of patterns is already enough to exceed the
+		// allowance when paired with the widest admissible header list, and it
+		// is refused whether they sit in one rule or in many.
+		wide := make([]miniogocors.Rule, 0, 12)
+		for i := range 12 {
+			wide = append(wide, miniogocors.Rule{
+				ID:            fmt.Sprintf("wide-%d", i),
+				AllowedHeader: patterns(4096 / 12),
+				AllowedMethod: []string{http.MethodPut},
+				AllowedOrigin: []string{origin},
+			})
+		}
+		if _, err := corsRuleFor(corsTestConfig(wide...), origin, http.MethodPut, requested(4096)); !errors.Is(err, errCORSPreflightEvaluationTooCostly) {
+			t.Fatalf("expected patterns spread over rules to draw on the same allowance, got %v", err)
+		}
+	})
+
+	// The refusal must not depend on reaching the last rule: an evaluation whose
+	// very first rule is unaffordable is refused on that rule, rather than
+	// walking the rest of the document reporting each as a non-match.
+	t.Run("theFirstUnaffordableRuleEndsTheEvaluation", func(t *testing.T) {
+		matching := miniogocors.Rule{
+			ID:            "would-have-matched",
+			AllowedHeader: []string{"*"},
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		}
+		costly := miniogocors.Rule{
+			ID:            "unaffordable",
+			AllowedHeader: patterns(4096),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		}
+
+		// The costly rule comes first, so first-matching-rule-wins reaches it
+		// before the rule that would have allowed the request. The evaluation is
+		// refused rather than falling through to that rule, because a document
+		// this expensive cannot be evaluated in the order S3 requires.
+		cfg := corsTestConfig(costly, matching)
+		if _, err := corsRuleFor(cfg, origin, http.MethodPut, requested(4096)); !errors.Is(err, errCORSPreflightEvaluationTooCostly) {
+			t.Fatalf("expected the unaffordable first rule to refuse the evaluation, got %v", err)
+		}
+
+		// With the matching rule first, the same request is allowed by it before
+		// any of the expensive comparisons is reached, so document order decides
+		// the cost as well as the outcome.
+		cfg = corsTestConfig(matching, costly)
+		rule, err := corsRuleFor(cfg, origin, http.MethodPut, requested(4096))
+		if err != nil {
+			t.Fatalf("expected a rule matching before the expensive one to complete, got error: %v", err)
+		}
+		if rule == nil || rule.ID != matching.ID {
+			t.Fatalf("expected rule %q to match first, got %+v", matching.ID, rule)
+		}
+	})
+
+	// A rule listing its allowed headers literally is indexed, so naming a great
+	// many of them is cheap however many headers the request asks about. This is
+	// the case the bound must not refuse, since it is the shape a large but
+	// ordinary configuration takes.
+	t.Run("literalAllowedHeadersStayAffordableInBulk", func(t *testing.T) {
+		names := requested(4096)
+		cfg := corsTestConfig(miniogocors.Rule{
+			ID:            "enumerated",
+			AllowedHeader: slices.Clone(names),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		})
+
+		rule, err := corsRuleFor(cfg, origin, http.MethodPut, names)
+		if err != nil {
+			t.Fatalf("expected an indexed rule to be affordable in bulk, got error: %v", err)
+		}
+		if rule == nil {
+			t.Fatalf("expected the rule naming all %d requested headers to match", len(names))
 		}
 	})
 }
@@ -2371,18 +2647,26 @@ func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 }
 
 // TestBucketCorsPreflightMiddlewareUnresolvableHost pins the disposition of a
-// preflight whose target bucket cannot be resolved because the Host header
-// cannot be parsed.
+// preflight whose Host header the server does not accept, which with
+// virtual-host-style addressing configured is also a Host the target bucket
+// cannot be resolved from.
 //
-// With virtual-host-style addressing the bucket name comes from a Host header
-// that is client controlled and unauthenticated on this path. A Host the server
-// cannot parse - a non-numeric or out of range port, an invalid host label, too
-// many colons, or no Host at all - resolves to no bucket, so the request is
-// delegated to the server-wide handler and must not fail: resolving it through
-// request2BucketObjectName instead reaches logger.CriticalIf, which panics.
+// The Host on this path is client controlled and unauthenticated, and the server
+// has already decided what such a Host is worth: setRequestValidityMiddleware
+// answers HTTP 400 for it, so the request the preflight asks about is refused
+// before it reaches any bucket handler. Handing the preflight to the server-wide
+// handler instead would answer the one request the server does respond to out of
+// the most permissive setting it has - and the router does still route such a
+// request path-style, so a bucket with restrictive rules of its own can genuinely
+// be its target. It is therefore refused, in parity with the request it precedes.
+// It must also not fail while doing so: resolving the Host through
+// request2BucketObjectName reaches logger.CriticalIf, which panics.
 //
-// Each case installs a configuration that would have matched the request, so the
-// disposition is provably decided by the unresolved bucket alone.
+// A Host that parses resolves its bucket as before, and an empty Host - which is
+// the one unparsable Host the server tolerates, under CI/CD - resolves path-style
+// off the request path, again exactly as the router would. Each case installs a
+// configuration that would have matched the request, so the disposition is
+// provably decided by the Host alone.
 func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
 	const (
 		domain        = "s3.example.com"
@@ -2403,26 +2687,67 @@ func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
 	testCases := []struct {
 		name string
 		host string
-		// resolves reports whether the host is parseable, and therefore whether
-		// the bucket it names is evaluated against the stored rules instead of
-		// being handed on.
-		resolves bool
+		// path is the request path, which is what the bucket is resolved from
+		// whenever the Host does not name a virtual host.
+		path string
+		want corsPreflightOutcome
 	}{
-		{name: "nonNumericPort", host: bucket + "." + domain + ":notaport"},
-		{name: "portOutOfRange", host: bucket + "." + domain + ":99999"},
-		{name: "invalidHostLabel", host: "]bad[." + domain},
-		{name: "tooManyColons", host: ":::"},
-		{name: "noHostAtAll", host: ""},
-		// Port zero is a valid port, so this host parses and the bucket it names
-		// is evaluated. It is the boundary that proves only an unparsable host
-		// is handed on.
-		{name: "portZeroResolves", host: bucket + "." + domain + ":0", resolves: true},
-		{name: "wellFormedHostResolves", host: bucket + "." + domain, resolves: true},
+		// A Host the server refuses outright. Delegating any of these is what
+		// would answer a request bound for a restrictive bucket out of the
+		// server-wide default.
+		{name: "nonNumericPortIsRefused", host: bucket + "." + domain + ":notaport", path: "/object", want: corsOutcomeDenied},
+		{name: "portOutOfRangeIsRefused", host: bucket + "." + domain + ":99999", path: "/object", want: corsOutcomeDenied},
+		{name: "invalidHostLabelIsRefused", host: "]bad[." + domain, path: "/object", want: corsOutcomeDenied},
+		{name: "tooManyColonsIsRefused", host: ":::", path: "/object", want: corsOutcomeDenied},
+		// The refusal does not depend on the path naming a bucket that exists:
+		// the Host decided it before any lookup, which is what keeps this layer
+		// in step with the middleware that answers 400 for the same Host.
+		{
+			name: "aRefusedHostIsRefusedEvenForAnUnknownBucket",
+			host: "]bad[." + domain,
+			path: "/blitzy-cors-absent/object",
+			want: corsOutcomeDenied,
+		},
+		// The one unparsable Host the server tolerates. It names no virtual
+		// host, so the bucket comes from the path, and the stored rules of the
+		// bucket named there are what answer - parity with the path-style route
+		// such a request is dispatched to.
+		{
+			name: "anEmptyHostResolvesTheBucketPathStyle",
+			host: "",
+			path: "/" + bucket + "/object",
+			want: corsOutcomeAllowed,
+		},
+		// The same Host over a path naming a bucket without a configuration
+		// falls back to the server-wide setting, which proves the case above
+		// resolved the bucket rather than merely reaching the evaluator.
+		{
+			name: "anEmptyHostOverAnUnconfiguredBucketDelegates",
+			host: "",
+			path: "/blitzy-cors-absent/object",
+			want: corsOutcomeDelegated,
+		},
+		// Port zero is a valid port, so this Host parses and the bucket it names
+		// is evaluated. It is the boundary that proves only a Host the server
+		// rejects is refused.
+		{
+			name: "portZeroResolves",
+			host: bucket + "." + domain + ":0",
+			path: "/object",
+			want: corsOutcomeAllowed,
+		},
+		{
+			name: "wellFormedHostResolves",
+			host: bucket + "." + domain,
+			path: "/object",
+			want: corsOutcomeAllowed,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			reporter := installTestCORSPreflightReporter(t)
 
 			saved := globalDomainNames
 			t.Cleanup(func() { globalDomainNames = saved })
@@ -2437,7 +2762,7 @@ func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
 				}
 			})
 
-			req := httptest.NewRequest(http.MethodOptions, "/object", nil)
+			req := httptest.NewRequest(http.MethodOptions, tc.path, nil)
 			req.Host = tc.host
 			req.Header.Set("Origin", origin)
 			req.Header.Set("Access-Control-Request-Method", http.MethodGet)
@@ -2455,37 +2780,63 @@ func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
 				bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
 			}()
 
-			if tc.resolves {
-				if delegated {
-					t.Fatalf("expected the parseable host %q to resolve to bucket %q and be evaluated, but the request was handed on",
-						tc.host, bucket)
-				}
+			got := corsOutcomeDenied
+			switch {
+			case delegated:
+				got = corsOutcomeDelegated
+			case rec.Header().Get("Access-Control-Allow-Origin") != "":
+				got = corsOutcomeAllowed
+			}
+			if got != tc.want {
+				t.Fatalf("expected the preflight carrying host %q for path %q to be %s, it was %s (status %d, headers %v)",
+					tc.host, tc.path, tc.want, got, rec.Code, rec.Header())
+			}
+
+			reportedAt, _ := corsPreflightReporterState(t, reporter)
+			switch tc.want {
+			case corsOutcomeAllowed:
 				if rec.Code != http.StatusOK {
 					t.Errorf("expected status %d for the matched rule, got %d", http.StatusOK, rec.Code)
 				}
 				if got := rec.Header().Get("Access-Control-Allow-Origin"); got != origin {
 					t.Errorf("expected the matched rule to echo the origin %q, got %q", origin, got)
 				}
-				return
-			}
-
-			if !delegated {
-				t.Fatalf("expected a preflight carrying the unparsable host %q to reach the wrapped handler, got status %d with headers %v",
-					tc.host, rec.Code, rec.Header())
-			}
-			if rec.Code != http.StatusTeapot {
-				t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
-			}
-			if rec.Body.String() != delegatedBody {
-				t.Errorf("expected the wrapped handler's body %q, got %q", delegatedBody, rec.Body.String())
-			}
-			for _, name := range corsPreflightAllowHeaders {
-				if value := rec.Header().Get(name); value != "" {
-					t.Errorf("expected the middleware not to set %s on a delegated request, got %q", name, value)
+				if !reportedAt.IsZero() {
+					t.Errorf("expected an allowed preflight not to be reported, it was reported at %s", reportedAt)
 				}
-			}
-			if value := rec.Header().Get("Vary"); value != "" {
-				t.Errorf("expected the middleware not to set Vary on a delegated request, got %q", value)
+			case corsOutcomeDelegated:
+				if rec.Code != http.StatusTeapot {
+					t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
+				}
+				if rec.Body.String() != delegatedBody {
+					t.Errorf("expected the wrapped handler's body %q, got %q", delegatedBody, rec.Body.String())
+				}
+				for _, name := range corsPreflightAllowHeaders {
+					if value := rec.Header().Get(name); value != "" {
+						t.Errorf("expected the middleware not to set %s on a delegated request, got %q", name, value)
+					}
+				}
+				if value := rec.Header().Get("Vary"); value != "" {
+					t.Errorf("expected the middleware not to set Vary on a delegated request, got %q", value)
+				}
+				if !reportedAt.IsZero() {
+					t.Errorf("expected a delegated preflight not to be reported, it was reported at %s", reportedAt)
+				}
+			case corsOutcomeDenied:
+				if rec.Code != http.StatusOK {
+					t.Errorf("expected a refused preflight to answer %d, got %d", http.StatusOK, rec.Code)
+				}
+				for _, name := range corsPreflightAllowHeaders {
+					if value := rec.Header().Get(name); value != "" {
+						t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
+					}
+				}
+				// The refusal is indistinguishable on the wire from one the
+				// bucket's own rules produced, so it is reported - and the
+				// report carries nothing of the Host that caused it.
+				if reportedAt.IsZero() {
+					t.Error("expected a Host the server does not accept to be reported")
+				}
 			}
 		})
 	}
@@ -2677,16 +3028,63 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 		}
 	})
 
-	// Metadata already in hand answers for the bucket, so a later failed load
-	// must not turn it into an unavailable one.
-	t.Run("metadataAlreadyInHandIsNeverMarkedUnavailable", func(t *testing.T) {
+	// A copy of a bucket's metadata says what its configuration was, not what it
+	// is. The load that just failed is the one that would have reported a change
+	// made on another node, so a copy that predates it cannot be treated as the
+	// bucket's answer - the whole point of the state is that this cache no longer
+	// knows. Answering from the copy anyway is what would keep serving rules
+	// their owner has already tightened.
+	t.Run("cachedRulesStopBeingAuthoritativeAfterAFailedLoad", func(t *testing.T) {
 		sys := installTestBucketMetadataSys(t, true)
 		setTestBucketCORSConfig(sys, knownBucket, cfg)
 
+		// The copy answers while it is the newest thing known about the bucket.
+		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
+			t.Fatalf("expected the stored configuration before any load failed, got %+v and error %v", got, err)
+		}
+
 		sys.markMetadataUnavailable(knownBucket)
 
+		got, _, err := sys.GetCORSConfigCached(knownBucket)
+		if got != nil {
+			t.Fatalf("expected a superseded copy not to be returned, got %+v", got)
+		}
+		if !errors.Is(err, errBucketMetadataUnavailable) {
+			t.Fatalf("expected %v once a load failed, got %v", errBucketMetadataUnavailable, err)
+		}
+		if isBucketCORSConfigNotFound(err) {
+			t.Fatal("expected a copy of unknown currency not to report a definitive absence")
+		}
+
+		// A load succeeding again is what restores the copy's authority.
+		setTestBucketCORSConfig(sys, knownBucket, cfg)
 		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
-			t.Fatalf("expected the stored configuration, got %+v and error %v", got, err)
+			t.Fatalf("expected a successful load to make the configuration answerable again, got %+v and error %v", got, err)
+		}
+	})
+
+	// The same holds for a cached absence, and it is the more dangerous of the
+	// two: an absence is the one answer the evaluator is allowed to fall back on,
+	// so a stale one does not merely serve outdated rules, it hands the request
+	// to the permissive server-wide default. A bucket whose owner has just
+	// created its first restrictive configuration on another node is exactly the
+	// bucket whose cached "nothing set" must stop being believed.
+	t.Run("aCachedAbsenceStopsBeingAuthoritativeAfterAFailedLoad", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+		setTestBucketCORSConfig(sys, knownBucket, nil)
+
+		if _, _, err := sys.GetCORSConfigCached(knownBucket); !isBucketCORSConfigNotFound(err) {
+			t.Fatalf("expected a definitive absence before any load failed, got %v", err)
+		}
+
+		sys.markMetadataUnavailable(knownBucket)
+
+		_, _, err := sys.GetCORSConfigCached(knownBucket)
+		if isBucketCORSConfigNotFound(err) {
+			t.Fatalf("expected a cached absence of unknown currency not to read as a definitive absence, got %v", err)
+		}
+		if !errors.Is(err, errBucketMetadataUnavailable) {
+			t.Fatalf("expected %v once a load failed, got %v", errBucketMetadataUnavailable, err)
 		}
 	})
 
@@ -2789,11 +3187,13 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 // the cache-only CORS lookup depends on.
 //
 // A bucket whose metadata failed to load is remembered as unavailable so that it
-// stays distinguishable from a bucket that does not exist, and that memory has to
-// end the moment it stops being true: metadata arriving for the bucket answers for
-// it, and a bucket that is gone from the backend has no answer left to be unknown.
-// A state that outlived either event would keep refusing preflight requests for a
-// bucket that can be answered.
+// stays distinguishable both from a bucket that does not exist and from one whose
+// configuration is actually known, and that memory has to end the moment it stops
+// being true: metadata arriving for the bucket answers for it, and a bucket that
+// is gone from the backend has no answer left to be unknown. A state that outlived
+// either event would keep refusing preflight requests for a bucket that can be
+// answered, so the two directions are asserted together - it is recorded whenever
+// a load fails, and cleared whenever one succeeds.
 func TestBucketMetadataUnavailableTracking(t *testing.T) {
 	const bucket = "blitzy-cors-pending"
 
@@ -2822,6 +3222,45 @@ func TestBucketMetadataUnavailableTracking(t *testing.T) {
 		setTestBucketCORSConfig(sys, bucket, cfg)
 		if unavailable(t, sys) {
 			t.Fatal("expected metadata arriving for the bucket to end the unavailability")
+		}
+	})
+
+	// Every failed load is recorded, including one for a bucket the cache still
+	// holds metadata for. Skipping those is what would let a copy from before the
+	// failure keep answering as though it were current: the failed load is
+	// precisely the one that would have reported that the bucket's rules changed.
+	t.Run("aFailedLoadIsRecordedEvenWhenMetadataIsInHand", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+		setTestBucketCORSConfig(sys, bucket, cfg)
+		if unavailable(t, sys) {
+			t.Fatal("expected metadata in hand and no failed load to be answerable")
+		}
+
+		sys.markMetadataUnavailable(bucket)
+		if !unavailable(t, sys) {
+			t.Fatal("expected a failed load to be recorded even with metadata in hand")
+		}
+	})
+
+	// Whatever order successes and failures arrive in, the last one decides: a
+	// bucket only keeps failing closed while its newest load failed, and starts
+	// answering again as soon as one succeeds.
+	t.Run("theMostRecentLoadDecides", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t, true)
+
+		for range 3 {
+			sys.markMetadataUnavailable(bucket)
+			if !unavailable(t, sys) {
+				t.Fatal("expected the bucket to fail closed while its newest load failed")
+			}
+
+			setTestBucketCORSConfig(sys, bucket, cfg)
+			if unavailable(t, sys) {
+				t.Fatal("expected a succeeding load to make the bucket answerable again")
+			}
+			if got, _, err := sys.GetCORSConfigCached(bucket); err != nil || got != cfg {
+				t.Fatalf("expected the freshly loaded configuration, got %+v and error %v", got, err)
+			}
 		}
 	})
 
@@ -3312,17 +3751,23 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 }
 
 // TestBucketCorsPreflightMiddlewareMalformedHost pins the disposition of a
-// preflight whose Host header does not parse. That is reachable only when
-// virtual-host-style addressing is configured, because only then does resolving
-// the bucket have to parse the Host at all.
+// preflight whose Host header a browser will send but this server will not accept,
+// which is the case that decides whether this layer can be talked out of a
+// bucket's rules by the Host alone.
 //
-// A preflight carries no credentials, so this middleware inspects a client-chosen
-// Host before anything has authenticated the request. Resolving it through
-// request2BucketObjectName would report the parse failure through
-// logger.CriticalIf, which panics. A malformed Host identifies no bucket, so it
-// is delegated like any other request that does not resolve to one - and the
-// wrapped handler being reached at all is what proves nothing panicked on the way
-// there.
+// Every host below is one a browser forms an origin from and issues a request to,
+// yet none of them parses as a MinIO host, so the server answers HTTP 400 for the
+// request the preflight asks about. The preflight is therefore refused rather than
+// delegated: delegating it would answer, out of the server-wide default that
+// allows every origin with credentials, a request whose path-style route the
+// generic router does resolve to a real bucket. The refusal also has to be
+// panic-free, since resolving such a Host through request2BucketObjectName reaches
+// logger.CriticalIf.
+//
+// Each case installs a bucket whose single rule would have matched, and the
+// configured domain is varied so the refusal is shown not to depend on the Host
+// belonging to it. The two axes are asserted together: what the middleware answers,
+// and that it never reaches the wrapped handler.
 func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
@@ -3335,31 +3780,45 @@ func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
 	hosts := []struct {
 		name string
 		host string
+		// domains is the virtual-host-style configuration in force. An empty
+		// slice is path-style-only addressing, where resolving the bucket never
+		// parses the Host at all - and where the Host is still refused, because
+		// the middleware that answers 400 for it does not consult the
+		// configuration either.
+		domains []string
 	}{
-		{name: "underscoreInALabel", host: "a_b." + domain},
-		{name: "leadingHyphenInALabel", host: "-bad." + domain},
-		{name: "overLongLabel", host: overLongLabel + "." + domain},
-		{name: "emptyLabel", host: "a..b." + domain},
-		{name: "malformedHostOutsideTheDomain", host: "a_b.other.tld"},
-		{name: "malformedHostCarryingAPort", host: "a_b." + domain + ":9000"},
+		{name: "underscoreInALabel", host: "a_b." + domain, domains: []string{domain}},
+		{name: "leadingHyphenInALabel", host: "-bad." + domain, domains: []string{domain}},
+		{name: "overLongLabel", host: overLongLabel + "." + domain, domains: []string{domain}},
+		{name: "emptyLabel", host: "a..b." + domain, domains: []string{domain}},
+		{name: "malformedHostOutsideTheDomain", host: "a_b.other.tld", domains: []string{domain}},
+		{name: "malformedHostCarryingAPort", host: "a_b." + domain + ":9000", domains: []string{domain}},
+		// The exploit the review demonstrated: a browser accepts
+		// http://a_b.example/<bucket>/<object>, forms the origin http://a_b.example
+		// from it, and the request is routed path-style to the bucket in the path.
+		// No domain is configured, so nothing parses the Host while resolving the
+		// bucket, and only refusing on the Host keeps the preflight from being
+		// answered out of the server-wide default.
+		{name: "pathStyleOnlyDeploymentIsRefusedToo", host: "a_b.example"},
 	}
 
 	for _, tc := range hosts {
 		t.Run(tc.name, func(t *testing.T) {
 			// The bucket is present and its single rule would match the probe,
-			// so delegation cannot be mistaken for the ordinary
+			// so the disposition cannot be mistaken for the ordinary
 			// no-configuration fallback: the only thing standing in the way is
-			// the Host that does not parse.
+			// the Host the server does not accept.
 			sys := installTestBucketMetadataSys(t, true)
 			setTestBucketCORSConfig(sys, bucket, corsTestConfig(miniogocors.Rule{
 				ID:            "matching",
 				AllowedMethod: []string{http.MethodPut},
 				AllowedOrigin: []string{"*"},
 			}))
+			reporter := installTestCORSPreflightReporter(t)
 
 			saved := globalDomainNames
 			t.Cleanup(func() { globalDomainNames = saved })
-			globalDomainNames = []string{domain}
+			globalDomainNames = tc.domains
 
 			delegated := false
 			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -3367,32 +3826,358 @@ func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
 				w.WriteHeader(http.StatusTeapot)
 			})
 
-			req := httptest.NewRequest(http.MethodOptions, "/object", nil)
+			req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
 			req.Host = tc.host
 			req.Header.Set("Origin", origin)
 			req.Header.Set("Access-Control-Request-Method", http.MethodPut)
 			req.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
 			rec := httptest.NewRecorder()
 
-			bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Fatalf("the middleware panicked on the host %q: %v", tc.host, recovered)
+					}
+				}()
+				bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+			}()
 
-			if !delegated {
-				t.Fatalf("expected a preflight with a malformed Host to reach the wrapped handler, got status %d and headers %v",
-					rec.Code, rec.Header())
+			// Reaching the wrapped handler is what would hand the request to the
+			// server-wide default, so it is the failure this test exists to
+			// catch. Not reaching it is also what proves nothing panicked, since
+			// the middleware answered on its own.
+			if delegated {
+				t.Fatalf("expected a preflight carrying the unaccepted Host %q not to reach the server-wide handler, it did (status %d)",
+					tc.host, rec.Code)
 			}
-			if rec.Code != http.StatusTeapot {
-				t.Errorf("expected the wrapped handler's status %d, got %d", http.StatusTeapot, rec.Code)
+			if rec.Code != http.StatusOK {
+				t.Errorf("expected a refused preflight to answer %d, got %d", http.StatusOK, rec.Code)
 			}
 			for _, name := range corsPreflightAllowHeaders {
 				if value := rec.Header().Get(name); value != "" {
-					t.Errorf("expected the middleware not to set %s on a delegated request, got %q", name, value)
+					t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
 				}
 			}
-			if value := rec.Header().Get("Vary"); value != "" {
-				t.Errorf("expected the middleware not to set Vary on a delegated request, got %q", value)
+			// The refusal declares the same variance as every other preflight
+			// answer, so an intermediary cache cannot serve it to another origin.
+			if got := rec.Header().Values("Vary"); len(got) == 0 {
+				t.Error("expected a refused preflight to declare its variance")
+			}
+			if reportedAt, _ := corsPreflightReporterState(t, reporter); reportedAt.IsZero() {
+				t.Error("expected a Host the server does not accept to be reported")
 			}
 		})
 	}
+}
+
+// corsRequestedHeaderNamePrefix is shared by every name corsRequestedHeaderNames
+// produces, so that a single wildcard AllowedHeader pattern can cover all of them.
+// A rule is abandoned at the first requested header it does not cover, so only a
+// covering pattern makes an evaluation walk the whole list - which is the shape
+// the evaluation allowance exists to bound.
+const corsRequestedHeaderNamePrefix = "z"
+
+// corsRequestedHeaderNames returns count distinct, syntactically valid header
+// names short enough that a great many of them fit inside one header value. They
+// are the raw material of the widest requested-header list a client can get past
+// the server's header size limit.
+func corsRequestedHeaderNames(count int) []string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+	names := make([]string, 0, count)
+	for i := range count {
+		n := i
+		name := []byte(corsRequestedHeaderNamePrefix + "\x00\x00\x00")
+		for j := len(corsRequestedHeaderNamePrefix); j < len(name); j++ {
+			name[j] = alphabet[n%len(alphabet)]
+			n /= len(alphabet)
+		}
+		names = append(names, string(name))
+	}
+	return names
+}
+
+// corsWildcardHeaderPatterns returns decoys wildcard AllowedHeader patterns that
+// cover nothing corsRequestedHeaderNames produces, followed by one that covers all
+// of them and one that covers the ordinary x-amz-* headers a browser asks about.
+//
+// It is an entirely ordinary document by size - a few hundred short patterns - and
+// it is the second factor of the product the evaluation allowance bounds. The
+// index the matcher builds cannot flatten a wildcard, so each of them has to be
+// compared against each requested header.
+func corsWildcardHeaderPatterns(decoys int) []string {
+	patterns := make([]string, 0, decoys+2)
+	for i := range decoys {
+		patterns = append(patterns, fmt.Sprintf("x-never-%d-*", i))
+	}
+	return append(patterns, corsRequestedHeaderNamePrefix+"*", "x-amz-*")
+}
+
+// TestBucketCorsPreflightMiddlewareBoundedWork pins the cost of answering one
+// preflight, which is the cost of answering an unauthenticated request whose
+// headers are entirely the client's to choose.
+//
+// Two limits do that, and they compose. The first is the server's own header size
+// limit, which the evaluator applies itself because it runs ahead of the
+// middleware that normally would: without it a request may carry a megabyte of
+// headers, since that is all the HTTP server itself refuses. The second is the
+// evaluation allowance, which bounds the product of the requested header list and
+// the AllowedHeader patterns of the rules - a product that stays out of reach of
+// any size limit, because both lists are individually modest.
+//
+// Neither may be reached by narrowing what is evaluated: every header a request
+// asks about is still compared against the rules, so a rule that covers all but
+// one of them still refuses the request.
+func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
+	const (
+		bucket = "blitzy-cors-bucket"
+		origin = "https://www.example1.com"
+	)
+
+	allowEverything := corsTestConfig(miniogocors.Rule{
+		ID:            "allow-everything",
+		AllowedHeader: []string{"*"},
+		AllowedMethod: []string{http.MethodPut},
+		AllowedOrigin: []string{"*"},
+		MaxAgeSeconds: 3000,
+	})
+
+	// preflight builds a genuine preflight request for the bucket.
+	preflight := func(reqHeaders string) *http.Request {
+		req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+		if reqHeaders != "" {
+			req.Header.Set("Access-Control-Request-Headers", reqHeaders)
+		}
+		return req
+	}
+
+	// serve runs the middleware and reports how it disposed of the request.
+	serve := func(t *testing.T, req *http.Request) (corsPreflightOutcome, *httptest.ResponseRecorder) {
+		t.Helper()
+
+		delegated := false
+		next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			delegated = true
+			w.WriteHeader(http.StatusTeapot)
+		})
+		rec := httptest.NewRecorder()
+		bucketCORSPreflightMiddleware(next).ServeHTTP(rec, req)
+
+		switch {
+		case delegated:
+			return corsOutcomeDelegated, rec
+		case rec.Header().Get("Access-Control-Allow-Origin") != "":
+			return corsOutcomeAllowed, rec
+		}
+		return corsOutcomeDenied, rec
+	}
+
+	// A request carrying more header bytes than the server admits is refused
+	// before anything is read from those headers, so the refusal cannot depend on
+	// the bucket at all. Delegating it would answer, out of the permissive
+	// server-wide default, a request the server itself answers 413 for.
+	t.Run("headersLargerThanTheServerAdmitsAreRefused", func(t *testing.T) {
+		oversized := strings.Join(corsRequestedHeaderNames(4096), ",")
+
+		for _, tc := range []struct {
+			name  string
+			setup func(t *testing.T)
+		}{
+			{
+				name: "forABucketWithPermissiveRules",
+				setup: func(t *testing.T) {
+					t.Helper()
+					setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
+				},
+			},
+			{
+				// No configuration at all, which is the one state that would
+				// otherwise delegate. The size limit outranks it.
+				name: "forABucketWithoutAConfiguration",
+				setup: func(t *testing.T) {
+					t.Helper()
+					setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tc.setup(t)
+				reporter := installTestCORSPreflightReporter(t)
+
+				req := preflight(oversized)
+				if !isHTTPHeaderSizeTooLarge(req.Header) {
+					t.Fatalf("the fixture must exceed the server's header size limit, %d name(s) did not",
+						len(corsRequestedHeaderNames(4096)))
+				}
+
+				got, rec := serve(t, req)
+				if got != corsOutcomeDenied {
+					t.Fatalf("expected an oversized preflight to be refused, it was %s (status %d, headers %v)",
+						got, rec.Code, rec.Header())
+				}
+				for _, name := range corsPreflightAllowHeaders {
+					if value := rec.Header().Get(name); value != "" {
+						t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
+					}
+				}
+				if reportedAt, _ := corsPreflightReporterState(t, reporter); reportedAt.IsZero() {
+					t.Error("expected an oversized preflight to be reported")
+				}
+			})
+		}
+	})
+
+	// The widest list the size limit does admit is still evaluated in full: every
+	// name is compared, the response echoes every one of them back, and a rule one
+	// name short refuses the request. A layer that quietly stopped after the first
+	// so many headers would allow requests the rules do not.
+	t.Run("theWidestAdmissibleHeaderListIsEvaluatedInFull", func(t *testing.T) {
+		names := corsRequestedHeaderNames(1600)
+		reqHeaders := strings.Join(names, ",")
+
+		req := preflight(reqHeaders)
+		if isHTTPHeaderSizeTooLarge(req.Header) {
+			t.Fatalf("the fixture must be admissible, %d name(s) were not", len(names))
+		}
+
+		t.Run("aWildcardCoversThemAll", func(t *testing.T) {
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
+
+			got, rec := serve(t, preflight(reqHeaders))
+			if got != corsOutcomeAllowed {
+				t.Fatalf("expected the wildcard rule to allow all %d requested headers, the request was %s",
+					len(names), got)
+			}
+			if allowed := rec.Header().Get("Access-Control-Allow-Headers"); allowed != strings.Join(names, ", ") {
+				t.Errorf("expected every requested header to be echoed back, got %d byte(s)", len(allowed))
+			}
+		})
+
+		t.Run("aRuleOneNameShortRefusesTheRequest", func(t *testing.T) {
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+				ID:            "one-short",
+				AllowedHeader: slices.Clone(names[:len(names)-1]),
+				AllowedMethod: []string{http.MethodPut},
+				AllowedOrigin: []string{origin},
+			}))
+			reporter := installTestCORSPreflightReporter(t)
+
+			got, _ := serve(t, preflight(reqHeaders))
+			if got != corsOutcomeDenied {
+				t.Fatalf("expected a rule missing the last of %d requested headers to refuse, the request was %s",
+					len(names), got)
+			}
+			// The rules answered, so this is the configuration working as
+			// written rather than a condition to report.
+			if reportedAt, _ := corsPreflightReporterState(t, reporter); !reportedAt.IsZero() {
+				t.Errorf("expected a refusal by the rules not to be reported, it was reported at %s", reportedAt)
+			}
+		})
+	})
+
+	// The pairing the size limit cannot bound: a request the server admits, and a
+	// stored document of an entirely ordinary size whose AllowedHeader values are
+	// wildcard patterns, which no index can flatten. Their product is what the
+	// allowance refuses.
+	t.Run("anUnaffordableEvaluationIsRefusedAndReported", func(t *testing.T) {
+		names := corsRequestedHeaderNames(1600)
+		reqHeaders := strings.Join(names, ",")
+
+		setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+			ID:            "many-patterns",
+			AllowedHeader: corsWildcardHeaderPatterns(800),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		}))
+		reporter := installTestCORSPreflightReporter(t)
+
+		req := preflight(reqHeaders)
+		if isHTTPHeaderSizeTooLarge(req.Header) {
+			t.Fatal("the fixture must be a request the server admits, or the size limit rather than the allowance would refuse it")
+		}
+
+		got, rec := serve(t, req)
+		if got != corsOutcomeDenied {
+			t.Fatalf("expected an unaffordable evaluation to be refused, it was %s (status %d, headers %v)",
+				got, rec.Code, rec.Header())
+		}
+		for _, name := range corsPreflightAllowHeaders {
+			if value := rec.Header().Get(name); value != "" {
+				t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
+			}
+		}
+		if reportedAt, _ := corsPreflightReporterState(t, reporter); reportedAt.IsZero() {
+			t.Error("expected an unaffordable evaluation to be reported")
+		}
+
+		// The same document answers an ordinary preflight, so the allowance
+		// refuses the pairing rather than the configuration.
+		if got, _ := serve(t, preflight("x-amz-acl")); got != corsOutcomeAllowed {
+			t.Errorf("expected the same document to allow an ordinary preflight, the request was %s", got)
+		}
+	})
+
+	// Every refusal is decided per request, so a flood of them costs the flood's
+	// sender the requests and costs this server one report.
+	t.Run("concurrentUnaffordablePreflightsAreEachRefused", func(t *testing.T) {
+		const requests = 64
+
+		reqHeaders := strings.Join(corsRequestedHeaderNames(1600), ",")
+
+		setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+			ID:            "many-patterns",
+			AllowedHeader: corsWildcardHeaderPatterns(800),
+			AllowedMethod: []string{http.MethodPut},
+			AllowedOrigin: []string{origin},
+		}))
+		reporter := installTestCORSPreflightReporter(t)
+
+		middleware := bucketCORSPreflightMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		}))
+
+		var (
+			wg        sync.WaitGroup
+			mu        sync.Mutex
+			delegates int
+			allows    int
+		)
+		for range requests {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rec := httptest.NewRecorder()
+				middleware.ServeHTTP(rec, preflight(reqHeaders))
+
+				mu.Lock()
+				defer mu.Unlock()
+				if rec.Code == http.StatusTeapot {
+					delegates++
+				}
+				if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+					allows++
+				}
+			}()
+		}
+		wg.Wait()
+
+		if delegates != 0 || allows != 0 {
+			t.Fatalf("expected all %d concurrent preflights to be refused, %d were delegated and %d allowed",
+				requests, delegates, allows)
+		}
+		reportedAt, unreported := corsPreflightReporterState(t, reporter)
+		if reportedAt.IsZero() {
+			t.Fatal("expected the first of the concurrent refusals to be reported")
+		}
+		// One report, and the rest counted: the volume is this server's choice
+		// rather than the sender's.
+		if unreported != requests-1 {
+			t.Fatalf("expected %d of %d refusals to be counted rather than reported, got %d",
+				requests-1, requests, unreported)
+		}
+	})
 }
 
 // TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace pins the resource half
@@ -3422,21 +4207,21 @@ func TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace(t *testing.T) {
 }
 
 // installTestCORSPreflightReporter replaces the reporter the preflight evaluator
-// reports unavailable bucket rules through with a fresh one, restoring the
-// previous value afterwards, so a test observes only the refusals it causes.
-func installTestCORSPreflightReporter(t *testing.T) *corsPreflightUnavailableReporter {
+// reports its refusals through with a fresh one, restoring the previous value
+// afterwards, so a test observes only the refusals it causes.
+func installTestCORSPreflightReporter(t *testing.T) *corsPreflightRefusalReporter {
 	t.Helper()
 
-	saved := corsPreflightUnavailable
-	t.Cleanup(func() { corsPreflightUnavailable = saved })
+	saved := corsPreflightRefused
+	t.Cleanup(func() { corsPreflightRefused = saved })
 
-	corsPreflightUnavailable = &corsPreflightUnavailableReporter{}
-	return corsPreflightUnavailable
+	corsPreflightRefused = &corsPreflightRefusalReporter{}
+	return corsPreflightRefused
 }
 
 // corsPreflightReporterState reads a reporter's state under its own lock, which
 // is what makes it safe to inspect after concurrent reports.
-func corsPreflightReporterState(t *testing.T, r *corsPreflightUnavailableReporter) (reportedAt time.Time, unreported uint64) {
+func corsPreflightReporterState(t *testing.T, r *corsPreflightRefusalReporter) (reportedAt time.Time, unreported uint64) {
 	t.Helper()
 
 	r.mu.Lock()
@@ -3444,17 +4229,19 @@ func corsPreflightReporterState(t *testing.T, r *corsPreflightUnavailableReporte
 	return r.reportedAt, r.unreported
 }
 
-// TestCorsPreflightUnavailableReporterRate pins the rate at which the evaluator
-// reports that a bucket's own CORS rules could not be established.
+// TestCorsPreflightRefusalReporterRate pins the rate at which the evaluator
+// reports a refusal that the bucket's own rules did not produce.
 //
 // The refusal that follows such a report is answered to an unauthenticated
 // request, so the rate has to be the server's choice rather than the client's:
 // the first refusal is reported at once, every refusal inside the interval that
 // follows is counted rather than reported, and the next report carries that count
-// so the condition cannot read as rarer than it was.
-func TestCorsPreflightUnavailableReporterRate(t *testing.T) {
+// so the condition cannot read as rarer than it was. One reporter serves every
+// such reason, so a client cannot raise the volume by alternating between them
+// either.
+func TestCorsPreflightRefusalReporterRate(t *testing.T) {
 	start := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
-	reporter := &corsPreflightUnavailableReporter{}
+	reporter := &corsPreflightRefusalReporter{}
 
 	// The first refusal is reported immediately: the zero reportedAt is what says
 	// nothing has been reported yet.
@@ -3467,8 +4254,8 @@ func TestCorsPreflightUnavailableReporterRate(t *testing.T) {
 	for i, at := range []time.Time{
 		start,
 		start.Add(time.Nanosecond),
-		start.Add(corsPreflightUnavailableReportInterval / 2),
-		start.Add(corsPreflightUnavailableReportInterval - time.Nanosecond),
+		start.Add(corsPreflightRefusalReportInterval / 2),
+		start.Add(corsPreflightRefusalReportInterval - time.Nanosecond),
 	} {
 		if unreported, report := reporter.due(at); report || unreported != 0 {
 			t.Fatalf("expected refusal %d inside the interval to be counted, it was reported with (%d, %t)",
@@ -3481,7 +4268,7 @@ func TestCorsPreflightUnavailableReporterRate(t *testing.T) {
 
 	// The interval having elapsed, the next refusal is reported and carries the
 	// backlog with it, which resets.
-	elapsed := start.Add(corsPreflightUnavailableReportInterval)
+	elapsed := start.Add(corsPreflightRefusalReportInterval)
 	if unreported, report := reporter.due(elapsed); !report || unreported != 4 {
 		t.Fatalf("expected the refusal at the interval to be reported with a backlog of 4, got (%d, %t)",
 			unreported, report)
@@ -3495,24 +4282,104 @@ func TestCorsPreflightUnavailableReporterRate(t *testing.T) {
 	}
 }
 
-// TestCorsPreflightUnavailableReporterConcurrent pins the reporter's accounting
-// under the concurrency it actually meets, since every refusal it reports is
-// observed on a request goroutine.
-func TestCorsPreflightUnavailableReporterConcurrent(t *testing.T) {
+// TestCorsPreflightRefusalReportCarriesNoClientData pins what a refusal report is
+// allowed to say.
+//
+// A preflight is unauthenticated, so every value it carries is the client's: the
+// Host it was addressed to, the origin it declares, the headers it asks about. The
+// Host in particular is only bounded by the maximum header size, and the parse
+// failure it produces quotes it back, so composing the report from that failure
+// would put an arbitrary client string - newlines and all - into the server's log.
+// The reason reported for such a refusal is therefore a fixed sentence, and the
+// only value ever interpolated into a reason is a bucket name the evaluator has
+// already validated as one.
+func TestCorsPreflightRefusalReportCarriesNoClientData(t *testing.T) {
+	const bucket = "blitzy-cors-bucket"
+
+	// Fragments of the hosts, origins and header names a client can choose. None
+	// may appear in a report, and the parse failures xnet.ParseHost produces for
+	// the first two do quote them.
+	clientChosen := []string{
+		"a_b.example", "]bad[", ":::", ":notaport", "99999",
+		"https://www.example1.com", "x-amz-blitzy",
+	}
+
+	reasons := []struct {
+		name   string
+		reason error
+	}{
+		{name: "aHostTheServerDoesNotAccept", reason: errCORSPreflightHostNotAccepted},
+		{
+			name: "rulesThatCouldNotBeEstablished",
+			reason: fmt.Errorf("the CORS configuration of bucket %s could not be established: %w",
+				bucket, errBucketMetadataNotInitialized),
+		},
+	}
+
+	for _, tc := range reasons {
+		t.Run(tc.name, func(t *testing.T) {
+			report := corsPreflightRefusalReport(tc.reason, 0).Error()
+
+			for _, fragment := range clientChosen {
+				if strings.Contains(report, fragment) {
+					t.Errorf("expected the report not to carry the client-chosen %q, got %q", fragment, report)
+				}
+			}
+			// The report has to identify itself as this condition, or an operator
+			// cannot act on it.
+			if !strings.Contains(report, "Refused a CORS preflight request") {
+				t.Errorf("expected the report to name the condition, got %q", report)
+			}
+			if strings.ContainsAny(report, "\n\r") {
+				t.Errorf("expected the report to occupy a single log line, got %q", report)
+			}
+
+			// A backlog is the one number the report adds, and it is the server's
+			// own count rather than anything the request carried.
+			withBacklog := corsPreflightRefusalReport(tc.reason, 7).Error()
+			if !strings.Contains(withBacklog, "7 further refusal(s) went unreported") {
+				t.Errorf("expected a report to carry its backlog, got %q", withBacklog)
+			}
+			if strings.Contains(report, "went unreported") {
+				t.Errorf("expected a report with no backlog not to mention one, got %q", report)
+			}
+		})
+	}
+
+	// The reason a refused Host is reported through must not be built from the
+	// Host, so it carries no formatting placeholder that one could be spliced
+	// into either.
+	if strings.Contains(errCORSPreflightHostNotAccepted.Error(), "%") {
+		t.Errorf("expected the Host refusal reason to be a fixed sentence, got %q", errCORSPreflightHostNotAccepted)
+	}
+}
+
+// TestCorsPreflightRefusalReporterConcurrent pins the reporter's accounting under
+// the concurrency it actually meets, since every refusal it reports is observed
+// on a request goroutine.
+//
+// The reasons are deliberately mixed, because they share one reporter precisely so
+// that a client cannot multiply the volume a deployment logs by alternating
+// between them: whichever reasons arrive, exactly one report leaves the interval.
+func TestCorsPreflightRefusalReporterConcurrent(t *testing.T) {
 	const refusals = 256
 
-	reporter := &corsPreflightUnavailableReporter{}
-	cause := errors.New("bucket metadata not initialized yet")
+	reporter := &corsPreflightRefusalReporter{}
+	reasons := []error{
+		fmt.Errorf("the CORS configuration of bucket %s could not be established: %w",
+			"blitzy-cors-bucket", errBucketMetadataNotInitialized),
+		errCORSPreflightHostNotAccepted,
+	}
 
 	var wg sync.WaitGroup
-	for range refusals {
+	for i := range refusals {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// report is the production entry point, so this also exercises the
 			// message it builds - no log target is configured under test, so
 			// nothing is emitted.
-			reporter.report("blitzy-cors-bucket", cause)
+			reporter.report(reasons[i%len(reasons)])
 		}()
 	}
 	wg.Wait()
@@ -4037,6 +4904,138 @@ func TestCorsConfigReadError(t *testing.T) {
 	}
 }
 
+// TestCORSConfigBody covers the one property of corsConfigBody the routed tests
+// cannot reach: a body that already verifies is handed over with its verification
+// intact rather than replaced.
+//
+// This is the presigned V4 case. Such a request declares its payload digest in
+// the query string rather than in a header, and authentication has already
+// installed a reader that verifies it. Wrapping that body a second time around a
+// header derived digest would not add a check, it would take one away: merging an
+// empty expectation into a hash.Reader overwrites the one it holds (see newReader
+// in internal/hash), so a request whose digest lives in the query string would end
+// up with no digest verification at all.
+func TestCORSConfigBody(t *testing.T) {
+	document := []byte(corsCanonicalDocument)
+	corrupted := []byte("not the document that was declared")
+
+	t.Run("aVerifyingBodyIsHandedOverUntouched", func(t *testing.T) {
+		// The digest of the document the client promised, over bytes that are not
+		// that document, so a verification that survived reports the mismatch and
+		// one that was replaced reports nothing at all.
+		installed, err := hash.NewReader(GlobalContext, bytes.NewReader(corrupted), -1,
+			"", getSHA256Hash(document), -1)
+		if err != nil {
+			t.Fatalf("failed to install a verifying reader: %v", err)
+		}
+
+		// No digest header whatsoever, exactly as a presigned request arrives.
+		request := httptest.NewRequest(http.MethodPut, "/blitzy-cors-config-body?cors", nil)
+		request.Body = installed
+
+		body, apiErr := corsConfigBody(GlobalContext, request)
+		if apiErr != ErrNone {
+			t.Fatalf("expected the body to be accepted, got the API error code %v", apiErr)
+		}
+		if reader, ok := body.(*hash.Reader); !ok || reader != installed {
+			t.Fatalf("expected the reader authentication installed to be handed over, got %T", body)
+		}
+
+		var mismatch hash.SHA256Mismatch
+		if _, err := io.ReadAll(body); !errors.As(err, &mismatch) {
+			t.Fatalf("expected reading the body to report a SHA256 mismatch, got %v", err)
+		}
+	})
+
+	t.Run("aPlainBodyIsGivenTheVerificationItsHeadersDeclare", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPut, "/blitzy-cors-config-body?cors",
+			bytes.NewReader(corrupted))
+		request.Header.Set(xhttp.ContentMD5, getMD5HashBase64(document))
+
+		body, apiErr := corsConfigBody(GlobalContext, request)
+		if apiErr != ErrNone {
+			t.Fatalf("expected the body to be accepted, got the API error code %v", apiErr)
+		}
+		if body == io.Reader(request.Body) {
+			t.Fatal("expected an unverified body to be wrapped, got the request body itself")
+		}
+
+		var badDigest hash.BadDigest
+		if _, err := io.ReadAll(body); !errors.As(err, &badDigest) {
+			t.Fatalf("expected reading the body to report a bad digest, got %v", err)
+		}
+	})
+
+	t.Run("aChecksumIsVerifiedOnTopOfABodyThatAlreadyVerifies", func(t *testing.T) {
+		// The checksum is the verification no authentication path installs, so it
+		// has to be added to a body that already verifies as well as to one that
+		// does not - otherwise every signed request would keep the gap.
+		installed, err := hash.NewReader(GlobalContext, bytes.NewReader(document), -1,
+			"", getSHA256Hash(document), -1)
+		if err != nil {
+			t.Fatalf("failed to install a verifying reader: %v", err)
+		}
+
+		request := httptest.NewRequest(http.MethodPut, "/blitzy-cors-config-body?cors", nil)
+		request.Body = installed
+		request.Header.Set(xhttp.AmzChecksumCRC32, hash.NewChecksumFromData(hash.ChecksumCRC32, corrupted).Encoded)
+
+		body, apiErr := corsConfigBody(GlobalContext, request)
+		if apiErr != ErrNone {
+			t.Fatalf("expected the body to be accepted, got the API error code %v", apiErr)
+		}
+
+		var mismatch hash.ChecksumMismatch
+		if _, err := io.ReadAll(body); !errors.As(err, &mismatch) {
+			t.Fatalf("expected reading the body to report a checksum mismatch, got %v", err)
+		}
+	})
+
+	t.Run("anUndecodableDeclarationIsRefusedBeforeTheBodyIsRead", func(t *testing.T) {
+		testCases := []struct {
+			name    string
+			header  string
+			value   string
+			wantErr APIErrorCode
+		}{
+			{
+				name:    "contentMD5",
+				header:  xhttp.ContentMD5,
+				value:   "this is not a base64 encoded md5",
+				wantErr: ErrInvalidDigest,
+			},
+			{
+				name:    "contentSHA256",
+				header:  xhttp.AmzContentSha256,
+				value:   "this is not a hex encoded sha256",
+				wantErr: ErrContentSHA256Mismatch,
+			},
+			{
+				name:    "checksum",
+				header:  xhttp.AmzChecksumCRC32,
+				value:   "this is not a base64 encoded crc32",
+				wantErr: ErrInvalidChecksum,
+			},
+		}
+
+		for _, testCase := range testCases {
+			t.Run(testCase.name, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodPut, "/blitzy-cors-config-body?cors",
+					bytes.NewReader(document))
+				request.Header.Set(testCase.header, testCase.value)
+
+				body, apiErr := corsConfigBody(GlobalContext, request)
+				if apiErr != testCase.wantErr {
+					t.Fatalf("expected the API error code %v, got %v", testCase.wantErr, apiErr)
+				}
+				if body != nil {
+					t.Fatalf("expected no reader alongside a refusal, got %T", body)
+				}
+			})
+		}
+	})
+}
+
 // assertCORSHandlerError decodes the S3 XML error a CORS handler wrote and
 // asserts its status line and code together. Either one alone is ambiguous: a
 // 400 could be any rejection, and a MalformedXML body carrying a 200 would still
@@ -4102,11 +5101,50 @@ func newSignedCORSRequestWithHeaders(t *testing.T, method, bucketName string, bo
 	return request
 }
 
+// newSignedV2CORSRequestWithHeaders builds the same request signed with
+// signature version 2, overriding the given headers before it is signed.
+//
+// The signature version matters to body integrity rather than to routing. A V2
+// signature covers the Content-Md5 header but never the bytes that header
+// describes, and the V2 authentication path installs no verifying reader in place
+// of the body, so the handler is the only place a declared digest can be checked.
+func newSignedV2CORSRequestWithHeaders(t *testing.T, method, bucketName string, body []byte,
+	creds auth.Credentials, headers map[string]string,
+) *http.Request {
+	t.Helper()
+
+	var reader io.ReadSeeker
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+
+	request, err := newTestSignedRequestV2(method, getBucketCORSURL("", bucketName),
+		int64(len(body)), reader, creds.AccessKey, creds.SecretKey, headers)
+	if err != nil {
+		t.Fatalf("failed to build a V2 signed %s ?cors request: %v", method, err)
+	}
+	return request
+}
+
 // newAnonymousCORSRequest builds an unsigned request against the ?cors route.
 // Carrying no Authorization header is what makes it anonymous, and an anonymous
 // caller is authorized against the bucket policy rather than against the owner
 // short circuit.
 func newAnonymousCORSRequest(t *testing.T, method, bucketName string, body []byte) *http.Request {
+	t.Helper()
+
+	return newAnonymousCORSRequestWithHeaders(t, method, bucketName, body, nil)
+}
+
+// newAnonymousCORSRequestWithHeaders builds the same unsigned request while
+// overriding the given headers.
+//
+// Nothing is signed, so an override is simply the value the server acts upon -
+// which is exactly the point being asserted: an unsigned request declares things
+// about its body that no signature and no authentication path verifies.
+func newAnonymousCORSRequestWithHeaders(t *testing.T, method, bucketName string, body []byte,
+	headers map[string]string,
+) *http.Request {
 	t.Helper()
 
 	var reader io.ReadSeeker
@@ -4118,7 +5156,33 @@ func newAnonymousCORSRequest(t *testing.T, method, bucketName string, body []byt
 	if err != nil {
 		t.Fatalf("failed to build an anonymous %s ?cors request: %v", method, err)
 	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
 	return request
+}
+
+// grantAnonymousCORSAction stores a bucket policy granting the anonymous
+// principal exactly one CORS action on the bucket, and returns the function that
+// removes it again.
+//
+// This is what makes the unsigned write path reachable: without a policy an
+// anonymous request is refused before the handler reads anything, so the only way
+// to drive a body no signature covers all the way into the handler is to
+// authorize it by policy.
+func grantAnonymousCORSAction(t *testing.T, bucketName, action string) func() {
+	t.Helper()
+
+	if _, err := globalBucketMetadataSys.Update(GlobalContext, bucketName, bucketPolicyConfig,
+		[]byte(corsAnonymousPolicy(bucketName, action))); err != nil {
+		t.Fatalf("failed to grant the anonymous principal %s on bucket %s: %v", action, bucketName, err)
+	}
+
+	return func() {
+		if _, err := globalBucketMetadataSys.Delete(GlobalContext, bucketName, bucketPolicyConfig); err != nil {
+			t.Fatalf("failed to remove the bucket policy of %s: %v", bucketName, err)
+		}
+	}
 }
 
 // execCORSNilObjectLayerTest covers the branch every CORS handler evaluates
@@ -4280,14 +5344,14 @@ func testPutBucketCorsHandler(obj ObjectLayer, instanceType, bucketName string, 
 	// A body that fails its own integrity check is not a body that failed to
 	// validate, and it keeps the S3 code that failure already has. Each request
 	// below carries the canonical document, so the schema is beyond reproach and
-	// the only thing wrong is the digest the client declared.
+	// the only thing wrong is something the client declared about the bytes.
 	//
 	// newTestRequest computes a correct Content-Md5 and x-amz-content-sha256 for
-	// the body and newTestSignedRequestV4 applies these overrides before signing,
-	// so each request is perfectly signed and exactly one declared digest is
-	// wrong. The mismatch is then discovered where it is in production: while the
-	// handler reads the body through the verifying reader that
-	// checkRequestAuthType installed in place of it.
+	// the body and every builder applies these overrides before signing, so each
+	// request is perfectly signed and exactly one declared value is wrong. The
+	// mismatch is then discovered where it is in production: while the handler
+	// reads the document through the verifying reader corsConfigBody handed it.
+	corruptedBytes := []byte("not the document that follows")
 	integrityCases := []struct {
 		name       string
 		headers    map[string]string
@@ -4295,26 +5359,141 @@ func testPutBucketCorsHandler(obj ObjectLayer, instanceType, bucketName string, 
 		wantStatus int
 	}{
 		{
+			// Runs first in every mode, so each refusal that follows is
+			// attributable to the value the case corrupts rather than to the
+			// authentication mode carrying it.
+			name:       "aTruthfullyDeclaredDocumentIsAccepted",
+			wantStatus: http.StatusOK,
+		},
+		{
 			name:       "aContentMD5MismatchIsBadDigest",
-			headers:    map[string]string{xhttp.ContentMD5: getMD5HashBase64([]byte("not the document that follows"))},
+			headers:    map[string]string{xhttp.ContentMD5: getMD5HashBase64(corruptedBytes)},
 			wantCode:   "BadDigest",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "anUndecodableContentMD5IsAnInvalidDigest",
+			headers:    map[string]string{xhttp.ContentMD5: "this is not a base64 encoded md5"},
+			wantCode:   "InvalidDigest",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "aContentSHA256MismatchKeepsItsOwnCode",
-			headers:    map[string]string{xhttp.AmzContentSha256: getSHA256Hash([]byte("not the document that follows"))},
+			headers:    map[string]string{xhttp.AmzContentSha256: getSHA256Hash(corruptedBytes)},
 			wantCode:   "XAmzContentSHA256Mismatch",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// A declaration that cannot be decoded is refused rather than
+			// discarded, so a client cannot opt out of the check by garbling the
+			// value it declares.
+			name:       "anUndecodableContentSHA256IsRefusedToo",
+			headers:    map[string]string{xhttp.AmzContentSha256: "this is not a hex encoded sha256"},
+			wantCode:   "XAmzContentSHA256Mismatch",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// A checksum is verified by no authentication path at all, in any
+			// signature version, so accepting a truthful one proves the handler
+			// itself both installed the verification and honored it.
+			name: "aTruthfulChecksumIsAccepted",
+			headers: map[string]string{
+				xhttp.AmzChecksumCRC32: hash.NewChecksumFromData(hash.ChecksumCRC32, []byte(corsCanonicalDocument)).Encoded,
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "aChecksumMismatchIsAChecksumMismatch",
+			headers: map[string]string{
+				xhttp.AmzChecksumCRC32: hash.NewChecksumFromData(hash.ChecksumCRC32, corruptedBytes).Encoded,
+			},
+			wantCode:   "XAmzContentChecksumMismatch",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "anUndecodableChecksumIsRefusedAsAnArgument",
+			headers:    map[string]string{xhttp.AmzChecksumCRC32: "this is not a base64 encoded crc32"},
+			wantCode:   "InvalidArgument",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// A checksum promised in a trailer that never arrives is refused
+			// rather than ignored, which is also what keeps the trailing branch
+			// from being reached with nothing to compare against.
+			name:       "aPromisedTrailingChecksumThatNeverArrivesIsRefused",
+			headers:    map[string]string{xhttp.AmzTrailer: xhttp.AmzChecksumCRC32},
+			wantCode:   "XAmzContentChecksumMismatch",
 			wantStatus: http.StatusBadRequest,
 		},
 	}
 
-	for _, integrityCase := range integrityCases {
-		t.Run(integrityCase.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			apiRouter.ServeHTTP(rec, newSignedCORSRequestWithHeaders(t, http.MethodPut, bucketName,
-				[]byte(corsCanonicalDocument), creds, integrityCase.headers))
+	// Every authentication mode the ?cors route admits, because the guarantee is
+	// weakest where the request is least protected. Only the SigV4 path installs a
+	// verifying reader while it authenticates, in isReqAuthenticated; a V2
+	// signature covers the Content-Md5 header but never the bytes; and a request
+	// authorized by a bucket policy is not signed at all. The same contract is
+	// therefore asserted three times over rather than only on the one path that
+	// would have honored it anyway.
+	authModes := []struct {
+		name       string
+		authorize  func(t *testing.T) func()
+		newRequest func(t *testing.T, headers map[string]string) *http.Request
+	}{
+		{
+			name: "signedWithV4",
+			newRequest: func(t *testing.T, headers map[string]string) *http.Request {
+				return newSignedCORSRequestWithHeaders(t, http.MethodPut, bucketName,
+					[]byte(corsCanonicalDocument), creds, headers)
+			},
+		},
+		{
+			name: "signedWithV2",
+			newRequest: func(t *testing.T, headers map[string]string) *http.Request {
+				return newSignedV2CORSRequestWithHeaders(t, http.MethodPut, bucketName,
+					[]byte(corsCanonicalDocument), creds, headers)
+			},
+		},
+		{
+			name: "unsignedAndAuthorizedByBucketPolicy",
+			authorize: func(t *testing.T) func() {
+				return grantAnonymousCORSAction(t, bucketName, policy.PutBucketCorsAction)
+			},
+			newRequest: func(t *testing.T, headers map[string]string) *http.Request {
+				return newAnonymousCORSRequestWithHeaders(t, http.MethodPut, bucketName,
+					[]byte(corsCanonicalDocument), headers)
+			},
+		},
+	}
 
-			assertCORSHandlerError(t, instanceType, rec, integrityCase.wantCode, integrityCase.wantStatus)
+	for _, authMode := range authModes {
+		t.Run(authMode.name, func(t *testing.T) {
+			if authMode.authorize != nil {
+				// Removed again when this mode is done, so the modes stay
+				// independent and the anonymous refusal asserted at the end of
+				// this test is still asserted against a bucket with no policy.
+				t.Cleanup(authMode.authorize(t))
+			}
+
+			for _, integrityCase := range integrityCases {
+				t.Run(integrityCase.name, func(t *testing.T) {
+					rec := httptest.NewRecorder()
+					apiRouter.ServeHTTP(rec, authMode.newRequest(t, integrityCase.headers))
+
+					if integrityCase.wantCode == "" {
+						if rec.Code != integrityCase.wantStatus {
+							t.Fatalf("%s: expected status %d, got %d with body %q",
+								instanceType, integrityCase.wantStatus, rec.Code, truncateForError(rec.Body.String()))
+						}
+						if rec.Body.Len() != 0 {
+							t.Fatalf("%s: expected an empty body on success, got %q",
+								instanceType, truncateForError(rec.Body.String()))
+						}
+						return
+					}
+
+					assertCORSHandlerError(t, instanceType, rec, integrityCase.wantCode, integrityCase.wantStatus)
+				})
+			}
 		})
 	}
 
