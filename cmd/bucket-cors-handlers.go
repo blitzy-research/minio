@@ -18,7 +18,9 @@
 package cmd
 
 import (
+	"context"
 	"encoding/xml"
+	"errors"
 	"net/http"
 
 	"github.com/minio/minio/internal/logger"
@@ -59,11 +61,7 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 	// negative.
 	cfg, err := validateBucketCorsConfig(r.Body)
 	if err != nil {
-		// Surface the specific validation cause to the client, the S3 error code
-		// itself only says the document did not validate.
-		apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
-		apiErr.Description = err.Error()
-		writeErrorResponse(ctx, w, apiErr, r.URL)
+		writeErrorResponse(ctx, w, corsConfigAPIError(ctx, err), r.URL)
 		return
 	}
 
@@ -82,6 +80,36 @@ func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http
 	}
 
 	writeSuccessResponseHeadersOnly(w)
+}
+
+// corsConfigAPIError maps a failure reported by validateBucketCorsConfig to the
+// S3 error the client is answered with.
+//
+// A document that did not validate answers MalformedXML carrying the specific
+// cause, because the code itself only says the document did not validate and the
+// cause is what tells the client which rule and which value to correct.
+//
+// A body that could not be read did not fail to validate, and answering
+// MalformedXML for it would be wrong twice over: the client is told its XML is at
+// fault when it may be perfectly well-formed, and the real fault is hidden.
+// checkRequestAuthType replaces the body of an authenticated request with a
+// reader that verifies Content-MD5, x-amz-content-sha256 and any trailing
+// checksum while the document is consumed, so a mismatch surfaces from the read
+// and already has an S3 error code of its own - BadDigest,
+// XAmzContentSHA256Mismatch or XAmzContentChecksumMismatch. Such a failure is
+// therefore unwrapped and mapped like any other server error, which also keeps a
+// disconnecting client from being reported as having sent bad XML.
+func corsConfigAPIError(ctx context.Context, err error) APIError {
+	var readErr corsConfigReadError
+	if errors.As(err, &readErr) {
+		// toAPIError switches on the concrete type, so the cause is handed over
+		// unwrapped.
+		return toAPIError(ctx, readErr.cause)
+	}
+
+	apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
+	apiErr.Description = err.Error()
+	return apiErr
 }
 
 // GetBucketCorsHandler - GET Bucket CORS.

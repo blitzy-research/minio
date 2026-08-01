@@ -20,7 +20,7 @@ mc cors get myminio/mybucket
 mc cors remove myminio/mybucket
 ```
 
-The same three operations are available through `aws s3api` and through the AWS SDKs, and each of them is a request against the `?cors` sub-resource of the bucket. Every one is authenticated and authorized against its own policy action, so the requests are issued through a client that signs them - see [Bucket CORS operations](#bucket-cors-operations) for the wire contract and [Access control](#access-control) for the actions involved.
+The same three operations are available through `aws s3api` and through the AWS SDKs, and each of them is a request against the `?cors` sub-resource of the bucket. Each is authorized against its own policy action. A signing client such as `mc` is the usual way to issue them, but a signature is not itself what the server insists on: an unsigned request is evaluated against the bucket policy, so a policy that grants the action to an anonymous principal admits one - see [Bucket CORS operations](#bucket-cors-operations) for the wire contract and [Access control](#access-control) for the actions involved.
 
 ## The CORS configuration document
 
@@ -55,7 +55,7 @@ The document's root element is `CORSConfiguration` in the S3 namespace `http://s
 
 | Element | Cardinality per rule | Meaning |
 | --- | --- | --- |
-| `ID` | at most one | A label for the rule. It is stored and returned verbatim and is never matched against a request. |
+| `ID` | at most one | A label for the rule. Its value is preserved apart from the surrounding-whitespace normalization described below, and it is never matched against a request. |
 | `AllowedMethod` | one or more | An HTTP method the rule permits. Only `GET`, `PUT`, `POST`, `DELETE`, and `HEAD` are accepted. |
 | `AllowedOrigin` | one or more | An origin the rule permits, either literally or through a single `*` wildcard. |
 | `AllowedHeader` | zero or more | A request header the browser may announce in the preflight. Matched case-insensitively, and a single `*` wildcard is permitted. |
@@ -70,7 +70,7 @@ What is stored is the canonical form of the document that was submitted, rather 
 - The child elements of every rule are returned in the order `AllowedHeader`, `AllowedMethod`, `AllowedOrigin`, `ExposeHeader`, `ID`, `MaxAgeSeconds`, whatever order they were submitted in. The example above is already written in that order.
 - An element that carries no information is left out, which is why a `MaxAgeSeconds` of `0` does not come back: it means the same as omitting the element, namely that the browser is not to cache the answer.
 
-The rules themselves are never merged, reordered, or rewritten. They are stored and returned in the order the document lists them, which is the order [Preflight evaluation](#preflight-evaluation) matches them in.
+The rules themselves are never merged and never reordered: they are stored and returned in the order the document lists them, which is the order [Preflight evaluation](#preflight-evaluation) matches them in. The canonicalization above is the only rewriting a value undergoes, and none of it widens a rule: no origin, method, or header the document does not name is ever added to one.
 
 ## Bucket CORS operations
 
@@ -91,11 +91,11 @@ A request whose credentials do not permit the operation fails with `403 AccessDe
 
 ## Validation rules
 
-`PutBucketCors` accepts a document only if all of the following hold. Nothing is silently dropped or corrected: a document that violates any of these rules is rejected in full, and the bucket keeps whatever configuration it had.
+`PutBucketCors` accepts a document only if all of the following hold. Validation is all or nothing: a document that violates any one of these rules is rejected in full, no part of it is stored, and the bucket keeps whatever configuration it had. Nothing that carries meaning is repaired or dropped to make a document acceptable - the only changes it undergoes are the canonicalization described in [The CORS configuration document](#the-cors-configuration-document) and the skipping of the insignificant markup listed below.
 
-- The body is well-formed XML no larger than **128 KiB**, and its root element is `CORSConfiguration`. A leading byte order mark is tolerated. A document type declaration is not.
+- The body is well-formed XML and its root element is `CORSConfiguration`. Both the XML that arrives and the canonical form of it that gets stored must be no larger than **128 KiB**, so a document that only just fits can still be refused once the namespace has been filled in or a value escaped. A leading byte order mark is tolerated. A document type declaration is not.
 - The root element either declares the namespace `http://s3.amazonaws.com/doc/2006-03-01/` or declares no namespace at all, in which case the S3 namespace is assumed. Any other namespace is rejected, because the stored document is the one handed back to clients that expect the AWS wire format.
-- The document contains **between 1 and 100 `CORSRule` elements**, and nothing else: no text, no unrecognized element, and nothing following the root element. A misspelled element such as `AllowedOrigins` is refused rather than ignored, so a rule can never be stored with fewer values than the document appears to grant.
+- The document contains **between 1 and 100 `CORSRule` elements** and nothing besides them that could be read as configuration: text outside a rule, an unrecognized element, a nested element where a value belongs, and any element or text following the root element are each refused. A misspelled element such as `AllowedOrigins` is refused rather than ignored, so a rule can never be stored with fewer values than the document appears to grant. Markup that carries no configuration is insignificant and is simply skipped wherever it appears: the XML declaration, the indentation between elements, comments, processing instructions, and any attribute other than the root element's `xmlns`.
 - Every rule carries **at least one `AllowedMethod`**, and each one is `GET`, `PUT`, `POST`, `DELETE`, or `HEAD`. `OPTIONS` is not a valid value - it is the preflight method itself, which the server answers rather than something a rule grants - and neither is `PATCH`.
 - Every rule carries **at least one `AllowedOrigin`**. An origin is either the bare wildcard `*` or a value containing **at most one `*`**, such as `http://www.example2.*`.
 - Every `AllowedHeader` contains **at most one `*`**.
@@ -103,7 +103,7 @@ A request whose credentials do not permit the operation fails with `403 AccessDe
 - `MaxAgeSeconds` is a **non-negative** integer.
 - No origin or header name contains a control character.
 
-A rejection is a `MalformedXML` error whose `Message` names the cause, the rule that carries it, and the offending value, with rules numbered from zero in document order. Submitting a rule whose only `AllowedMethod` is `PATCH` produces the following body, shown here indented for readability and with the `RequestId` and `HostId` that identify the request and the server it reached:
+A rejection is a `MalformedXML` error whose `Message` names the specific validation cause rather than the generic schema text. What else the message points at follows from the cause: one that belongs to a single rule identifies that rule, numbering rules from zero in document order, and one that turns on a particular value quotes that value. A cause that belongs to the document as a whole - an oversized body, a rule count outside the permitted range, a root element that is not `CORSConfiguration` - belongs to no rule, so it identifies none. Submitting a rule whose only `AllowedMethod` is `PATCH` is a per-value cause within a rule, and produces the following body, shown here indented for readability and with the `RequestId` and `HostId` that identify the request and the server it reached:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -118,6 +118,8 @@ A rejection is a `MalformedXML` error whose `Message` names the cause, the rule 
 ```
 
 Clients surface that `Message` verbatim, so `mc` and `aws s3api` both report `CORSRule 0 has unsupported AllowedMethod "PATCH"` rather than the generic schema text.
+
+A request whose body fails its own integrity check is not a document that failed to validate, and it is not reported as one. An authenticated request verifies the `Content-Md5`, `x-amz-content-sha256` and trailing checksum values it declares while the body is read, so a mismatch is answered with the error S3 defines for it - `BadDigest`, `XAmzContentSHA256Mismatch` or `XAmzContentChecksumMismatch` - rather than with `MalformedXML`.
 
 ## Preflight evaluation
 
@@ -145,7 +147,9 @@ The answer is `200 OK` with no body and the CORS response headers the matched ru
 
 The answer also declares `Vary: Origin`, `Vary: Access-Control-Request-Method`, and `Vary: Access-Control-Request-Headers`, because it depends on all three: an intermediary cache has to key on each of them rather than hand one origin's answer to another.
 
-The origin is echoed rather than answered with `*` because MinIO allows credentialed cross-origin requests, and a browser rejects `*` for those. The method and the headers are echoed for the same reason a browser announces them one request at a time: the answer only has to cover the request being asked about.
+The origin is echoed rather than answered with `*` so that the answer names the one caller it was written for, which is what makes the `Vary: Origin` declaration above meaningful: an intermediary that caches the answer can then only reuse it for that origin. The method and the headers are echoed for the same reason a browser announces them one request at a time: the answer only has to cover the request being asked about.
+
+The table above is the complete set of `Access-Control-*` headers a matched rule produces. In particular, a preflight answered from a bucket's own rules does **not** carry `Access-Control-Allow-Credentials`; only the server-wide handler emits that header, which is one of the ways the two answers are told apart in [Relationship to the server-wide CORS setting](#relationship-to-the-server-wide-cors-setting). A browser will not send a credentialed cross-origin request - one made with `credentials: 'include'`, carrying cookies or HTTP authentication - unless the preflight answer says `Access-Control-Allow-Credentials: true`, so a bucket's own rules govern uncredentialed cross-origin requests.
 
 The following preflight matches the `web-app-uploads` rule of the document above:
 
@@ -156,7 +160,9 @@ curl -i -X OPTIONS http://localhost:9000/mybucket/ \
   -H "Access-Control-Request-Headers: content-type"
 ```
 
-```sh
+Its answer carries the following CORS headers. The block is an excerpt: the response also carries the generic headers the HTTP server adds to any reply, such as `Date` and a zero `Content-Length`.
+
+```http
 HTTP/1.1 200 OK
 Access-Control-Allow-Headers: content-type
 Access-Control-Allow-Methods: PUT
@@ -172,9 +178,9 @@ A preflight is not an authenticated S3 request and carries no credentials, so it
 
 ### When no rule matches
 
-**The answer carries no `Access-Control-Allow-*` header at all, and that absence is the denial.** The status is still `200 OK`, because the preflight itself was a perfectly valid HTTP request; what tells the browser it may not proceed is that the response never names its origin. Only `Vary` is set. There is no error code to look for, so a client debugging a denied request should look for a missing `Access-Control-Allow-Origin` rather than for a failed status.
+**The answer carries no `Access-Control-Allow-*` header at all, and that absence is the denial.** The status is still `200 OK`, because the preflight itself was a perfectly valid HTTP request; what tells the browser it may not proceed is that the response never names its origin. Among the CORS decision headers, only `Vary` is set. There is no error code to look for, so a client debugging a denied request should look for a missing `Access-Control-Allow-Origin` rather than for a failed status.
 
-Changing the origin of the request above to one no rule names produces exactly that:
+Changing the origin of the request above to one no rule names is denied in exactly that way:
 
 ```sh
 curl -i -X OPTIONS http://localhost:9000/mybucket/ \
@@ -183,17 +189,20 @@ curl -i -X OPTIONS http://localhost:9000/mybucket/ \
   -H "Access-Control-Request-Headers: content-type"
 ```
 
-```sh
+Again as an excerpt, alongside the generic headers the HTTP server adds:
+
+```http
 HTTP/1.1 200 OK
 Vary: Origin
 Vary: Access-Control-Request-Method
 Vary: Access-Control-Request-Headers
 ```
 
-The same answer is given whenever the request deviates on any single axis - a method no rule allows, or a single requested header no rule covers, is enough - and in two further cases:
+The same answer is given whenever the request deviates on any single axis - a method no rule allows, or a single requested header no rule covers, is enough. However many headers a preflight announces, every one of them is evaluated against the rule: the list is never shortened, and no count of its own refuses a request.
 
-- A preflight that announces an implausible number of distinct headers, far more than any browser sends, is refused outright instead of being matched against a shortened list, so no header is ever left unchecked against the rules.
-- A bucket whose own rules cannot be established is refused rather than answered from the server-wide setting - while a freshly started server is still loading bucket metadata, for instance. This fails closed on purpose: a restrictively configured bucket is never answered out of a more permissive default merely because its rules were momentarily unavailable. The refusal costs the client nothing that outlives the condition, because it carries no `Access-Control-Max-Age` and a browser does not cache a refused preflight, so a retry once the rules are in hand is answered from them.
+One further case is answered the same way:
+
+- A bucket whose own rules cannot be established is refused rather than answered from the server-wide setting - while a freshly started server is still loading bucket metadata, for instance. This fails closed on purpose: a restrictively configured bucket is never answered out of a more permissive default merely because its rules were momentarily unavailable. The refusal costs the client nothing that outlives the condition, because it carries no `Access-Control-Max-Age` and a browser does not cache a refused preflight, so a retry once the rules are in hand is answered from them. Because such a refusal looks to a client exactly like one the rules produced, the server reports the reason in its log as a warning, at a bounded rate rather than once per request, so that an operator can tell the two apart.
 
 Be clear about what a denial is and is not. It is enforced by the browser, which withholds the response from the page that asked for it; it is not server-side access control. A client that speaks to MinIO directly is unaffected by CORS rules entirely, because nothing in the mechanism depends on it cooperating. Deciding who may read an object remains the job of credentials and bucket policies; a bucket's CORS rules decide only what a browser will do on a page's behalf.
 
@@ -201,7 +210,7 @@ Be clear about what a denial is and is not. It is enforced by the browser, which
 
 MinIO has always had a server-wide allow-origin list, `MINIO_API_CORS_ALLOW_ORIGIN`, which defaults to `'*'` and is documented with the rest of the `api` subsystem in the [MinIO Server Configuration Guide](https://github.com/minio/minio/blob/master/docs/config/README.md):
 
-```sh
+```text
 MINIO_API_CORS_ALLOW_ORIGIN               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
 ```
 
@@ -210,7 +219,7 @@ That setting is unchanged by per-bucket CORS and remains the server-wide control
 - A bucket that **has** a CORS configuration is answered from it, and only from it. Its rules decide, and the server-wide list is not consulted for that bucket's preflights.
 - A bucket that has **no** CORS configuration is answered exactly as it was before, by the server-wide handler governed by `MINIO_API_CORS_ALLOW_ORIGIN`. Setting a configuration on one bucket changes nothing for any other bucket.
 
-The two answers are easy to tell apart when you are checking which one you got: the server-wide handler replies to a preflight with `204 No Content` and includes `Access-Control-Allow-Credentials: true`, and it never emits `Access-Control-Max-Age` or `Access-Control-Expose-Headers`. A preflight answered from a bucket's own rules replies `200 OK` instead. Removing a bucket's configuration with `DeleteBucketCors` hands that bucket back to the server-wide setting.
+The two answers are easy to tell apart when you are checking which one you got: the server-wide handler replies to a preflight with `204 No Content` and includes `Access-Control-Allow-Credentials: true`, and it never emits `Access-Control-Max-Age` or `Access-Control-Expose-Headers`. A preflight answered from a bucket's own rules replies `200 OK`, carries no `Access-Control-Allow-Credentials`, and does emit `Access-Control-Max-Age` and `Access-Control-Expose-Headers` when the matched rule configures them. Removing a bucket's configuration with `DeleteBucketCors` hands that bucket back to the server-wide setting.
 
 The division is over preflights specifically, because that is where a bucket's rules are consulted. A cross-origin request simple enough that the browser sends no preflight at all - a plain `GET` carrying no custom header, say - is not preceded by one, so the CORS headers on its response continue to come from the server-wide handler exactly as they did before. Setting per-bucket rules is therefore how you constrain the requests a browser has to ask permission for, not a way to change how MinIO answers a request it is asked directly.
 
@@ -218,10 +227,10 @@ The division is over preflights specifically, because that is where a bucket's r
 
 The wire format is the AWS one, so the operations work with the AWS SDKs and with any tool built on them. Two clients are worth showing explicitly, because they take the configuration in different shapes.
 
-`mc` takes the XML document as it goes over the wire:
+`mc` takes the XML document as it goes over the wire. Leaving the access key and secret key off the `alias set` command makes `mc` prompt for them, which keeps them out of the shell history; the plain `http://` endpoint below is only appropriate because it is local, and any other endpoint should be `https://`:
 
 ```sh
-mc alias set myminio http://localhost:9000 minioadmin minioadmin
+mc alias set myminio http://localhost:9000
 mc cors set myminio/mybucket cors.xml
 mc cors get myminio/mybucket
 mc cors remove myminio/mybucket
@@ -273,7 +282,9 @@ The three operations are governed by the policy actions S3 defines for them, and
 | `GetBucketCors` | `s3:GetBucketCors` |
 | `DeleteBucketCors` | `s3:DeleteBucketCors` |
 
-`DeleteBucketCors` requires its own `s3:DeleteBucketCors` action; permission to write a configuration does not imply permission to remove one. All three actions already existed in MinIO's policy vocabulary, so the capability ships without any change to the identity and access model, and a policy granting them is written like any other bucket policy statement:
+`DeleteBucketCors` requires its own `s3:DeleteBucketCors` action; permission to write a configuration does not imply permission to remove one. All three actions already existed in MinIO's policy vocabulary, so the capability ships without any change to the identity and access model. There are two ways to grant them, and they differ in one element.
+
+An **identity policy** names actions and resources but no principal, because the principal is whichever user or group the policy is attached to:
 
 ```json
 {
@@ -292,7 +303,38 @@ The three operations are governed by the policy actions S3 defines for them, and
 }
 ```
 
-The root credentials need no such policy, so an administrator can configure a bucket's CORS rules straight away and grant the actions to other identities afterwards.
+Save that as `cors-admin.json`, then create it on the server and attach it to an identity:
+
+```sh
+mc admin policy create myminio cors-admin cors-admin.json
+mc admin policy attach myminio cors-admin --user webops
+```
+
+A **bucket policy** is attached to the bucket instead, so it has to say who it applies to: every statement must carry a `Principal`, and MinIO rejects one that does not. Granting a CORS action to the anonymous principal is what makes an unsigned request to the `?cors` sub-resource succeed:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": ["*"]},
+      "Action": [
+        "s3:GetBucketCors"
+      ],
+      "Resource": ["arn:aws:s3:::mybucket"]
+    }
+  ]
+}
+```
+
+Save that as `cors-read.json` and put it on the bucket:
+
+```sh
+mc anonymous set-json cors-read.json myminio/mybucket
+```
+
+Grant only the actions you mean to: the example above lets anyone read the bucket's CORS configuration, and adding `s3:PutBucketCors` or `s3:DeleteBucketCors` to it would let anyone rewrite or erase that configuration. The root credentials need neither policy, so an administrator can configure a bucket's CORS rules straight away and grant the actions to other identities afterwards.
 
 ## Explore Further
 

@@ -51,6 +51,21 @@ type BucketMetadataSys struct {
 	initialized bool
 	group       *singleflight.Group
 	metadataMap map[string]BucketMetadata
+
+	// unavailableBuckets holds the buckets that are known to exist, because
+	// they were listed from the backend, but whose metadata could not be
+	// loaded, so nothing about their configuration is known.
+	//
+	// Without it a bucket skipped by a failed load is indistinguishable from a
+	// bucket that does not exist: both are simply missing from metadataMap. A
+	// cache-only reader would then answer for such a bucket out of whatever
+	// default applies when no configuration is set, which for CORS means the
+	// permissive server-wide origin list, relaxing a restrictive bucket for as
+	// long as its metadata stays unreadable. An entry is added when a load
+	// fails and no metadata for the bucket is already in hand, and removed as
+	// soon as metadata for it reaches metadataMap or the bucket is gone, so the
+	// map only ever holds buckets whose answer is genuinely unknown.
+	unavailableBuckets map[string]struct{}
 }
 
 // Count returns number of bucket metadata map entries.
@@ -67,6 +82,9 @@ func (sys *BucketMetadataSys) Remove(buckets ...string) {
 	for _, bucket := range buckets {
 		sys.group.Forget(bucket)
 		delete(sys.metadataMap, bucket)
+		// A bucket that is gone is no longer a bucket whose metadata is
+		// pending; it has no answer to be unknown.
+		delete(sys.unavailableBuckets, bucket)
 		globalBucketMonitor.DeleteBucket(bucket)
 	}
 	sys.Unlock()
@@ -84,6 +102,12 @@ func (sys *BucketMetadataSys) RemoveStaleBuckets(diskBuckets set.StringSet) {
 		delete(sys.metadataMap, bucket)
 		globalBucketMonitor.DeleteBucket(bucket)
 	}
+	for bucket := range sys.unavailableBuckets {
+		if diskBuckets.Contains(bucket) {
+			continue
+		} // doesn't exist on disk, so its metadata is not pending anymore.
+		delete(sys.unavailableBuckets, bucket)
+	}
 }
 
 // Set - sets a new metadata in-memory.
@@ -95,8 +119,28 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 	if !isMinioMetaBucketName(bucket) {
 		sys.Lock()
 		sys.metadataMap[bucket] = meta
+		// The bucket's metadata is in hand, so it is no longer unavailable.
+		delete(sys.unavailableBuckets, bucket)
 		sys.Unlock()
 	}
+}
+
+// markMetadataUnavailable records that the metadata of a bucket known to exist
+// could not be loaded, so that a cache-only reader can tell the bucket apart
+// from one that does not exist instead of answering for it out of a default it
+// may never have chosen.
+//
+// Metadata already in hand takes precedence: a load that fails for a bucket the
+// cache still holds leaves that bucket answerable from what it holds, so it is
+// not recorded as unavailable.
+func (sys *BucketMetadataSys) markMetadataUnavailable(bucket string) {
+	sys.Lock()
+	defer sys.Unlock()
+
+	if _, ok := sys.metadataMap[bucket]; ok {
+		return
+	}
+	sys.unavailableBuckets[bucket] = struct{}{}
 }
 
 func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket string, configFile string, configData []byte, parse bool) (updatedAt time.Time, err error) {
@@ -390,8 +434,8 @@ func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config,
 // CORS preflight evaluator needs, because a browser preflight carries no
 // credentials and its path is entirely attacker controlled.
 //
-// The two absence cases are reported distinctly, and the caller must treat them
-// differently:
+// Three answers report that no configuration was returned, and the caller must
+// treat them differently because only the first is a definitive absence:
 //
 //   - BucketCORSConfigNotFound means the bucket definitively has no CORS
 //     configuration, either because its metadata is loaded and carries none or
@@ -400,17 +444,35 @@ func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config,
 //   - errBucketMetadataNotInitialized means the answer is simply not known yet,
 //     because the bucket is absent from a cache that has not finished loading.
 //     A caller must not read that as an absence.
+//   - errBucketMetadataUnavailable means the bucket is known to exist but its
+//     metadata could not be loaded, so the answer is not known and will not
+//     become known until a later load succeeds. A caller must not read that as
+//     an absence either.
+//
+// The three states are read under a single lock, so a bucket whose metadata
+// arrives while this runs is never reported as definitively absent.
 func (sys *BucketMetadataSys) GetCORSConfigCached(bucket string) (*miniogocors.Config, time.Time, error) {
-	meta, err := sys.Get(bucket)
-	if err != nil {
-		if errors.Is(err, errConfigNotFound) {
-			if !sys.Initialized() {
-				return nil, time.Time{}, errBucketMetadataNotInitialized
-			}
-			return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
-		}
-		return nil, time.Time{}, err
+	if isMinioMetaBucketName(bucket) {
+		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
 	}
+
+	sys.RLock()
+	meta, loaded := sys.metadataMap[bucket]
+	_, unavailable := sys.unavailableBuckets[bucket]
+	initialized := sys.initialized
+	sys.RUnlock()
+
+	switch {
+	case loaded:
+		// The bucket's metadata is in hand; answer from it below.
+	case !initialized:
+		return nil, time.Time{}, errBucketMetadataNotInitialized
+	case unavailable:
+		return nil, time.Time{}, fmt.Errorf("bucket %s: %w", bucket, errBucketMetadataUnavailable)
+	default:
+		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
+	}
+
 	if meta.corsConfig == nil {
 		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}
 	}
@@ -510,6 +572,12 @@ func (sys *BucketMetadataSys) GetConfigFromDisk(ctx context.Context, bucket stri
 
 var errBucketMetadataNotInitialized = errors.New("bucket metadata not initialized yet")
 
+// errBucketMetadataUnavailable is returned for a bucket that is known to exist
+// but whose metadata could not be loaded, so nothing about its configuration is
+// known. It is deliberately not a not-found error: the configuration is
+// unavailable, not absent.
+var errBucketMetadataUnavailable = errors.New("bucket metadata is unavailable")
+
 // GetConfig returns a specific configuration from the bucket metadata.
 // The returned object may not be modified.
 // reloaded will be true if metadata refreshed from disk
@@ -546,6 +614,8 @@ func (sys *BucketMetadataSys) GetConfig(ctx context.Context, bucket string) (met
 	}
 	sys.Lock()
 	sys.metadataMap[bucket] = meta
+	// The bucket's metadata is in hand, so it is no longer unavailable.
+	delete(sys.unavailableBuckets, bucket)
 	sys.Unlock()
 
 	return meta, true, nil
@@ -597,9 +667,18 @@ func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []stri
 	sys.Lock()
 	for i, meta := range bucketMetas {
 		if errs[i] != nil {
+			// The bucket exists - it was listed from the backend - but its
+			// metadata could not be read, so it must not be left looking like a
+			// bucket that never existed once loading is declared finished.
+			// Remembering it keeps a cache-only reader from answering for it out
+			// of a default the bucket may never have chosen.
+			if _, ok := sys.metadataMap[buckets[i]]; !ok {
+				sys.unavailableBuckets[buckets[i]] = struct{}{}
+			}
 			continue
 		}
 		sys.metadataMap[buckets[i]] = meta
+		delete(sys.unavailableBuckets, buckets[i])
 	}
 	sys.Unlock()
 
@@ -648,6 +727,11 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 				meta, err := loadBucketMetadata(ctx, sys.objAPI, bucket)
 				if err != nil {
 					internalLogIf(ctx, err, logger.WarningKind)
+					// A refresh that cannot read a bucket leaves whatever
+					// metadata is already in hand in place; a bucket with none
+					// is remembered as unavailable rather than left
+					// indistinguishable from a bucket that does not exist.
+					sys.markMetadataUnavailable(bucket)
 					wait() // wait to proceed to next entry.
 					continue
 				}
@@ -657,6 +741,12 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 				if lu := sys.metadataMap[bucket].lastUpdate(); lu.Before(meta.lastUpdate()) {
 					updated = true
 					sys.metadataMap[bucket] = meta
+				}
+				// Clear the pending state exactly when the bucket's metadata is
+				// in hand, whether this refresh installed it or an earlier load
+				// did.
+				if _, ok := sys.metadataMap[bucket]; ok {
+					delete(sys.unavailableBuckets, bucket)
 				}
 				sys.Unlock()
 
@@ -705,13 +795,15 @@ func (sys *BucketMetadataSys) init(ctx context.Context, buckets []string) {
 func (sys *BucketMetadataSys) Reset() {
 	sys.Lock()
 	clear(sys.metadataMap)
+	clear(sys.unavailableBuckets)
 	sys.Unlock()
 }
 
 // NewBucketMetadataSys - creates new policy system.
 func NewBucketMetadataSys() *BucketMetadataSys {
 	return &BucketMetadataSys{
-		metadataMap: make(map[string]BucketMetadata),
-		group:       &singleflight.Group{},
+		metadataMap:        make(map[string]BucketMetadata),
+		unavailableBuckets: make(map[string]struct{}),
+		group:              &singleflight.Group{},
 	}
 }
