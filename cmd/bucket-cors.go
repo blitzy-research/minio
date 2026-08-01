@@ -38,10 +38,12 @@ import (
 const (
 	bucketCORSConfig = "cors.xml"
 
-	// Maximum size of a CORS configuration document, matching the 128 KiB
-	// ceiling MinIO's own SDK bounds its decoder at. validateBucketCorsConfig
-	// enforces it, refusing a body that exceeds it rather than validating a
-	// truncated prefix of it.
+	// Maximum size of a CORS configuration document. AWS S3 limits the document
+	// to 64 KiB; MinIO's own SDK bounds its decoder at 128 KiB as a safety
+	// margin, and the same ceiling is applied here so that every document the
+	// SDK accepts is accepted. validateBucketCorsConfig enforces it, reading one
+	// byte past the ceiling so an oversized body is refused rather than
+	// validated as a truncated prefix of itself.
 	maxBucketCORSConfigSize = 128 * humanize.KiByte
 
 	maxBucketCORSRules = 100
@@ -49,25 +51,15 @@ const (
 	// Most comparisons one preflight evaluation may perform before it is refused
 	// instead of completed.
 	//
-	// Evaluating a preflight compares every header it asks about against the
-	// AllowedHeader values of the rules whose origin and method match, so the
-	// work is the product of two lists a bucket owner and a client choose
-	// separately. Both are individually bounded - a stored document is at most
-	// maxBucketCORSConfigSize, which holds on the order of four thousand
-	// AllowedHeader values, and a request admitted by
-	// corsPreflightHeadersTooLarge carries at most maxHeaderSize bytes of
-	// headers, which names on the order of four thousand of them - but their
-	// product is on the order of sixteen million, and a preflight is
-	// unauthenticated, so nothing else stands between a client and that product
-	// being spent per request.
-	//
-	// This ceiling is an order of magnitude below that product and two orders
-	// above what any real preflight costs: a browser asks about a handful of
-	// headers, and even a request naming thirty-two of them against a document
-	// holding four thousand patterns spends an eighth of it. Exceeding it
-	// therefore says the evaluation is not one a browser would drive, and the
-	// request is refused - fail closed, since a request whose rules were never
-	// fully evaluated cannot be known to be allowed by them.
+	// The work is the product of two lists chosen separately, by a bucket owner
+	// and by an unauthenticated client: every header a preflight asks about is
+	// compared against the AllowedHeader values of the rules whose origin and
+	// method match. Each list is bounded on its own - by
+	// maxBucketCORSConfigSize and by corsPreflightHeadersTooLarge - but nothing
+	// bounds their product, so this budget does. It leaves ordinary preflights,
+	// which ask about a handful of headers, orders of magnitude of headroom.
+	// Exhausting it fails closed: rules that were not evaluated in full cannot
+	// be known to allow the request.
 	maxCORSPreflightMatchCost = 1 << 20
 
 	// Shortest interval between two reports that preflight requests are being
@@ -259,12 +251,13 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 		return nil, fmt.Errorf("Unexpected root element %q, expected %s", cfg.XMLName.Local, corsConfigurationElement)
 	}
 
-	// Requirement R8, the AWS wire format. The parser defaults an absent
-	// namespace to the S3 namespace but preserves any other value, and the
-	// marshaller emits whatever it holds, so a document declaring a different
-	// namespace has to be rejected here. Both forms matter and neither implies
-	// the other: the resolved element namespace can be correct while a default
-	// xmlns attribute alongside a prefixed element name is not.
+	// The parser defaults an absent namespace to the S3 namespace but preserves
+	// any other value, and the marshaller emits whatever it holds, so a document
+	// declaring a different namespace has to be rejected here: it would be
+	// persisted and handed back to clients that expect the AWS wire format. Both
+	// forms matter and neither implies the other - the resolved element namespace
+	// can be correct while a default xmlns attribute alongside a prefixed element
+	// name is not.
 	if cfg.XMLName.Space != "" && cfg.XMLName.Space != corsConfigXMLNS {
 		return nil, fmt.Errorf("Unexpected XML namespace %q on the %s element, expected %s",
 			cfg.XMLName.Space, corsConfigurationElement, corsConfigXMLNS)
@@ -804,7 +797,8 @@ type corsHeaderMatcher struct {
 	exact map[string]struct{}
 	// patterns holds the lower-cased AllowedHeader values that carry a
 	// wildcard. They cannot be looked up and are compared one by one, which is
-	// affordable because a rule names very few of them.
+	// what maxCORSPreflightMatchCost bounds: a rule may list as many of them as
+	// a stored document holds.
 	patterns []string
 }
 
@@ -917,30 +911,28 @@ func corsPreflightHeadersTooLarge(header http.Header) bool {
 // It wraps the server-wide rs/cors handler built by corsHandler and is therefore
 // the outermost HTTP layer. That placement is required: no mux route registers
 // OPTIONS, so a preflight never reaches an S3 handler and a mux middleware would
-// be bypassed for it. It also means this code runs before any authentication, on
-// a request whose path and headers are entirely client controlled, so it does
-// exactly two things with them: read the in-memory bucket metadata, and answer.
+// be bypassed for it. It also means this runs before authentication and before
+// the mux middlewares, on a request whose path and headers are entirely client
+// controlled, so it repeats their admission checks itself and reads only the
+// in-memory bucket metadata.
 //
 // A request is disposed of in one of three ways:
 //
 //   - Delegated, which keeps the server-wide MINIO_API_CORS_ALLOW_ORIGIN setting
-//     in force for it: the request is not a preflight, carries no origin to echo
-//     back, addresses the server root, names no syntactically valid bucket, or
-//     names a bucket that definitively has no CORS configuration of its own. That
-//     definitive absence is the only lookup outcome the fallback rests on.
+//     in force for it: the request is not a preflight, addresses the server root
+//     or no syntactically valid bucket, or names a bucket that definitively has
+//     no CORS configuration of its own. That definitive absence is the only
+//     lookup outcome the fallback rests on.
 //   - Allowed, on the first rule that matches: HTTP 200 with the CORS response
 //     headers that rule configures.
 //   - Denied, HTTP 200 carrying no Access-Control-Allow-* header, which is how a
 //     browser learns the request is refused: the bucket has rules and none of
 //     them allows this request, or this layer will not answer for the request at
-//     all. Rules that are merely unavailable - an absent or still loading
-//     metadata subsystem, a bucket whose metadata could not be loaded, an
-//     unusable stored document, a failed lookup - are refused rather than
-//     delegated, because the server-wide default allows every origin with
-//     credentials and would relax a restrictive bucket for as long as they stay
-//     unavailable. So is a request the server itself would refuse outright, for
-//     the same reason: delegating it would answer a request that never reaches a
-//     bucket handler out of the most permissive setting the server has.
+//     all. Rules that are merely unavailable, and a request the server itself
+//     would refuse outright, are denied rather than delegated - the server-wide
+//     default allows every origin with credentials, so delegating either would
+//     answer for a possibly restrictive bucket out of the most permissive setting
+//     the server has.
 func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match the rs/cors preflight gate, plus the Origin that a matched rule
@@ -957,33 +949,27 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// A request carrying more header bytes than this server admits is refused
-		// here for the same reason a Host it does not accept is, just below:
-		// setRequestLimitMiddleware refuses it before any bucket handler runs, so
-		// the request this preflight asks about could never be served, and
-		// delegating the preflight would answer it out of the most permissive
-		// setting the server has. Checking it before anything else is read from
-		// the headers is also what bounds every step that follows, since the
-		// lists this layer parses, compares and echoes back are the ones those
-		// bytes carry - which is why every value of every repeated field counts
-		// towards the ceiling here, rather than the first value of each field
-		// alone.
+		// setRequestLimitMiddleware refuses a request carrying more header bytes
+		// than this ceiling before any bucket handler runs, so the request this
+		// preflight asks about could never be served and the preflight is refused
+		// here rather than answered from the server-wide default. Applying it
+		// before anything else is read from the headers is also what bounds every
+		// step below, since the lists this layer parses, compares and echoes back
+		// are the ones those bytes carry.
 		if corsPreflightHeadersTooLarge(r.Header) {
 			corsPreflightRefused.report(errCORSPreflightHeadersTooLarge)
 			writeCORSPreflightDenied(w)
 			return
 		}
 
-		// A Host this server does not accept is refused here, because it is
-		// refused everywhere else: setRequestValidityMiddleware answers HTTP 400
-		// for it before any bucket handler runs, so the request this preflight
-		// asks about could never be served. Delegating it instead would answer
-		// the one request the server does respond to - the preflight - out of the
-		// most permissive setting the server has, and the router does still route
-		// such a request, so the bucket it would have reached may well have
-		// restrictive rules of its own. hasBadHost is the very check that
-		// middleware applies, including its allowance for an empty Host under
-		// CI/CD, so the two layers agree by construction.
+		// setRequestValidityMiddleware answers HTTP 400 for a Host this server
+		// does not accept, so the request this preflight asks about could never be
+		// served either - while the router does still route it to a real bucket
+		// whose own rules may be restrictive, which is why the preflight is
+		// refused here rather than answered from the server-wide default.
+		// hasBadHost is the very check that middleware applies, including its
+		// allowance for an empty Host under CI/CD, so the two layers agree by
+		// construction.
 		if hasBadHost(r.Host) != nil {
 			corsPreflightRefused.report(errCORSPreflightHostNotAccepted)
 			writeCORSPreflightDenied(w)
@@ -1013,8 +999,7 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		bucket, _ := path2BucketObject(resource)
 		if bucket == "" {
 			// A preflight for the server root names no bucket, so there are no
-			// per-bucket rules to apply and the server-wide setting answers it,
-			// exactly as it did before this layer existed.
+			// per-bucket rules to apply and the server-wide setting answers it.
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1031,33 +1016,21 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		cfg, err := preflightCORSConfig(bucket)
 		switch {
 		case err == nil:
-			// The bucket's own rules are in hand; evaluate the request against
-			// them below.
 		case isBucketCORSConfigNotFound(err):
-			// The bucket definitively has no CORS configuration of its own,
-			// which is the one and only state that falls back to the
-			// server-wide handler, so the pre-existing
-			// MINIO_API_CORS_ALLOW_ORIGIN behavior answers the request
-			// unchanged.
+			// A definitive absence of rules is the one and only state the
+			// server-wide MINIO_API_CORS_ALLOW_ORIGIN fallback answers.
 			next.ServeHTTP(w, r)
 			return
 		default:
 			// The bucket's rules could not be established - the metadata
 			// subsystem is absent or has not finished loading, the stored
-			// document is unusable, or the lookup failed. Deny rather than fall
-			// back: a configuration that is merely unavailable is not an absent
-			// configuration, and delegating here would answer for a possibly
-			// restrictive bucket out of the permissive server-wide default.
+			// document is unusable, or the lookup failed. Unavailable is not
+			// absent, so deny rather than relax the bucket to the permissive
+			// server-wide default for as long as the condition lasts.
 			//
-			// The refusal costs a client nothing that outlives the condition. It
-			// carries no Access-Control-Max-Age and a refused preflight is not
-			// entered into a browser's preflight cache, so a retry once the rules
-			// are in hand is answered from them; and while the metadata is still
-			// loading, the request the preflight asks about answers 503 anyway.
-			//
-			// It does, however, look exactly like the refusals further down,
-			// which say the request was evaluated against the bucket's rules and
-			// not allowed by them, so the reason for this one is reported - at a
+			// The refusal is indistinguishable from the ones further down, which
+			// say the request was evaluated against the bucket's rules and not
+			// allowed by them, so the reason for this one is reported - at a
 			// bounded rate, and carrying nothing the unauthenticated request
 			// brought with it beyond the bucket name validated just above.
 			corsPreflightRefused.report(fmt.Errorf(

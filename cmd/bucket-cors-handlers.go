@@ -162,38 +162,18 @@ func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCo
 // corsConfigAPIError maps a failure reported by validateBucketCorsConfig to the
 // S3 error the client is answered with.
 //
+// A failure raised while the body was read keeps the code that names it rather
+// than being reported as a schema violation: the integrity failures corsConfigBody
+// verifies surface with their own codes, and a transfer that ended early becomes
+// IncompleteBody through toObjectErr, the same conversion the object write path
+// applies. A cause neither recognizes remains a server error.
+//
 // A document that did not validate answers MalformedXML carrying the specific
 // cause, because the code itself only says the document did not validate and the
 // cause is what tells the client which rule and which value to correct.
-//
-// A body that could not be read did not fail to validate, and answering
-// MalformedXML for it would be wrong twice over: the client is told its XML is at
-// fault when it may be perfectly well-formed, and the real fault is hidden. Two
-// kinds of failure surface from the read, and each keeps the S3 error code that
-// names it:
-//
-//   - An integrity failure. corsConfigBody hands the handler a body that verifies
-//     Content-MD5, x-amz-content-sha256 and any x-amz-checksum-* the client
-//     declared while the document is consumed, so a mismatch surfaces from the
-//     read already carrying its own code - BadDigest, XAmzContentSHA256Mismatch
-//     or XAmzContentChecksumMismatch.
-//   - A body that stopped short of what the client said it was sending, which the
-//     transport reports as an unexpected end of input. S3 answers IncompleteBody
-//     for exactly that, and this server maps it there through toObjectErr, the
-//     same conversion the object write path applies to a read that ended early.
-//
-// The cause is therefore unwrapped and handed to toObjectErr before toAPIError.
-// toObjectErr converts an early end of input, a short write and an expired
-// deadline into IncompleteBody, and returns everything else - the integrity
-// failures above included - unchanged for toAPIError to map on its own. A cause
-// neither of them recognizes remains a server error, which is what an unknown
-// transport failure is.
 func corsConfigAPIError(ctx context.Context, err error) APIError {
 	var readErr corsConfigReadError
 	if errors.As(err, &readErr) {
-		// toObjectErr and toAPIError both switch on the concrete type, so the
-		// cause is handed over unwrapped rather than as the corsConfigReadError
-		// that carried it back here.
 		return toAPIError(ctx, toObjectErr(readErr.cause))
 	}
 

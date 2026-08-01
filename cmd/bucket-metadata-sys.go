@@ -54,28 +54,18 @@ type BucketMetadataSys struct {
 
 	// unavailableBuckets holds the buckets whose metadata this cache cannot
 	// vouch for, because the most recent attempt to load it failed. Whatever
-	// metadataMap holds for such a bucket - an entry from an earlier load, or
-	// no entry at all - is of unknown currency until a load succeeds again.
+	// metadataMap holds for such a bucket - an entry from an earlier load, or no
+	// entry at all - is of unknown currency until a load succeeds again, so a
+	// cache-only reader must not answer for it out of the default that applies
+	// when nothing is set.
 	//
-	// The distinction matters because a bucket whose metadata cannot be read is
-	// otherwise indistinguishable from a bucket that has no configuration: both
-	// answer "nothing set". A cache-only reader would then answer for it out of
-	// whatever default applies when no configuration is set, which for CORS
-	// means the permissive server-wide origin list, relaxing a restrictive
-	// bucket for as long as its metadata stays unreadable. Nor is an entry that
-	// is merely present enough to vouch for: a bucket whose owner has just
-	// tightened or removed its rules keeps answering from the superseded copy
-	// if the refresh that would have brought that change in failed, so an entry
-	// from before a failed load is treated as unknown rather than
-	// authoritative.
-	//
-	// An entry is therefore added on every failed load, whether or not metadata
-	// for the bucket is already in hand, and removed only once a load succeeds
-	// or the bucket's metadata is set or replaced outright - never merely
-	// because something is cached. Its growth is bounded by the set of buckets
-	// the backend reports, since the only loads recorded here are of buckets
-	// listed from it: the initial load of the cache, and the refresh that walks
-	// the same listing afterwards.
+	// An entry is added on every failed load, whether or not metadata for the
+	// bucket is already in hand, and removed only once a load succeeds or the
+	// bucket's metadata is set or removed outright - never merely because
+	// something is cached. Its growth is bounded by the set of buckets the
+	// backend reports, since the only loads recorded here are of buckets listed
+	// from it: the initial load of the cache, and the refresh that walks the same
+	// listing afterwards.
 	unavailableBuckets map[string]struct{}
 }
 
@@ -138,17 +128,12 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 
 // markMetadataUnavailable records that the metadata of a bucket could not be
 // loaded, so that a cache-only reader can tell the bucket apart from one whose
-// configuration is genuinely known instead of answering for it out of a default
-// it may never have chosen.
+// configuration is genuinely known.
 //
 // It is recorded unconditionally, including for a bucket whose metadata is
-// already in hand. An entry left by an earlier load says what the bucket's
-// configuration was, not what it is: the load that just failed is precisely the
-// one that would have shown this cache that the bucket's rules changed - which
-// is how a change made through another node reaches it once the write's own
-// reload has come and gone. Treating that copy as authoritative is what would
-// let a tightened or deleted configuration keep being served from the copy it
-// replaced.
+// already in hand: a failed load leaves the currency of any cached copy unknown,
+// because that load is precisely the one that would have brought in a change made
+// through another node.
 func (sys *BucketMetadataSys) markMetadataUnavailable(bucket string) {
 	sys.Lock()
 	defer sys.Unlock()
@@ -441,32 +426,25 @@ func (sys *BucketMetadataSys) GetCORSConfig(bucket string) (*miniogocors.Config,
 // The returned object may not be modified.
 //
 // Unlike GetCORSConfig it neither loads metadata on a cache miss nor inserts a
-// new entry, so it is safe to call with an arbitrary, client-supplied bucket
-// name on a request that has not been authenticated yet: an unknown name can
-// trigger neither backend I/O nor growth of the in-memory map. That is what the
-// CORS preflight evaluator needs, because a browser preflight carries no
-// credentials and its path is entirely attacker controlled.
+// new entry, so it is safe to call with an arbitrary, client-supplied bucket name
+// on a request that has not been authenticated yet: an unknown name can trigger
+// neither backend I/O nor growth of the in-memory map.
 //
-// Three answers report that no configuration was returned, and the caller must
-// treat them differently because only the first is a definitive absence:
+// Three answers report that no configuration was returned, and only the first is
+// a definitive absence a caller may fall back on:
 //
-//   - BucketCORSConfigNotFound means the bucket definitively has no CORS
-//     configuration, either because its metadata is loaded and carries none or
-//     because a fully loaded cache does not know the bucket at all. A caller may
-//     safely fall back to whatever behavior applies without a configuration.
-//   - errBucketMetadataNotInitialized means the answer is simply not known yet,
-//     because the bucket is absent from a cache that has not finished loading.
-//     A caller must not read that as an absence.
-//   - errBucketMetadataUnavailable means the most recent attempt to load the
-//     bucket's metadata failed, so the answer is not known and will not become
-//     known until a later load succeeds. A caller must not read that as an
-//     absence either, and must not answer from any copy this cache still holds:
-//     that copy predates the load that failed, so it cannot show a change the
-//     failed load was meant to bring in.
+//   - BucketCORSConfigNotFound - the bucket has no CORS configuration, either
+//     because its metadata is loaded and carries none or because a fully loaded
+//     cache does not know the bucket at all.
+//   - errBucketMetadataNotInitialized - the bucket is absent from a cache that has
+//     not finished loading, so the answer is not known yet.
+//   - errBucketMetadataUnavailable - the most recent load of the bucket's metadata
+//     failed, so the answer will not be known until a later one succeeds, and any
+//     copy this cache still holds predates that failure.
 //
-// Unavailability is therefore decided before anything cached is consulted, and
-// all three states are read under a single lock, so a bucket whose metadata
-// arrives while this runs is never reported as definitively absent.
+// Unavailability is therefore decided before anything cached is consulted, and all
+// three states are read under a single lock, so a bucket whose metadata arrives
+// while this runs is never reported as definitively absent.
 func (sys *BucketMetadataSys) GetCORSConfigCached(bucket string) (*miniogocors.Config, time.Time, error) {
 	if isMinioMetaBucketName(bucket) {
 		return nil, time.Time{}, BucketCORSConfigNotFound{Bucket: bucket}

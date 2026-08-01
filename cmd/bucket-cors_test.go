@@ -140,10 +140,10 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: `Unexpected root element "AccessControlPolicy"`,
 		},
 
-		// V1c - the body must be exactly one CORSConfiguration document. A
-		// single decode stops as soon as it has filled the root element and
-		// never asks for EOF, so anything trailing the closing tag would
-		// otherwise be accepted in silence.
+		// Document framing: the body must be exactly one CORSConfiguration
+		// document. A single decode stops as soon as it has filled the root
+		// element and never asks for EOF, so anything trailing the closing tag
+		// would otherwise be accepted in silence.
 		{
 			name:             "V1c/trailingTextAfterTheDocument",
 			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + `trailing`,
@@ -246,9 +246,9 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: "character data after the CORSConfiguration element",
 		},
 
-		// V1d - element placement and cardinality. The document model would
-		// otherwise normalize a violation away: a repeated scalar keeps only
-		// its last value and an unknown element is skipped without comment.
+		// Element placement and cardinality. The document model would otherwise
+		// normalize a violation away: a repeated scalar keeps only its last
+		// value and an unknown element is skipped without comment.
 		{
 			name:             "V1d/unexpectedElementUnderRoot",
 			xml:              `<CORSConfiguration><NotARule/>` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
@@ -394,10 +394,10 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// V9 - the body is bounded by maxBucketCORSConfigSize. The boundary
-		// itself is accepted and one byte more is rejected as too large, which
-		// is only provable because the validator reads one byte past the ceiling
-		// instead of validating a truncated prefix of the body.
+		// Body-size boundary: the body is bounded by maxBucketCORSConfigSize.
+		// The boundary itself is accepted and one byte more is rejected as too
+		// large, which is only provable because the validator reads one byte
+		// past the ceiling instead of validating a truncated prefix of the body.
 		{
 			name:      "V9/oneByteUnderMaxConfigSizeIsAccepted",
 			xml:       corsPaddedDoc(maxBucketCORSConfigSize - sizeOverhead - 1),
@@ -440,10 +440,10 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantErrSubstring: fmt.Sprintf("larger than the maximum of %d bytes", maxBucketCORSConfigSize),
 		},
 
-		// R8 - the wire format is the AWS one, so the document either omits the
-		// namespace or declares exactly the S3 namespace. Any other value would
-		// be preserved on the persisted document and handed back to clients that
-		// cannot read it.
+		// Namespace compatibility: the wire format is the AWS one, so the
+		// document either omits the namespace or declares exactly the S3
+		// namespace. Any other value would be preserved on the persisted document
+		// and handed back to clients that cannot read it.
 		{
 			name: "R8/wrongNamespaceIsRejected",
 			xml: `<CORSConfiguration xmlns="http://example.com/wrong">` +
@@ -488,8 +488,8 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// R1 - ID and MaxAgeSeconds are single valued. They map to scalar fields
-		// of the document model, which silently keeps the last occurrence, so a
+		// Single-valued elements: ID and MaxAgeSeconds map to scalar fields of
+		// the document model, which silently keeps the last occurrence, so a
 		// repeated element can only be caught by validating the document itself.
 		{
 			name:             "R1/duplicateIDIsRejected",
@@ -516,10 +516,10 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// R1/R2 - an element the document model does not know is discarded while
-		// decoding, so a client would be told a configuration was stored that
-		// the server never understood. Every unknown element is rejected, and so
-		// is a known element in an invalid position.
+		// Unknown elements: an element the document model does not know is
+		// discarded while decoding, so a client would be told a configuration was
+		// stored that the server never understood. Every unknown element is
+		// rejected, and so is a known element in an invalid position.
 		{
 			name:             "schema/unknownElementInCORSConfigurationIsRejected",
 			xml:              corsTestDoc(`<CORSPolicy/>`, corsTestRule(corsMinimalRuleBody)),
@@ -597,9 +597,9 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
-		// R2 - the decoder stops at the end of the first root element and the
-		// document model never learns what followed it, so a trailing tail has
-		// to be rejected explicitly.
+		// Trailing content: the decoder stops at the end of the first root
+		// element and the document model never learns what followed it, so a
+		// trailing tail has to be rejected explicitly.
 		{
 			name:             "trailer/characterDataAfterRootIsRejected",
 			xml:              corsTestDoc(corsTestRule(corsMinimalRuleBody)) + "trailing garbage",
@@ -1414,9 +1414,8 @@ func TestCorsConfigLimits(t *testing.T) {
 		t.Errorf("expected the body ceiling to be at least the AWS document limit of %d bytes, got %d",
 			awsMaxCORSDocumentSize, maxBucketCORSConfigSize)
 	}
-	// Requirement R8: the namespace the validator enforces is the one every S3
-	// client sends and expects back, so it is pinned against a literal rather
-	// than against itself.
+	// The namespace the validator enforces is the one every S3 client sends and
+	// expects back, so it is pinned against a literal rather than against itself.
 	if corsConfigXMLNS != s3CORSNamespace {
 		t.Errorf("expected the enforced namespace to be %q, got %q", s3CORSNamespace, corsConfigXMLNS)
 	}
@@ -2290,8 +2289,6 @@ func TestCorsMatchBudget(t *testing.T) {
 		}
 	})
 
-	// Sticky, so a later cheap comparison cannot make an incomplete evaluation
-	// look complete.
 	t.Run("exhaustionIsSticky", func(t *testing.T) {
 		budget := &corsMatchBudget{remaining: 1}
 
@@ -2337,7 +2334,8 @@ func TestCorsMatchBudget(t *testing.T) {
 // index can flatten, and an unauthenticated client names as many headers as the
 // server's header limit admits. Neither is illegitimate on its own, and nothing
 // authenticates the request that pairs them, so the pairing has to be bounded or a
-// single request buys hundreds of millions of comparisons.
+// single request buys millions of comparisons - about 16.8 million for the widest
+// pairing exercised here.
 func TestCorsRuleForBoundedWork(t *testing.T) {
 	const origin = "https://www.example1.com"
 
@@ -2433,7 +2431,6 @@ func TestCorsRuleForBoundedWork(t *testing.T) {
 		rules[len(rules)-1].AllowedOrigin = []string{origin}
 		cfg := corsTestConfig(rules...)
 
-		// Reachable at all: the same document answers a modest request.
 		if _, err := corsRuleFor(cfg, origin, http.MethodPut, requested(8)); err != nil {
 			t.Fatalf("expected a modest request against the spread document to complete, got error: %v", err)
 		}
@@ -2522,8 +2519,8 @@ func TestCorsRuleForBoundedWork(t *testing.T) {
 // handler without added CORS headers.
 //
 // That gate is what keeps the server-wide MINIO_API_CORS_ALLOW_ORIGIN handler in
-// force, and it is the structural reason the existing TestCors regression guard -
-// which sends OPTIONS with only an Origin header - is unaffected by this feature.
+// force for every OPTIONS request that is not a complete preflight, including the
+// Origin-only shape TestCors asserts against.
 func TestBucketCorsPreflightMiddlewareDelegation(t *testing.T) {
 	const delegatedBody = "delegated"
 
@@ -3343,13 +3340,12 @@ func (o corsPreflightOutcome) String() string {
 // The three dispositions carry very different weight. Delegating hands the
 // request to the server-wide handler, whose default allows every origin with
 // credentials, so it is reserved for the single case where the bucket definitively
-// has no configuration of its own - requirement R7's fallback. Every state in
-// which this layer cannot establish the bucket's rules - an absent or still
-// loading metadata subsystem, a stored document carrying no rule, a failed lookup
-// - denies instead, because falling back there would quietly relax a restrictive
-// bucket exactly when it matters. Once the rules are in hand the layer answers on
-// its own, allowing on the first matching rule and denying when
-// none allows the request.
+// has no configuration of its own. Every state in which this layer cannot
+// establish the bucket's rules - an absent or still loading metadata subsystem, a
+// stored document carrying no rule, a failed lookup - denies instead, because
+// falling back there would quietly relax a restrictive bucket exactly when it
+// matters. Once the rules are in hand the layer answers on its own, allowing on
+// the first matching rule and denying when none allows the request.
 func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
@@ -3378,8 +3374,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name string
-		// setup installs the bucket metadata state the case needs.
+		name  string
 		setup func(t *testing.T)
 		// target defaults to a path-style request for bucket.
 		target string
@@ -3440,8 +3435,8 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 		},
 		{
 			// A loaded cache that does not know the bucket answers the definitive
-			// BucketCORSConfigNotFound, so this is requirement R7's fallback and
-			// the server-wide handler serves the request.
+			// BucketCORSConfigNotFound, so the server-wide handler serves the
+			// request.
 			name: "unknownBucketOnALoadedCacheDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
@@ -3793,12 +3788,11 @@ func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
 		{name: "emptyLabel", host: "a..b." + domain, domains: []string{domain}},
 		{name: "malformedHostOutsideTheDomain", host: "a_b.other.tld", domains: []string{domain}},
 		{name: "malformedHostCarryingAPort", host: "a_b." + domain + ":9000", domains: []string{domain}},
-		// The exploit the review demonstrated: a browser accepts
-		// http://a_b.example/<bucket>/<object>, forms the origin http://a_b.example
-		// from it, and the request is routed path-style to the bucket in the path.
-		// No domain is configured, so nothing parses the Host while resolving the
-		// bucket, and only refusing on the Host keeps the preflight from being
-		// answered out of the server-wide default.
+		// A browser accepts http://a_b.example/<bucket>/<object>, forms the origin
+		// http://a_b.example from it, and the request is routed path-style to the
+		// bucket in the path. No domain is configured, so nothing parses the Host
+		// while resolving the bucket, and only refusing on the Host keeps the
+		// preflight from being answered out of the server-wide default.
 		{name: "pathStyleOnlyDeploymentIsRefusedToo", host: "a_b.example"},
 	}
 
@@ -3942,7 +3936,6 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		MaxAgeSeconds: 3000,
 	})
 
-	// preflight builds a genuine preflight request for the bucket.
 	preflight := func(reqHeaders string) *http.Request {
 		req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
 		req.Header.Set("Origin", origin)
@@ -3953,7 +3946,6 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		return req
 	}
 
-	// serve runs the middleware and reports how it disposed of the request.
 	serve := func(t *testing.T, req *http.Request) (corsPreflightOutcome, *httptest.ResponseRecorder) {
 		t.Helper()
 
@@ -4224,8 +4216,9 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 }
 
 // TestCorsPreflightHeadersTooLarge pins the accounting a preflight is admitted
-// by, which is the only bound standing between an unauthenticated client and the
-// work its request asks this layer for.
+// by, which bounds the input an unauthenticated client may present to this layer.
+// The cost of evaluating what it does present is bounded separately, by
+// maxCORSPreflightMatchCost.
 //
 // What it has to measure is a request whose header fields may repeat: the
 // requested-header list is read from every value of Access-Control-Request-Headers
@@ -4284,9 +4277,9 @@ func TestCorsPreflightHeadersTooLarge(t *testing.T) {
 			want: true,
 		},
 		{
-			// The regression this function exists for: a first value nothing
-			// could object to, and the excess in further fields of the same
-			// name. An accounting that read Header.Get alone would admit it.
+			// Excess bytes split across repeated fields of the same name have to
+			// be counted even when the first value is small: an accounting that
+			// read Header.Get alone would admit this request.
 			name: "excessSpreadAcrossRepeatedFieldsIsRefused",
 			header: func() http.Header {
 				header := preflightHeader()
@@ -4426,8 +4419,6 @@ func TestCorsPreflightRefusalReporterRate(t *testing.T) {
 	start := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	reporter := &corsPreflightRefusalReporter{}
 
-	// The first refusal is reported immediately: the zero reportedAt is what says
-	// nothing has been reported yet.
 	if unreported, report := reporter.due(start); !report || unreported != 0 {
 		t.Fatalf("expected the first refusal to be reported with no backlog, got (%d, %t)", unreported, report)
 	}
@@ -4449,8 +4440,6 @@ func TestCorsPreflightRefusalReporterRate(t *testing.T) {
 		t.Fatalf("expected 4 counted refusals, got %d", unreported)
 	}
 
-	// The interval having elapsed, the next refusal is reported and carries the
-	// backlog with it, which resets.
 	elapsed := start.Add(corsPreflightRefusalReportInterval)
 	if unreported, report := reporter.due(elapsed); !report || unreported != 4 {
 		t.Fatalf("expected the refusal at the interval to be reported with a backlog of 4, got (%d, %t)",
@@ -4508,8 +4497,6 @@ func TestCorsPreflightRefusalReportCarriesNoClientData(t *testing.T) {
 					t.Errorf("expected the report not to carry the client-chosen %q, got %q", fragment, report)
 				}
 			}
-			// The report has to identify itself as this condition, or an operator
-			// cannot act on it.
 			if !strings.Contains(report, "Refused a CORS preflight request") {
 				t.Errorf("expected the report to name the condition, got %q", report)
 			}
@@ -4567,8 +4554,6 @@ func TestCorsPreflightRefusalReporterConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// One of the refusals was reported and the rest were counted, whichever
-	// order they arrived in, because they all fall inside one interval.
 	reportedAt, unreported := corsPreflightReporterState(t, reporter)
 	if reportedAt.IsZero() {
 		t.Fatal("expected one of the concurrent refusals to have been reported")
@@ -4596,12 +4581,9 @@ func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
 	)
 
 	testCases := []struct {
-		name string
-		// setup installs the bucket metadata state the case needs.
-		setup func(t *testing.T)
-		// want is how the middleware is expected to dispose of the request.
-		want corsPreflightOutcome
-		// wantReported is whether the disposition is expected to be reported.
+		name         string
+		setup        func(t *testing.T)
+		want         corsPreflightOutcome
 		wantReported bool
 	}{
 		{
@@ -4694,7 +4676,6 @@ func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
 						tc.want, got, rec.Code, rec.Header())
 				}
 				if tc.want == corsOutcomeDenied {
-					// Reporting the refusal must not have added anything to it.
 					for _, name := range corsPreflightAllowHeaders {
 						if value := rec.Header().Get(name); value != "" {
 							t.Fatalf("expected a refused preflight to carry no %s, got %q", name, value)
@@ -4983,10 +4964,8 @@ func TestCorsConfigAPIError(t *testing.T) {
 	transportErr := errors.New("connection reset by peer")
 
 	testCases := []struct {
-		name string
-		err  error
-		// wantCode and wantStatus are the S3 code and HTTP status the client is
-		// answered with.
+		name       string
+		err        error
 		wantCode   string
 		wantStatus int
 		// wantDescription is asserted only when set, because the descriptions of
@@ -5262,13 +5241,9 @@ func TestCORSConfigBody(t *testing.T) {
 		// deployment started with --no-compat has asked to tolerate exactly those
 		// clients.
 		testCases := []struct {
-			name string
-			// declared is the x-amz-content-sha256 value the request carries.
-			declared string
-			// strict is the compatibility mode the deployment runs in.
-			strict bool
-			// wantVerified says whether reading the body reports the mismatch
-			// between what was declared and the bytes that arrived.
+			name         string
+			declared     string
+			strict       bool
 			wantVerified bool
 		}{
 			{name: "unsignedPayloadDeclaresNoDigest", declared: unsignedPayload, strict: true},
@@ -5945,7 +5920,6 @@ func testDeleteBucketCorsHandler(obj ObjectLayer, instanceType, bucketName strin
 
 	assertDeleted("deleting a stored configuration")
 
-	// The delete cleared the document rather than merely reporting success.
 	rec = httptest.NewRecorder()
 	apiRouter.ServeHTTP(rec, newSignedCORSRequest(t, http.MethodGet, bucketName, nil, creds))
 	assertCORSHandlerError(t, instanceType, rec, "NoSuchCORSConfiguration", http.StatusNotFound)

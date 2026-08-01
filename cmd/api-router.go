@@ -691,21 +691,15 @@ func corsHandler(handler http.Handler) http.Handler {
 	}
 	// The per-bucket CORS evaluator wraps the handler built above instead of
 	// being installed on the mux, because no mux route is registered for
-	// OPTIONS: only an outer HTTP layer sees a browser preflight at all.
-	// It answers preflights for buckets that carry a stored CORS configuration
-	// and delegates every other request, so the server-wide allow-origin
-	// behavior configured above stays in force for buckets without one.
+	// OPTIONS: only an outer HTTP layer sees a browser preflight at all. A
+	// preflight for a bucket that definitively has no CORS configuration of its
+	// own is delegated, so the server-wide allow-origin behavior configured above
+	// stays in force for it; one whose rules cannot be established, or that this
+	// server would not serve at all, is refused rather than answered out of these
+	// permissive settings.
 	//
-	// That placement puts it ahead of the middlewares the mux applies, so it
-	// cannot rely on them having screened the request and applies the same
-	// admission rules itself: a request carrying more header bytes than
-	// setRequestLimitMiddleware admits, and a Host that
-	// setRequestValidityMiddleware answers 400 for, are refused here too.
-	// Delegating either would answer, out of the permissive settings configured
-	// above, a preflight for a request the server itself would never serve -
-	// while the generic path-style route registered for /{bucket} does resolve
-	// such a request to a real bucket whose own rules may be restrictive. Those
-	// same limits are what bound the lists the evaluator then parses and
-	// compares, since a preflight is unauthenticated and both come from it.
+	// That placement also puts it ahead of the middlewares the mux applies, so it
+	// cannot rely on them having screened the request and repeats their admission
+	// checks itself.
 	return bucketCORSPreflightMiddleware(cors.New(opts).Handler(handler))
 }

@@ -728,7 +728,6 @@ func (s *TestSuiteCommon) TestBucketCORSRoundTrip(c *check) {
 		closeResponseBody(c, deleteResponse)
 	}
 
-	// The delete the last phase permitted really cleared the configuration.
 	request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
 		0, nil, s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
@@ -873,31 +872,26 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 		descriptionPrefix string
 	}{
 		{
-			// Not well-formed at all: the CORSRule element is never closed.
 			name:              "not well-formed XML",
 			body:              `<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>`,
 			descriptionPrefix: "decoding xml: ",
 		},
 		{
-			// Well-formed XML whose root element is not CORSConfiguration.
 			name:        "root element is not CORSConfiguration",
 			body:        `<NotACORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></NotACORSConfiguration>`,
 			description: `Unexpected root element "NotACORSConfiguration", expected CORSConfiguration`,
 		},
 		{
-			// A CORSConfiguration carrying no rule at all.
 			name:        "no CORSRule",
 			body:        `<CORSConfiguration></CORSConfiguration>`,
 			description: "CORSConfiguration must contain at least one CORSRule",
 		},
 		{
-			// A rule whose AllowedMethod falls outside {GET, PUT, POST, DELETE, HEAD}.
 			name:        "unsupported AllowedMethod",
 			body:        `<CORSConfiguration><CORSRule><AllowedMethod>PATCH</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
 			description: `CORSRule 0 has unsupported AllowedMethod "PATCH"`,
 		},
 		{
-			// A rule with no AllowedOrigin.
 			name:        "no AllowedOrigin",
 			body:        `<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`,
 			description: "CORSRule 0 must contain at least one AllowedOrigin",
@@ -971,12 +965,11 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 // refused.
 //
 // The identical preflight is issued three times against the same bucket, which is
-// what makes the outcomes directly comparable. Before any rule is stored it is
-// answered by the pre-existing server-wide handler, exactly as it was before
-// per-bucket CORS existed, so the global allow-origin setting is proven to still
-// be the fallback. Storing a configuration visibly takes the answer over, and the
-// same request from another origin is then refused even though the server-wide
-// setting would have allowed it.
+// what makes the outcomes directly comparable. While the bucket stores no rule the
+// server-wide handler is the fallback and answers it; once a configuration is
+// stored the per-bucket evaluator owns the answer, and the same request from
+// another origin is then refused even though the server-wide setting would have
+// allowed it.
 //
 // The two answers are distinguishable, which is what makes each assertion
 // meaningful: the server-wide handler replies 204 with
@@ -1014,8 +1007,8 @@ func (s *TestSuiteCommon) TestBucketCORSPreflight(c *check) {
 	// The bucket has no CORS configuration yet, so this preflight has to be
 	// answered by the server-wide handler and not by the per-bucket evaluator.
 	// The server-wide allow-origin list defaults to "*", so the request is
-	// permitted - with the status and the headers that handler has always
-	// answered with.
+	// permitted - with that handler's own status and header set: 204, an
+	// Access-Control-Allow-Credentials, and no Max-Age or Expose-Headers.
 	delegated, err := s.client.Do(newPreflight("http://example.com"))
 	c.Assert(err, nil)
 	c.Assert(delegated.StatusCode, http.StatusNoContent)
