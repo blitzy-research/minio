@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2026 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -134,8 +134,12 @@ func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCo
 		}
 
 		// skipContentSha256Cksum decides whether the header carries a digest to
-		// verify at all, so the values S3 defines in its place - UNSIGNED-PAYLOAD
-		// and the streaming forms - are not mistaken for a malformed one.
+		// verify at all, so the two values S3 defines in place of one -
+		// UNSIGNED-PAYLOAD and STREAMING-UNSIGNED-PAYLOAD-TRAILER - are not
+		// mistaken for a malformed digest. It also carries the server's own
+		// --no-compat allowance for a client that declares the SHA-256 of an
+		// empty body while sending a non-empty one, so that allowance applies
+		// here exactly as it does to every other body this server accepts.
 		var contentSHA256 []byte
 		if !skipContentSha256Cksum(r) {
 			contentSHA256, err = hex.DecodeString(r.Header.Get(xhttp.AmzContentSha256))

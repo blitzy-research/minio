@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2026 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -63,12 +63,13 @@ const (
 	maxCORSPreflightMatchCost = 1 << 20
 
 	// Shortest interval between two reports that preflight requests are being
-	// refused for a reason other than the bucket's own rules - rules this layer
-	// cannot establish, or a request it will not evaluate at all. The reason is
-	// reported so that an operator can tell such a refusal apart from a rule that
-	// simply did not match, and it is reported no more often than this because a
-	// preflight is unauthenticated: reporting every one of them would let
-	// whoever sends them decide how much a deployment logs.
+	// refused for a reason other than the bucket's own rules - a request this
+	// layer will not evaluate at all, or one whose rules it could not finish
+	// evaluating. The reason is reported so that an operator can tell such a
+	// refusal apart from a rule that simply did not match, and it is reported no
+	// more often than this because a preflight is unauthenticated: reporting
+	// every one of them would let whoever sends them decide how much a
+	// deployment logs.
 	corsPreflightRefusalReportInterval = time.Minute
 
 	// corsConfigXMLNS is the XML namespace of every S3 CORS document. A client
@@ -920,19 +921,19 @@ func corsPreflightHeadersTooLarge(header http.Header) bool {
 //
 //   - Delegated, which keeps the server-wide MINIO_API_CORS_ALLOW_ORIGIN setting
 //     in force for it: the request is not a preflight, addresses the server root
-//     or no syntactically valid bucket, or names a bucket that definitively has
-//     no CORS configuration of its own. That definitive absence is the only
-//     lookup outcome the fallback rests on.
+//     or no syntactically valid bucket, or names a bucket whose own CORS rules
+//     this layer cannot produce - it has none stored, the metadata subsystem is
+//     absent or still loading, the lookup failed, or what is stored carries no
+//     rule. Delegating on every one of those is what leaves a bucket without a
+//     configuration of its own behaving exactly as it did before this layer
+//     existed.
 //   - Allowed, on the first rule that matches: HTTP 200 with the CORS response
 //     headers that rule configures.
 //   - Denied, HTTP 200 carrying no Access-Control-Allow-* header, which is how a
 //     browser learns the request is refused: the bucket has rules and none of
-//     them allows this request, or this layer will not answer for the request at
-//     all. Rules that are merely unavailable, and a request the server itself
-//     would refuse outright, are denied rather than delegated - the server-wide
-//     default allows every origin with credentials, so delegating either would
-//     answer for a possibly restrictive bucket out of the most permissive setting
-//     the server has.
+//     them allows this request, or the request is one the server itself would
+//     refuse outright, so the request this preflight asks about could never be
+//     served whatever any rule says.
 func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match the rs/cors preflight gate, plus the Origin that a matched rule
@@ -984,7 +985,9 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		// These are the two halves of request2BucketObjectName, spelled out
 		// rather than called through it, because that wrapper reports a Host it
 		// cannot parse through logger.CriticalIf, which panics - and the Host
-		// here is client controlled and unauthenticated.
+		// here is client controlled and unauthenticated. The wrapper does
+		// nothing else, so for every Host it does not panic on the two produce
+		// the same bucket it would have.
 		resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
 		if err != nil {
 			// The only Host getResource rejects is one hasBadHost rejects too,
@@ -1014,28 +1017,15 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 		}
 
 		cfg, err := preflightCORSConfig(bucket)
-		switch {
-		case err == nil:
-		case isBucketCORSConfigNotFound(err):
-			// A definitive absence of rules is the one and only state the
-			// server-wide MINIO_API_CORS_ALLOW_ORIGIN fallback answers.
+		if err != nil || cfg == nil || len(cfg.CORSRules) == 0 {
+			// The bucket has no rules of its own to answer this preflight from,
+			// whichever way that came about: it carries no configuration, the
+			// metadata subsystem is absent or has not finished loading, the
+			// lookup failed, or what is stored carries no rule. Every one of
+			// those hands the request to the server-wide handler, which is what
+			// keeps the MINIO_API_CORS_ALLOW_ORIGIN setting in force for exactly
+			// the requests it governed before this layer existed.
 			next.ServeHTTP(w, r)
-			return
-		default:
-			// The bucket's rules could not be established - the metadata
-			// subsystem is absent or has not finished loading, the stored
-			// document is unusable, or the lookup failed. Unavailable is not
-			// absent, so deny rather than relax the bucket to the permissive
-			// server-wide default for as long as the condition lasts.
-			//
-			// The refusal is indistinguishable from the ones further down, which
-			// say the request was evaluated against the bucket's rules and not
-			// allowed by them, so the reason for this one is reported - at a
-			// bounded rate, and carrying nothing the unauthenticated request
-			// brought with it beyond the bucket name validated just above.
-			corsPreflightRefused.report(fmt.Errorf(
-				"the CORS configuration of bucket %s could not be established: %w", bucket, err))
-			writeCORSPreflightDenied(w)
 			return
 		}
 
@@ -1086,55 +1076,35 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// preflightCORSConfig returns the usable CORS configuration of a bucket for the
-// purpose of answering a preflight request.
+// preflightCORSConfig returns the CORS configuration a bucket's own rules are to
+// be read from when answering a preflight request, or an error when the bucket
+// has none this layer can use.
 //
-// The lookup is strictly in-memory. An unauthenticated preflight names its
-// bucket in the request path, so resolving it through the loading accessor would
-// let anyone turn a stream of made-up names into backend metadata reads and into
-// permanent entries in the bucket metadata map, with work that outlives the
-// request because that accessor is not request scoped.
+// The lookup is strictly in-memory, through BucketMetadataSys.Get, which reads
+// the bucket metadata cache under its own lock and reports errConfigNotFound for
+// a bucket it does not hold. An unauthenticated preflight names its bucket in the
+// request path, so going through the loading accessor GetCORSConfig instead would
+// let anyone turn a stream of made-up names into backend metadata reads, with
+// work that outlives the request because that accessor is not request scoped.
+// Reading the cache directly is how the rest of the server resolves a bucket
+// ahead of the router too - collectAPIStats does the same to decide whether a
+// request names a bucket that exists.
 //
-// Every reason a bucket's own rules cannot be produced is reported as an error,
-// but only one of them is the BucketCORSConfigNotFound sentinel that reports a
-// definitive absence, and only that one may be read as "this bucket has no rules
-// of its own". A configuration that parsed but carries no rule cannot have come
-// from PutBucketCors, which requires at least one, so it is reported as a plain
-// error; so is an absent metadata subsystem, a cache that has not finished
-// loading, and a bucket that exists but whose metadata could not be loaded -
-// the answer for the last two is simply not known yet. The caller falls back to
-// the server-wide handler on the definitive absence alone, and denies on every
-// other error.
+// The configuration returned is the one parseAllConfigs produced when the
+// metadata was loaded, which is exactly what GetCORSConfig hands back, so both
+// paths answer a bucket's rules from the same parsed document.
 func preflightCORSConfig(bucket string) (*miniogocors.Config, error) {
 	if globalBucketMetadataSys == nil {
 		return nil, errServerNotInitialized
 	}
-	cfg, _, err := globalBucketMetadataSys.GetCORSConfigCached(bucket)
+	meta, err := globalBucketMetadataSys.Get(bucket)
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil || len(cfg.CORSRules) == 0 {
-		return nil, fmt.Errorf("Stored CORS configuration for bucket %s contains no CORSRule", bucket)
+	if meta.corsConfig == nil {
+		return nil, BucketCORSConfigNotFound{Bucket: bucket}
 	}
-	return cfg, nil
-}
-
-// isBucketCORSConfigNotFound reports whether err is the concrete sentinel that
-// says a bucket has no CORS configuration, as opposed to any other reason the
-// configuration could not be produced.
-//
-// Only that one condition may be treated as an absence, because an absence is
-// what the server-wide MINIO_API_CORS_ALLOW_ORIGIN default answers for, so the
-// test is deliberately narrow: it recognizes the typed sentinel however it is
-// wrapped, and recognizes nothing else. In particular neither
-// errBucketMetadataNotInitialized, which GetCORSConfigCached returns for a bucket
-// missing from a cache that has not finished loading, nor
-// errBucketMetadataUnavailable, which it returns for a bucket whose metadata
-// could not be loaded on the most recent attempt and so has nothing left that is
-// known to be current, is an absence - both are answers that are not known yet.
-func isBucketCORSConfigNotFound(err error) bool {
-	var notFound BucketCORSConfigNotFound
-	return errors.As(err, &notFound)
+	return meta.corsConfig, nil
 }
 
 // corsPreflightRefusalReporter reports that preflight requests are being refused
@@ -1146,9 +1116,9 @@ func isBucketCORSConfigNotFound(err error) bool {
 // Access-Control-Allow-* header - and a preflight is answered ahead of the
 // router, so none of the per-request audit, trace or metric plumbing covers it.
 // Without a report the two are indistinguishable to an operator as well, and the
-// ones that say this deployment cannot read its own bucket metadata, or that a
-// request was turned away before its rules were consulted, are the ones worth
-// acting on.
+// ones that say a request was turned away before its rules were consulted, or
+// that its rules could not be evaluated to the end, are the ones worth acting
+// on.
 //
 // Every such reason shares this one reporter, and therefore one rate limit,
 // because they are all reachable by an unauthenticated request and a client that

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2026 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -34,7 +34,6 @@ import (
 	"time"
 
 	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
-	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
@@ -2743,7 +2742,7 @@ func TestBucketCorsPreflightMiddlewareUnresolvableHost(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			reporter := installTestCORSPreflightReporter(t)
 
 			saved := globalDomainNames
@@ -2852,22 +2851,16 @@ var corsPreflightAllowHeaders = []string{
 
 // installTestBucketMetadataSys replaces the global bucket metadata system with a
 // fresh, empty one for the duration of the test, restoring the previous value
-// afterwards. loaded reports whether the replacement presents itself as having
-// finished loading, which is what tells the preflight evaluator that a bucket
-// absent from the cache is a bucket without a configuration rather than an
-// answer that is not known yet.
-func installTestBucketMetadataSys(t *testing.T, loaded bool) *BucketMetadataSys {
+// afterwards. A bucket is made known to it, with or without a CORS
+// configuration, through setTestBucketCORSConfig; every other bucket name is one
+// the cache does not hold.
+func installTestBucketMetadataSys(t *testing.T) *BucketMetadataSys {
 	t.Helper()
 
 	saved := globalBucketMetadataSys
 	t.Cleanup(func() { globalBucketMetadataSys = saved })
 
 	sys := NewBucketMetadataSys()
-	if loaded {
-		sys.Lock()
-		sys.initialized = true
-		sys.Unlock()
-	}
 	globalBucketMetadataSys = sys
 	return sys
 }
@@ -2880,66 +2873,27 @@ func setTestBucketCORSConfig(sys *BucketMetadataSys, bucket string, cfg *miniogo
 	sys.Set(bucket, meta)
 }
 
-// TestIsBucketCORSConfigNotFound pins how narrow the preflight evaluator's
-// absence test has to be. Recognizing an error as an absence is what sends a
-// preflight to the server-wide handler, whose default allows every origin with
-// credentials, so exactly one error may be recognized: the typed
-// BucketCORSConfigNotFound sentinel, however it is wrapped. Every other reason a
-// configuration could not be produced - above all a cache that has not finished
-// loading, whose answer is merely unknown - must read as not an absence, so that
-// the evaluator denies instead of falling back.
-func TestIsBucketCORSConfigNotFound(t *testing.T) {
-	const bucket = "blitzy-cors-bucket"
-
-	testCases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "noError", err: nil, want: false},
-		{name: "theSentinelItself", err: BucketCORSConfigNotFound{Bucket: bucket}, want: true},
-		{
-			name: "theSentinelWrapped",
-			err:  fmt.Errorf("loading bucket %s: %w", bucket, BucketCORSConfigNotFound{Bucket: bucket}),
-			want: true,
-		},
-		{name: "aCacheThatHasNotFinishedLoading", err: errBucketMetadataNotInitialized, want: false},
-		{
-			name: "aCacheThatHasNotFinishedLoadingWrapped",
-			err:  fmt.Errorf("looking up bucket %s: %w", bucket, errBucketMetadataNotInitialized),
-			want: false,
-		},
-		{name: "anAbsentMetadataSubsystem", err: errServerNotInitialized, want: false},
-		{name: "aDifferentConfigurationsAbsence", err: BucketSSEConfigNotFound{Bucket: bucket}, want: false},
-		{
-			name: "aRuleLessStoredDocument",
-			err:  fmt.Errorf("Stored CORS configuration for bucket %s contains no CORSRule", bucket),
-			want: false,
-		},
-		{name: "anyOtherLookupFailure", err: errors.New("disk not found"), want: false},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isBucketCORSConfigNotFound(tc.err); got != tc.want {
-				t.Fatalf("expected isBucketCORSConfigNotFound(%v) to be %t, got %t", tc.err, tc.want, got)
-			}
-		})
-	}
+// isCORSConfigNotFound reports whether err is the typed sentinel that says a
+// bucket has no CORS configuration, however it is wrapped. It is the error the
+// GET handler turns into NoSuchCORSConfiguration, so asserting on it rather than
+// on any error is what proves an absence is reported as an absence.
+func isCORSConfigNotFound(err error) bool {
+	var notFound BucketCORSConfigNotFound
+	return errors.As(err, &notFound)
 }
 
-// TestGetCORSConfigCachedIsCacheOnly pins the property the preflight evaluator
+// TestPreflightCORSConfigIsCacheOnly pins the property the preflight evaluator
 // depends on. A preflight request carries no credentials and names its bucket in
 // a path the client chooses freely, so the lookup it performs must never read
 // from the backend and must never add an entry to the bucket metadata map -
 // otherwise a stream of made-up names turns into backend reads and into
 // permanent, unbounded memory growth.
 //
-// The two absence answers must also stay distinguishable: a bucket missing from
-// a loaded cache definitively has no configuration, while a bucket missing from
-// a cache that is still loading is simply not known yet, and only the former may
-// be treated as an absence.
-func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
+// Every outcome that produces no configuration is an error, and the caller
+// treats all of them alike by handing the request to the server-wide handler, so
+// what is asserted here is that the lookup answers a bucket's stored rules when
+// the cache holds them and answers nothing at all - at no cost - otherwise.
+func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 	const (
 		knownBucket   = "blitzy-cors-known"
 		unknownBucket = "blitzy-cors-unknown"
@@ -2950,359 +2904,111 @@ func TestGetCORSConfigCachedIsCacheOnly(t *testing.T) {
 		AllowedOrigin: []string{"https://www.example1.com"},
 	})
 
-	t.Run("unknownBucketWhileTheCacheIsStillLoading", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, false)
+	t.Run("anAbsentMetadataSubsystem", func(t *testing.T) {
+		saved := globalBucketMetadataSys
+		t.Cleanup(func() { globalBucketMetadataSys = saved })
+		globalBucketMetadataSys = nil
 
-		got, _, err := sys.GetCORSConfigCached(unknownBucket)
+		got, err := preflightCORSConfig(knownBucket)
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
-		if !errors.Is(err, errBucketMetadataNotInitialized) {
-			t.Fatalf("expected %v, got %v", errBucketMetadataNotInitialized, err)
+		if !errors.Is(err, errServerNotInitialized) {
+			t.Fatalf("expected %v, got %v", errServerNotInitialized, err)
 		}
-		// An unloaded cache must remain distinguishable from a definitive
-		// absence: only the latter is the error the preflight evaluator falls
-		// back on, and only the latter maps to NoSuchCORSConfiguration for GET.
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatal("expected an unloaded cache not to report a definitive absence")
+	})
+
+	t.Run("aBucketTheCacheDoesNotHold", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
+
+		got, err := preflightCORSConfig(unknownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if err == nil {
+			t.Fatal("expected an error for a bucket the cache does not hold")
 		}
 		if sys.Count() != 0 {
 			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
 		}
 	})
 
-	t.Run("unknownBucketOnALoadedCache", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
+	// The reserved bucket is never a CORS target, and the cache-only reader
+	// answers for it without consulting anything.
+	t.Run("theReservedBucket", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
 
-		got, _, err := sys.GetCORSConfigCached(unknownBucket)
-		if got != nil {
-			t.Fatalf("expected no configuration, got %+v", got)
-		}
-		if !isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
+		if _, err := preflightCORSConfig(minioMetaBucket); err == nil {
+			t.Fatal("expected the reserved bucket to have no CORS configuration")
 		}
 		if sys.Count() != 0 {
 			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
 		}
 	})
 
-	// A bucket that exists but whose metadata could not be loaded is missing
-	// from a loaded cache for a reason that has nothing to do with the bucket's
-	// configuration, so it must not be answered as a bucket without one. It is
-	// the third state the accessor reports, and the one a failed load produces.
-	t.Run("knownBucketWhoseMetadataIsUnavailable", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		sys.markMetadataUnavailable(knownBucket)
-
-		got, _, err := sys.GetCORSConfigCached(knownBucket)
-		if got != nil {
-			t.Fatalf("expected no configuration, got %+v", got)
-		}
-		if !errors.Is(err, errBucketMetadataUnavailable) {
-			t.Fatalf("expected %v, got %v", errBucketMetadataUnavailable, err)
-		}
-		// Reading this as an absence is what would answer the bucket out of the
-		// permissive server-wide default, so it must not read as one - nor as a
-		// cache that has not finished loading, which it has.
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatal("expected unavailable metadata not to report a definitive absence")
-		}
-		if errors.Is(err, errBucketMetadataNotInitialized) {
-			t.Fatalf("expected unavailable metadata not to read as an unloaded cache, got %v", err)
-		}
-		if !strings.Contains(err.Error(), knownBucket) {
-			t.Fatalf("expected the error to name the bucket %q, got %q", knownBucket, err)
-		}
-		if sys.Count() != 0 {
-			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
-		}
-
-		// Metadata arriving for the bucket ends the unavailability, and what it
-		// carries is answered from at once.
-		setTestBucketCORSConfig(sys, knownBucket, cfg)
-		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
-			t.Fatalf("expected the stored configuration once the metadata arrives, got %+v and error %v", got, err)
-		}
-	})
-
-	// A copy of a bucket's metadata says what its configuration was, not what it
-	// is. The load that just failed is the one that would have reported a change
-	// made on another node, so a copy that predates it cannot be treated as the
-	// bucket's answer - the whole point of the state is that this cache no longer
-	// knows. Answering from the copy anyway is what would keep serving rules
-	// their owner has already tightened.
-	t.Run("cachedRulesStopBeingAuthoritativeAfterAFailedLoad", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		setTestBucketCORSConfig(sys, knownBucket, cfg)
-
-		// The copy answers while it is the newest thing known about the bucket.
-		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
-			t.Fatalf("expected the stored configuration before any load failed, got %+v and error %v", got, err)
-		}
-
-		sys.markMetadataUnavailable(knownBucket)
-
-		got, _, err := sys.GetCORSConfigCached(knownBucket)
-		if got != nil {
-			t.Fatalf("expected a superseded copy not to be returned, got %+v", got)
-		}
-		if !errors.Is(err, errBucketMetadataUnavailable) {
-			t.Fatalf("expected %v once a load failed, got %v", errBucketMetadataUnavailable, err)
-		}
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatal("expected a copy of unknown currency not to report a definitive absence")
-		}
-
-		// A load succeeding again is what restores the copy's authority.
-		setTestBucketCORSConfig(sys, knownBucket, cfg)
-		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
-			t.Fatalf("expected a successful load to make the configuration answerable again, got %+v and error %v", got, err)
-		}
-	})
-
-	// The same holds for a cached absence, and it is the more dangerous of the
-	// two: an absence is the one answer the evaluator is allowed to fall back on,
-	// so a stale one does not merely serve outdated rules, it hands the request
-	// to the permissive server-wide default. A bucket whose owner has just
-	// created its first restrictive configuration on another node is exactly the
-	// bucket whose cached "nothing set" must stop being believed.
-	t.Run("aCachedAbsenceStopsBeingAuthoritativeAfterAFailedLoad", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
+	t.Run("aKnownBucketWithoutAConfiguration", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, nil)
 
-		if _, _, err := sys.GetCORSConfigCached(knownBucket); !isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected a definitive absence before any load failed, got %v", err)
-		}
-
-		sys.markMetadataUnavailable(knownBucket)
-
-		_, _, err := sys.GetCORSConfigCached(knownBucket)
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected a cached absence of unknown currency not to read as a definitive absence, got %v", err)
-		}
-		if !errors.Is(err, errBucketMetadataUnavailable) {
-			t.Fatalf("expected %v once a load failed, got %v", errBucketMetadataUnavailable, err)
-		}
-	})
-
-	t.Run("manyUnknownBucketsNeverGrowTheMetadataMap", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-
-		for i := range 512 {
-			if _, _, err := sys.GetCORSConfigCached(fmt.Sprintf("blitzy-cors-probe-%d", i)); err == nil {
-				t.Fatalf("expected an unknown bucket to have no configuration, got one for probe %d", i)
-			}
-		}
-		if sys.Count() != 0 {
-			t.Fatalf("expected 512 unknown lookups to add no metadata entries, got %d", sys.Count())
-		}
-	})
-
-	t.Run("theTwoAbsenceSignalsStayDistinguishable", func(t *testing.T) {
-		// The preflight decision rests on telling these two apart: a definitive
-		// absence must be recognized as one and delegate, while a bucket missing
-		// from a cache that is still loading must not be, or a configuration that
-		// is merely unavailable would fall back to the permissive server-wide
-		// default. The S3 GET handler depends on the same distinction to answer
-		// NoSuchCORSConfiguration. Asserting on the function the evaluator calls
-		// also proves neither answer is reshaped on the way out.
-		//
-		// The loading accessor is deliberately not exercised: it reaches for the
-		// process-wide object layer, so its answer depends on what an earlier
-		// test in this package left installed. That it stays out of the preflight
-		// path is asserted deterministically instead - neither lookup below may
-		// add a metadata entry, which only a cache-only lookup can satisfy.
-		loaded := installTestBucketMetadataSys(t, true)
-
-		_, err := preflightCORSConfig(unknownBucket)
-		if !isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected a definitive absence on a loaded cache, got %v", err)
-		}
-		if errors.Is(err, errBucketMetadataNotInitialized) {
-			t.Fatalf("a definitive absence must not also read as an unknown state, got %v", err)
-		}
-		if loaded.Count() != 0 {
-			t.Fatalf("expected the lookup not to add a metadata entry, got %d", loaded.Count())
-		}
-
-		loading := installTestBucketMetadataSys(t, false)
-
-		_, err = preflightCORSConfig(unknownBucket)
-		if !errors.Is(err, errBucketMetadataNotInitialized) {
-			t.Fatalf("expected an unknown state while the cache is still loading, got %v", err)
-		}
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatal("an unknown state must not read as a definitive absence")
-		}
-		if loading.Count() != 0 {
-			t.Fatalf("expected the lookup not to add a metadata entry, got %d", loading.Count())
-		}
-	})
-
-	t.Run("knownBucketWithoutAConfiguration", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		setTestBucketCORSConfig(sys, knownBucket, nil)
-
-		got, _, err := sys.GetCORSConfigCached(knownBucket)
+		got, err := preflightCORSConfig(knownBucket)
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
-		if !isBucketCORSConfigNotFound(err) {
+		var notFound BucketCORSConfigNotFound
+		if !errors.As(err, &notFound) {
 			t.Fatalf("expected a BucketCORSConfigNotFound sentinel, got %v", err)
+		}
+		if notFound.Bucket != knownBucket {
+			t.Fatalf("expected the sentinel to name the bucket %q, got %q", knownBucket, notFound.Bucket)
 		}
 		if sys.Count() != 1 {
 			t.Fatalf("expected exactly the one bucket that was stored, got %d", sys.Count())
 		}
 	})
 
-	t.Run("knownBucketWithAConfiguration", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
+	t.Run("aKnownBucketWithAConfiguration", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, cfg)
 
-		got, _, err := sys.GetCORSConfigCached(knownBucket)
+		got, err := preflightCORSConfig(knownBucket)
 		if err != nil {
 			t.Fatalf("expected the stored configuration, got error: %v", err)
 		}
+		// The parsed document itself is handed back, not a copy of it, which is
+		// what makes the lookup free of per-request parsing.
 		if got != cfg {
 			t.Fatalf("expected the stored configuration to be returned as-is, got %+v", got)
 		}
 	})
 
-	// A cold cache must not be reported as an absence even for a bucket it does
-	// hold, so the loaded flag may only ever be consulted on a cache miss.
-	t.Run("knownBucketIsAnsweredEvenWhileTheCacheIsStillLoading", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, false)
+	// A configuration is removed by clearing the parsed pointer, so the lookup
+	// must stop answering from it the moment that happens rather than keep the
+	// rules a DELETE has already taken away.
+	t.Run("aConfigurationThatWasRemoved", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, cfg)
 
-		if got, _, err := sys.GetCORSConfigCached(knownBucket); err != nil || got != cfg {
+		if got, err := preflightCORSConfig(knownBucket); err != nil || got != cfg {
 			t.Fatalf("expected the stored configuration, got %+v and error %v", got, err)
 		}
-	})
-}
 
-// TestBucketMetadataUnavailableTracking pins the lifecycle of the pending state
-// the cache-only CORS lookup depends on.
-//
-// A bucket whose metadata failed to load is remembered as unavailable so that it
-// stays distinguishable both from a bucket that does not exist and from one whose
-// configuration is actually known, and that memory has to end the moment it stops
-// being true: metadata arriving for the bucket answers for it, and a bucket that
-// is gone from the backend has no answer left to be unknown. A state that outlived
-// either event would keep refusing preflight requests for a bucket that can be
-// answered, so the two directions are asserted together - it is recorded whenever
-// a load fails, and cleared whenever one succeeds.
-func TestBucketMetadataUnavailableTracking(t *testing.T) {
-	const bucket = "blitzy-cors-pending"
+		setTestBucketCORSConfig(sys, knownBucket, nil)
 
-	cfg := corsTestConfig(miniogocors.Rule{
-		ID:            "only",
-		AllowedMethod: []string{http.MethodPut},
-		AllowedOrigin: []string{"https://www.example1.com"},
-	})
-
-	// unavailable reports whether the bucket's own rules are neither in hand nor
-	// definitively absent, which is what makes the preflight evaluator refuse.
-	unavailable := func(t *testing.T, sys *BucketMetadataSys) bool {
-		t.Helper()
-
-		_, _, err := sys.GetCORSConfigCached(bucket)
-		return errors.Is(err, errBucketMetadataUnavailable)
-	}
-
-	t.Run("metadataArrivingEndsTheUnavailability", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		sys.markMetadataUnavailable(bucket)
-		if !unavailable(t, sys) {
-			t.Fatal("expected a bucket whose metadata failed to load to be unavailable")
-		}
-
-		setTestBucketCORSConfig(sys, bucket, cfg)
-		if unavailable(t, sys) {
-			t.Fatal("expected metadata arriving for the bucket to end the unavailability")
+		if got, err := preflightCORSConfig(knownBucket); err == nil {
+			t.Fatalf("expected no configuration once it was removed, got %+v", got)
 		}
 	})
 
-	// Every failed load is recorded, including one for a bucket the cache still
-	// holds metadata for. Skipping those is what would let a copy from before the
-	// failure keep answering as though it were current: the failed load is
-	// precisely the one that would have reported that the bucket's rules changed.
-	t.Run("aFailedLoadIsRecordedEvenWhenMetadataIsInHand", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		setTestBucketCORSConfig(sys, bucket, cfg)
-		if unavailable(t, sys) {
-			t.Fatal("expected metadata in hand and no failed load to be answerable")
-		}
+	t.Run("manyUnknownBucketsNeverGrowTheMetadataMap", func(t *testing.T) {
+		sys := installTestBucketMetadataSys(t)
 
-		sys.markMetadataUnavailable(bucket)
-		if !unavailable(t, sys) {
-			t.Fatal("expected a failed load to be recorded even with metadata in hand")
-		}
-	})
-
-	// Whatever order successes and failures arrive in, the last one decides: a
-	// bucket only keeps failing closed while its newest load failed, and starts
-	// answering again as soon as one succeeds.
-	t.Run("theMostRecentLoadDecides", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-
-		for range 3 {
-			sys.markMetadataUnavailable(bucket)
-			if !unavailable(t, sys) {
-				t.Fatal("expected the bucket to fail closed while its newest load failed")
-			}
-
-			setTestBucketCORSConfig(sys, bucket, cfg)
-			if unavailable(t, sys) {
-				t.Fatal("expected a succeeding load to make the bucket answerable again")
-			}
-			if got, _, err := sys.GetCORSConfigCached(bucket); err != nil || got != cfg {
-				t.Fatalf("expected the freshly loaded configuration, got %+v and error %v", got, err)
+		for i := range 512 {
+			if _, err := preflightCORSConfig(fmt.Sprintf("blitzy-cors-probe-%d", i)); err == nil {
+				t.Fatalf("expected an unknown bucket to have no configuration, got one for probe %d", i)
 			}
 		}
-	})
-
-	t.Run("aBucketGoneFromTheBackendIsNoLongerPending", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		sys.markMetadataUnavailable(bucket)
-
-		// Still on the backend: the metadata is merely unreadable, so the state
-		// stands and the bucket keeps failing closed.
-		sys.RemoveStaleBuckets(set.CreateStringSet(bucket))
-		if !unavailable(t, sys) {
-			t.Fatal("expected a bucket still on the backend to stay unavailable")
-		}
-
-		// Gone from the backend: there is no bucket left whose configuration
-		// could be unknown, so the state is dropped and the lookup answers the
-		// definitive absence a nonexistent bucket deserves.
-		sys.RemoveStaleBuckets(set.CreateStringSet())
-		if unavailable(t, sys) {
-			t.Fatal("expected a bucket gone from the backend to stop being unavailable")
-		}
-		if _, _, err := sys.GetCORSConfigCached(bucket); !isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected a definitive absence for a bucket that is gone, got %v", err)
-		}
-	})
-
-	t.Run("resetClearsThePendingState", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, true)
-		sys.markMetadataUnavailable(bucket)
-
-		sys.Reset()
-		if unavailable(t, sys) {
-			t.Fatal("expected Reset to clear the pending state")
-		}
-	})
-
-	// Before loading finishes, no bucket has a definitive answer, so an
-	// unavailable bucket must not be reported as an absence there either.
-	t.Run("anUnloadedCacheStillReportsNoAbsence", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t, false)
-		sys.markMetadataUnavailable(bucket)
-
-		_, _, err := sys.GetCORSConfigCached(bucket)
-		if isBucketCORSConfigNotFound(err) {
-			t.Fatalf("expected no definitive absence while the cache is still loading, got %v", err)
+		if sys.Count() != 0 {
+			t.Fatalf("expected 512 unknown lookups to add no metadata entries, got %d", sys.Count())
 		}
 	})
 }
@@ -3338,14 +3044,14 @@ func (o corsPreflightOutcome) String() string {
 // be in.
 //
 // The three dispositions carry very different weight. Delegating hands the
-// request to the server-wide handler, whose default allows every origin with
-// credentials, so it is reserved for the single case where the bucket definitively
-// has no configuration of its own. Every state in which this layer cannot
-// establish the bucket's rules - an absent or still loading metadata subsystem, a
-// stored document carrying no rule, a failed lookup - denies instead, because
-// falling back there would quietly relax a restrictive bucket exactly when it
-// matters. Once the rules are in hand the layer answers on its own, allowing on
-// the first matching rule and denying when none allows the request.
+// request to the server-wide handler, and it is what every state in which this
+// layer has no rules of its own to apply comes to: the bucket carries no
+// configuration, the metadata subsystem is absent or has not finished loading,
+// the lookup failed, or what is stored carries no rule. That is what leaves such
+// a bucket answered exactly as it was before this layer existed, by the
+// MINIO_API_CORS_ALLOW_ORIGIN setting. Once the rules are in hand the layer
+// answers on its own, allowing on the first matching rule and denying when none
+// allows the request.
 func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
@@ -3391,87 +3097,57 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 		wantHeaders map[string]string
 	}{
 		{
-			// The metadata subsystem is not there to be asked, so whether the
-			// bucket restricts cross-origin access cannot be established. That is
-			// not the same as establishing that it does not, so the request is
-			// refused rather than handed to the permissive default.
-			name: "nilMetadataSystemDenies",
+			// The metadata subsystem is not there to be asked, so this layer has
+			// no rules to apply and the request stays the server-wide handler's
+			// to answer, exactly as it was before this layer existed.
+			name: "nilMetadataSystemDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
 				saved := globalBucketMetadataSys
 				t.Cleanup(func() { globalBucketMetadataSys = saved })
 				globalBucketMetadataSys = nil
 			},
-			want: corsOutcomeDenied,
+			want: corsOutcomeDelegated,
 		},
 		{
-			// The startup window: the cache cannot yet say whether the bucket
-			// has a configuration. Delegating on that unknown would answer a
-			// restrictive bucket out of the server-wide default for as long as
-			// the window lasts, so it is refused instead - a refusal that
-			// carries no Access-Control-Max-Age and is not entered into the
-			// browser's preflight cache, so a retry once the cache is loaded is
-			// answered from the bucket's own rules.
-			name: "unknownBucketWhileTheCacheIsStillLoadingDenies",
+			// A cache that does not hold the bucket - because it has not
+			// finished loading, or because the bucket has no metadata to load -
+			// yields no rules either, so the request is delegated rather than
+			// answered from rules this layer does not have.
+			name: "bucketTheCacheDoesNotHoldDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
-				installTestBucketMetadataSys(t, false)
-			},
-			want: corsOutcomeDenied,
-		},
-		{
-			// The bucket exists - it was listed from the backend - but its
-			// metadata could not be read, so a loaded cache does not hold it.
-			// That is not the same as a loaded cache knowing the bucket has no
-			// configuration, and answering it as such would hand a possibly
-			// restrictive bucket to the permissive server-wide default for as
-			// long as its metadata stays unreadable.
-			name: "knownBucketWhoseMetadataIsUnavailableDenies",
-			setup: func(t *testing.T) {
-				t.Helper()
-				installTestBucketMetadataSys(t, true).markMetadataUnavailable(bucket)
-			},
-			want: corsOutcomeDenied,
-		},
-		{
-			// A loaded cache that does not know the bucket answers the definitive
-			// BucketCORSConfigNotFound, so the server-wide handler serves the
-			// request.
-			name: "unknownBucketOnALoadedCacheDelegates",
-			setup: func(t *testing.T) {
-				t.Helper()
-				installTestBucketMetadataSys(t, true)
+				installTestBucketMetadataSys(t)
 			},
 			want: corsOutcomeDelegated,
 		},
 		{
-			// The same definitive absence, reached the other way: the bucket's
-			// metadata is loaded and carries no CORS configuration at all.
+			// The same outcome reached the other way: the bucket's metadata is in
+			// hand and carries no CORS configuration at all.
 			name: "bucketWithoutAConfigurationDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, nil)
 			},
 			want: corsOutcomeDelegated,
 		},
 		{
 			// A rule-less document cannot have come from PutBucketCors, which
-			// requires at least one rule, so the bucket carries a configuration
-			// this layer cannot use rather than no configuration at all. There is
-			// nothing to match against and nothing that says the fallback
-			// applies, so the request is refused.
-			name: "storedConfigurationWithZeroRulesDenies",
+			// requires at least one rule. There is nothing in it to match
+			// against, so it grants nothing and the request is delegated like
+			// any other bucket this layer has no rules for.
+			name: "storedConfigurationWithZeroRulesDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig())
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig())
 			},
-			want: corsOutcomeDenied,
+			want: corsOutcomeDelegated,
 		},
 		{
 			name: "syntacticallyInvalidBucketNameDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
-				installTestBucketMetadataSys(t, true)
+				installTestBucketMetadataSys(t)
 			},
 			target: "/Not_A_Bucket/object",
 			want:   corsOutcomeDelegated,
@@ -3480,7 +3156,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "rootPathPreflightDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
-				installTestBucketMetadataSys(t, true)
+				installTestBucketMetadataSys(t)
 			},
 			target: "/",
 			want:   corsOutcomeDelegated,
@@ -3489,7 +3165,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "noRuleMatchesTheOriginDenies",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(otherOriginRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(otherOriginRule))
 			},
 			want: corsOutcomeDenied,
 		},
@@ -3497,7 +3173,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "noRuleMatchesTheMethodDenies",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			},
 			reqMethod: http.MethodDelete,
 			want:      corsOutcomeDenied,
@@ -3506,7 +3182,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "noRuleCoversTheRequestedHeadersDenies",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			},
 			reqHeaders: "content-type",
 			want:       corsOutcomeDenied,
@@ -3518,7 +3194,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "manyRequestedHeadersAreAllowedWhenTheRuleCoversThem",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(
 					miniogocors.Rule{
 						ID:            "everything",
 						AllowedHeader: []string{"*"},
@@ -3542,7 +3218,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "manyRequestedHeadersDenyWhenOneOfThemIsNotCovered",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(
 					miniogocors.Rule{
 						ID:            "almost-everything",
 						AllowedHeader: slices.Clone(manyHeaders[:len(manyHeaders)-1]),
@@ -3558,7 +3234,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "matchingRuleAllowsAndEmitsEveryHeaderFamily",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			},
 			reqHeaders: "X-Amz-Meta-Foo, x-amz-acl",
 			want:       corsOutcomeAllowed,
@@ -3574,7 +3250,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "matchingRuleWithoutRequestedHeadersOmitsAllowHeaders",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			},
 			want: corsOutcomeAllowed,
 			wantHeaders: map[string]string{
@@ -3588,7 +3264,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "matchingRuleWithoutMaxAgeOrExposeHeaderOmitsThem",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(
 					miniogocors.Rule{
 						ID:            "bare",
 						AllowedMethod: []string{http.MethodPut},
@@ -3611,7 +3287,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "firstMatchingRuleInDocumentOrderDeterminesTheResponse",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(
 					otherOriginRule,
 					miniogocors.Rule{
 						ID:            "first-match",
@@ -3643,7 +3319,7 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 			name: "virtualHostStyleAddressingResolvesTheSameBucket",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(matchingRule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(matchingRule))
 			},
 			target:      "/object",
 			host:        bucket + ".s3.example.com",
@@ -3802,7 +3478,7 @@ func TestBucketCorsPreflightMiddlewareMalformedHost(t *testing.T) {
 			// so the disposition cannot be mistaken for the ordinary
 			// no-configuration fallback: the only thing standing in the way is
 			// the Host the server does not accept.
-			sys := installTestBucketMetadataSys(t, true)
+			sys := installTestBucketMetadataSys(t)
 			setTestBucketCORSConfig(sys, bucket, corsTestConfig(miniogocors.Rule{
 				ID:            "matching",
 				AllowedMethod: []string{http.MethodPut},
@@ -4010,7 +3686,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 						name: "forABucketWithPermissiveRules",
 						setup: func(t *testing.T) {
 							t.Helper()
-							setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
+							setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, allowEverything)
 						},
 					},
 					{
@@ -4019,7 +3695,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 						name: "forABucketWithoutAConfiguration",
 						setup: func(t *testing.T) {
 							t.Helper()
-							setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+							setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, nil)
 						},
 					},
 				} {
@@ -4078,7 +3754,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		}
 
 		t.Run("aWildcardCoversThemAll", func(t *testing.T) {
-			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, allowEverything)
 
 			got, rec := serve(t, preflight(reqHeaders))
 			if got != corsOutcomeAllowed {
@@ -4091,7 +3767,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		})
 
 		t.Run("aRuleOneNameShortRefusesTheRequest", func(t *testing.T) {
-			setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+			setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(miniogocors.Rule{
 				ID:            "one-short",
 				AllowedHeader: slices.Clone(names[:len(names)-1]),
 				AllowedMethod: []string{http.MethodPut},
@@ -4120,7 +3796,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		names := corsRequestedHeaderNames(1600)
 		reqHeaders := strings.Join(names, ",")
 
-		setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+		setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(miniogocors.Rule{
 			ID:            "many-patterns",
 			AllowedHeader: corsWildcardHeaderPatterns(800),
 			AllowedMethod: []string{http.MethodPut},
@@ -4161,7 +3837,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 
 		reqHeaders := strings.Join(corsRequestedHeaderNames(1600), ",")
 
-		setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(miniogocors.Rule{
+		setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(miniogocors.Rule{
 			ID:            "many-patterns",
 			AllowedHeader: corsWildcardHeaderPatterns(800),
 			AllowedMethod: []string{http.MethodPut},
@@ -4362,7 +4038,7 @@ func TestCorsPreflightHeadersTooLarge(t *testing.T) {
 // guarantee an unauthenticated client can grow the map without bound simply by
 // inventing a new name per request.
 func TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace(t *testing.T) {
-	sys := installTestBucketMetadataSys(t, true)
+	sys := installTestBucketMetadataSys(t)
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
@@ -4481,10 +4157,10 @@ func TestCorsPreflightRefusalReportCarriesNoClientData(t *testing.T) {
 		reason error
 	}{
 		{name: "aHostTheServerDoesNotAccept", reason: errCORSPreflightHostNotAccepted},
+		{name: "aRequestCarryingTooManyHeaderBytes", reason: errCORSPreflightHeadersTooLarge},
 		{
-			name: "rulesThatCouldNotBeEstablished",
-			reason: fmt.Errorf("the CORS configuration of bucket %s could not be established: %w",
-				bucket, errBucketMetadataNotInitialized),
+			name:   "rulesThatCouldNotBeEvaluatedInFull",
+			reason: fmt.Errorf("for bucket %s, %w", bucket, errCORSPreflightEvaluationTooCostly),
 		},
 	}
 
@@ -4536,8 +4212,7 @@ func TestCorsPreflightRefusalReporterConcurrent(t *testing.T) {
 
 	reporter := &corsPreflightRefusalReporter{}
 	reasons := []error{
-		fmt.Errorf("the CORS configuration of bucket %s could not be established: %w",
-			"blitzy-cors-bucket", errBucketMetadataNotInitialized),
+		fmt.Errorf("for bucket %s, %w", "blitzy-cors-bucket", errCORSPreflightEvaluationTooCostly),
 		errCORSPreflightHostNotAccepted,
 	}
 
@@ -4564,49 +4239,68 @@ func TestCorsPreflightRefusalReporterConcurrent(t *testing.T) {
 	}
 }
 
-// TestBucketCorsPreflightMiddlewareReportsUnavailableRules pins which refusals
-// the evaluator reports.
+// TestBucketCorsPreflightMiddlewareReportsItsOwnRefusals pins which refusals the
+// evaluator reports.
 //
 // A refusal carries no Access-Control-Allow-* header whether the bucket's rules
-// were read and allow nothing or could not be read at all, and a preflight is
-// answered ahead of the router, so no audit entry, trace or metric distinguishes
-// the two. The report is the only thing that does, and it therefore has to be
-// emitted for exactly one of them: the bucket whose rules are unavailable. A
-// refusal by the rules themselves is the configuration working as written and is
-// not reported, and neither is a request handed to the server-wide handler.
-func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
+// were read and allow nothing or the request was turned away before they were
+// consulted, and a preflight is answered ahead of the router, so no audit entry,
+// trace or metric distinguishes the two. The report is the only thing that does,
+// and it therefore has to be emitted for exactly the refusals this layer produces
+// on its own account: a request the server would refuse outright, and rules it
+// could not finish evaluating. A refusal by the rules themselves is the
+// configuration working as written and is not reported, and neither is a request
+// handed to the server-wide handler.
+func TestBucketCorsPreflightMiddlewareReportsItsOwnRefusals(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
 		origin = "https://www.example1.com"
 	)
 
+	// Rules that would allow the probe below, so that a case which is refused all
+	// the same is refused for the reason it is testing rather than for want of a
+	// matching rule.
+	allowEverything := corsTestConfig(miniogocors.Rule{
+		ID:            "allow-everything",
+		AllowedHeader: []string{"*"},
+		AllowedMethod: []string{http.MethodPut},
+		AllowedOrigin: []string{"*"},
+	})
+
 	testCases := []struct {
-		name         string
-		setup        func(t *testing.T)
+		name  string
+		setup func(t *testing.T)
+		// request mutates the probe, which is otherwise a preflight the rules
+		// above allow.
+		request      func(req *http.Request)
 		want         corsPreflightOutcome
 		wantReported bool
 	}{
 		{
-			// The cache cannot yet say whether the bucket has rules, so the
-			// refusal reflects the state of this server rather than the state of
-			// the bucket. That is the condition worth an operator's attention.
-			name: "rulesUnavailableIsReported",
+			// The server answers 400 for this Host, so the request the preflight
+			// asks about could never be served. The refusal says something about
+			// how this request was handled rather than about the bucket, which is
+			// what makes it worth an operator's attention.
+			name: "aHostTheServerDoesNotAcceptIsReported",
 			setup: func(t *testing.T) {
 				t.Helper()
-				installTestBucketMetadataSys(t, false)
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, allowEverything)
 			},
+			request:      func(req *http.Request) { req.Host = "a_b.example" },
 			want:         corsOutcomeDenied,
 			wantReported: true,
 		},
 		{
-			// The metadata subsystem is not there to be asked at all, which is
-			// the same class of condition.
-			name: "absentMetadataSubsystemIsReported",
+			// Likewise for a request carrying more header bytes than any MinIO
+			// request may: it is refused before those headers are read.
+			name: "aRequestCarryingTooManyHeaderBytesIsReported",
 			setup: func(t *testing.T) {
 				t.Helper()
-				saved := globalBucketMetadataSys
-				t.Cleanup(func() { globalBucketMetadataSys = saved })
-				globalBucketMetadataSys = nil
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, allowEverything)
+			},
+			request: func(req *http.Request) {
+				req.Header.Set("Access-Control-Request-Headers",
+					strings.Join(corsRequestedHeaderNames(4096), ","))
 			},
 			want:         corsOutcomeDenied,
 			wantReported: true,
@@ -4618,7 +4312,7 @@ func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
 			name: "refusalByTheRulesIsNotReported",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, corsTestConfig(
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(
 					miniogocors.Rule{
 						AllowedMethod: []string{http.MethodGet},
 						AllowedOrigin: []string{"https://www.example9.com"},
@@ -4629,14 +4323,50 @@ func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
 			wantReported: false,
 		},
 		{
-			// The bucket definitively has no rules of its own, so the request is
-			// the server-wide handler's to answer and there is nothing to report.
+			// The bucket has no rules of its own, so the request is the
+			// server-wide handler's to answer and there is nothing to report.
 			name: "delegationIsNotReported",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, nil)
 			},
 			want:         corsOutcomeDelegated,
+			wantReported: false,
+		},
+		{
+			// Neither is the delegation of a bucket the cache does not hold,
+			// which is the state a still loading cache and an absent bucket
+			// share. It is the ordinary fallback rather than a condition.
+			name: "delegationOfABucketTheCacheDoesNotHoldIsNotReported",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installTestBucketMetadataSys(t)
+			},
+			want:         corsOutcomeDelegated,
+			wantReported: false,
+		},
+		{
+			// And neither is the absence of the metadata subsystem itself, for
+			// the same reason: no rules of this bucket's own were established, so
+			// the request stays the server-wide handler's.
+			name: "delegationWithoutAMetadataSubsystemIsNotReported",
+			setup: func(t *testing.T) {
+				t.Helper()
+				saved := globalBucketMetadataSys
+				t.Cleanup(func() { globalBucketMetadataSys = saved })
+				globalBucketMetadataSys = nil
+			},
+			want:         corsOutcomeDelegated,
+			wantReported: false,
+		},
+		{
+			// A rule matched, so there is nothing to report either.
+			name: "anAllowedRequestIsNotReported",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, allowEverything)
+			},
+			want:         corsOutcomeAllowed,
 			wantReported: false,
 		},
 	}
@@ -4660,6 +4390,9 @@ func TestBucketCorsPreflightMiddlewareReportsUnavailableRules(t *testing.T) {
 				req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
 				req.Header.Set("Origin", origin)
 				req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+				if tc.request != nil {
+					tc.request(req)
+				}
 				rec := httptest.NewRecorder()
 
 				middleware.ServeHTTP(rec, req)
@@ -5518,7 +5251,7 @@ func testPutBucketCorsHandler(obj ObjectLayer, instanceType, bucketName string, 
 			t.Fatalf("%s: expected the message %q, got %q", instanceType, want, errorResponse.Message)
 		}
 
-		if _, _, err := globalBucketMetadataSys.GetCORSConfig(bucketName); !isBucketCORSConfigNotFound(err) {
+		if _, _, err := globalBucketMetadataSys.GetCORSConfig(bucketName); !isCORSConfigNotFound(err) {
 			t.Fatalf("%s: expected the bucket to still have no CORS configuration, got %v",
 				instanceType, err)
 		}
@@ -6038,12 +5771,12 @@ func testBucketCORSMetadataTimestamp(obj ObjectLayer, instanceType, bucketName s
 ) {
 	ctx := t.Context()
 
-	// storedTimestamp returns the timestamp both accessors report for the stored
-	// configuration, having asserted that they agree on it and on the
-	// configuration itself. Both are required: the GET handler reads through
-	// GetCORSConfig while the preflight evaluator reads through
-	// GetCORSConfigCached, so a value only one of them gets right is a value half
-	// the server never sees.
+	// storedTimestamp returns the timestamp GetCORSConfig reports for the stored
+	// configuration, having asserted that it was actually stamped and that the
+	// preflight evaluator's own lookup serves the same configuration. Both reads
+	// are required: the GET handler answers through GetCORSConfig while the
+	// preflight evaluator answers through preflightCORSConfig, so a configuration
+	// only one of them gets right is one half the server never sees.
 	storedTimestamp := func(stage string) time.Time {
 		t.Helper()
 
@@ -6060,21 +5793,17 @@ func testBucketCORSMetadataTimestamp(obj ObjectLayer, instanceType, bucketName s
 				instanceType, stage)
 		}
 
-		cachedConfig, cachedAt, err := globalBucketMetadataSys.GetCORSConfigCached(bucketName)
+		preflightConfig, err := preflightCORSConfig(bucketName)
 		if err != nil {
-			t.Fatalf("%s: %s: expected the cached CORS configuration to be readable, got error: %v",
+			t.Fatalf("%s: %s: expected the preflight lookup to find the configuration, got error: %v",
 				instanceType, stage, err)
 		}
 		// Equivalence rather than pointer identity, because serving the same
 		// configuration is the contract; whether the two answers happen to share
 		// one cached value is an implementation detail.
-		if !reflect.DeepEqual(cachedConfig, config) {
-			t.Fatalf("%s: %s: expected both accessors to serve the same parsed configuration, got %+v and %+v",
-				instanceType, stage, config, cachedConfig)
-		}
-		if !cachedAt.Equal(updatedAt) {
-			t.Fatalf("%s: %s: expected GetCORSConfigCached to report the timestamp %s GetCORSConfig reports, got %s",
-				instanceType, stage, updatedAt, cachedAt)
+		if !reflect.DeepEqual(preflightConfig, config) {
+			t.Fatalf("%s: %s: expected both lookups to serve the same parsed configuration, got %+v and %+v",
+				instanceType, stage, config, preflightConfig)
 		}
 		return updatedAt
 	}
@@ -6093,19 +5822,20 @@ func testBucketCORSMetadataTimestamp(obj ObjectLayer, instanceType, bucketName s
 		return meta
 	}
 
-	// assertMissing proves a cleared configuration is reported as definitively
-	// absent by both accessors rather than as an error of some other kind, which
-	// is the distinction the preflight evaluator acts on.
+	// assertMissing proves a cleared configuration is reported as an absence by
+	// the accessor the GET handler answers 404 from, and that the preflight
+	// lookup no longer produces rules for the bucket either - which is what hands
+	// it back to the server-wide setting.
 	assertMissing := func(stage string) {
 		t.Helper()
 
-		if _, _, err := globalBucketMetadataSys.GetCORSConfig(bucketName); !isBucketCORSConfigNotFound(err) {
+		if _, _, err := globalBucketMetadataSys.GetCORSConfig(bucketName); !isCORSConfigNotFound(err) {
 			t.Fatalf("%s: %s: expected GetCORSConfig to report the configuration missing, got error: %v",
 				instanceType, stage, err)
 		}
-		if _, _, err := globalBucketMetadataSys.GetCORSConfigCached(bucketName); !isBucketCORSConfigNotFound(err) {
-			t.Fatalf("%s: %s: expected GetCORSConfigCached to report the configuration missing, got error: %v",
-				instanceType, stage, err)
+		if config, err := preflightCORSConfig(bucketName); err == nil {
+			t.Fatalf("%s: %s: expected the preflight lookup to find no configuration, got %+v",
+				instanceType, stage, config)
 		}
 	}
 
