@@ -175,6 +175,10 @@ func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCo
 // A document that did not validate answers MalformedXML carrying the specific
 // cause, because the code itself only says the document did not validate and the
 // cause is what tells the client which rule and which value to correct.
+//
+// No integrity code is enumerated here on purpose: the cause is handed to
+// toAPIError rather than translated, so every error the read can report keeps the
+// code that belongs to it without this classifier having to list them.
 func corsConfigAPIError(ctx context.Context, err error) APIError {
 	var readErr corsConfigReadError
 	if errors.As(err, &readErr) {

@@ -4058,6 +4058,185 @@ func TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace(t *testing.T) {
 	}
 }
 
+// TestBucketCorsPreflightServerWideFallback holds the disposition of a preflight
+// for a bucket that has no rules of its own, through the handler a running server
+// actually composes rather than through the middleware alone.
+//
+// The bound it pins is the one a browser feels: a bucket without a configuration
+// of its own must keep being answered from MINIO_API_CORS_ALLOW_ORIGIN, and every
+// reason there are no rules to answer from has to be treated alike - the bucket
+// carries no configuration, the metadata cache has not reached it yet, the cache
+// has finished loading and does not hold it, what is stored carries no rule, or
+// there is no metadata subsystem at all. Telling any of those apart would make a
+// browser's access to a bucket depend on whether this server happens to have read
+// that bucket's metadata yet, a condition no deployment configures and none can
+// observe, on a path that carries no credentials to attribute a refusal to.
+//
+// The two answers are distinguished by their own fingerprints rather than by
+// inspection: the server-wide handler replies 204 and sets
+// Access-Control-Allow-Credentials, and never emits Access-Control-Expose-Headers
+// on a preflight, while the per-bucket evaluator replies 200 and sets neither. So
+// a rule that matches and a rule set that refuses must both still answer for
+// themselves, which is what keeps this from passing by delegating everything.
+func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
+	const (
+		bucket = "blitzy-cors-bucket"
+		origin = "https://www.example1.com"
+	)
+
+	rule := miniogocors.Rule{
+		ID:            "matching",
+		AllowedHeader: []string{"x-amz-*"},
+		AllowedMethod: []string{http.MethodPut},
+		AllowedOrigin: []string{origin},
+		ExposeHeader:  []string{"ETag"},
+		MaxAgeSeconds: 3000,
+	}
+
+	// installLoadedTestBucketMetadataSys presents the replacement cache as having
+	// finished loading, which is the state in which a bucket it does not hold is a
+	// bucket without a configuration rather than one not read yet.
+	installLoadedTestBucketMetadataSys := func(t *testing.T) *BucketMetadataSys {
+		t.Helper()
+
+		sys := installTestBucketMetadataSys(t)
+		sys.Lock()
+		sys.initialized = true
+		sys.Unlock()
+		return sys
+	}
+
+	testCases := []struct {
+		name  string
+		setup func(t *testing.T)
+		// origin the preflight announces; the stored rule allows only origin.
+		origin string
+		// wantServerWide is whether the server-wide handler is expected to answer.
+		wantServerWide bool
+	}{
+		{
+			// The condition a freshly started server is in for as long as it takes
+			// to load bucket metadata: the cache cannot yet say whether the bucket
+			// has a configuration. The global setting has to keep answering.
+			name:           "aBucketAbsentFromACacheThatIsStillLoading",
+			setup:          func(t *testing.T) { t.Helper(); installTestBucketMetadataSys(t) },
+			wantServerWide: true,
+		},
+		{
+			name:           "aBucketAbsentFromALoadedCache",
+			setup:          func(t *testing.T) { t.Helper(); installLoadedTestBucketMetadataSys(t) },
+			wantServerWide: true,
+		},
+		{
+			name: "aBucketWhoseMetadataCarriesNoConfiguration",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, nil)
+			},
+			wantServerWide: true,
+		},
+		{
+			name: "aStoredDocumentCarryingNoRule",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig())
+			},
+			wantServerWide: true,
+		},
+		{
+			name: "anAbsentMetadataSubsystem",
+			setup: func(t *testing.T) {
+				t.Helper()
+				saved := globalBucketMetadataSys
+				t.Cleanup(func() { globalBucketMetadataSys = saved })
+				globalBucketMetadataSys = nil
+			},
+			wantServerWide: true,
+		},
+		{
+			// Rules that are in hand answer for themselves, so the fallback must
+			// not reach this request: the matched rule allows it.
+			name: "aMatchingRuleAnswersInstead",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+			},
+			wantServerWide: false,
+		},
+		{
+			// And the fallback must not reach a request the rules refuse either,
+			// even though the server-wide setting would have allowed this origin.
+			name: "rulesThatRefuseTheRequestAnswerInstead",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+			},
+			origin:         "https://www.example9.com",
+			wantServerWide: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.setup(t)
+
+			// The S3 handler behind the CORS layers must never be reached by a
+			// preflight: no mux route is registered for OPTIONS, which is the
+			// whole reason the evaluator is HTTP middleware.
+			handler := corsHandler(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				t.Error("expected a preflight not to reach the wrapped S3 handler")
+			}))
+
+			reqOrigin := tc.origin
+			if reqOrigin == "" {
+				reqOrigin = origin
+			}
+			req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
+			req.Header.Set("Origin", reqOrigin)
+			req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+			req.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if !tc.wantServerWide {
+				// Answered by the per-bucket evaluator: 200, and the server-wide
+				// handler's Access-Control-Allow-Credentials is absent because
+				// that handler never saw the request.
+				if rec.Code != http.StatusOK {
+					t.Errorf("expected the per-bucket evaluator's status %d, got %d", http.StatusOK, rec.Code)
+				}
+				if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+					t.Errorf("expected the server-wide handler not to have answered, it set Access-Control-Allow-Credentials to %q", got)
+				}
+				return
+			}
+
+			// Answered by the server-wide handler, with the status and headers it
+			// has always answered a preflight with. The global allow-origin list
+			// is unset in this process, which getCorsAllowOrigins reports as "*",
+			// so the origin is allowed.
+			if rec.Code != http.StatusNoContent {
+				t.Errorf("expected the server-wide handler's status %d, got %d", http.StatusNoContent, rec.Code)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != reqOrigin {
+				t.Errorf("expected the server-wide handler to allow the origin %q, got %q", reqOrigin, got)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+				t.Errorf("expected the server-wide handler's Access-Control-Allow-Credentials to be %q, got %q", "true", got)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Methods"); got != http.MethodPut {
+				t.Errorf("expected the server-wide handler to allow the method %q, got %q", http.MethodPut, got)
+			}
+			// Never emitted on a preflight by the server-wide handler, so its
+			// absence is what proves the per-bucket evaluator did not answer.
+			if got := rec.Header().Values("Access-Control-Expose-Headers"); len(got) != 0 {
+				t.Errorf("expected no Access-Control-Expose-Headers on a server-wide preflight response, got %v", got)
+			}
+		})
+	}
+}
+
 // installTestCORSPreflightReporter replaces the reporter the preflight evaluator
 // reports its refusals through with a fresh one, restoring the previous value
 // afterwards, so a test observes only the refusals it causes.
@@ -4677,13 +4856,14 @@ func TestBucketMetadataDefaultTimestampsCORS(t *testing.T) {
 // The distinction the table draws is the point of the classifier. A document that
 // really did not validate answers MalformedXML and carries the specific cause, so
 // the client is told which rule and which value to correct. A body that failed its
-// own integrity check never got as far as validating: an authenticated request
-// body verifies Content-MD5, x-amz-content-sha256 and any trailing checksum while
-// it is consumed, so those mismatches surface from the read of a document that may
-// be perfectly well-formed. Answering MalformedXML for them would send the client
-// looking for an XML fault that does not exist while the digest it declared stays
-// wrong, and it would make an integrity failure indistinguishable from a schema
-// violation on the wire.
+// own integrity check never got as far as validating: the body the PUT handler
+// reads verifies the Content-MD5, x-amz-content-sha256 and x-amz-checksum-* values
+// the client declared while it is consumed - the last of them installed by
+// corsConfigBody rather than by any authentication path - so those mismatches
+// surface from the read of a document that may be perfectly well-formed. Answering
+// MalformedXML for them would send the client looking for an XML fault that does
+// not exist while the digest it declared stays wrong, and it would make an
+// integrity failure indistinguishable from a schema violation on the wire.
 //
 // A body that simply stopped early is the third case, and it is a client fault
 // with an S3 code of its own: IncompleteBody, HTTP 400. Only a failure that says
@@ -4732,6 +4912,14 @@ func TestCorsConfigAPIError(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			// The classifier defers to toAPIError instead of enumerating the
+			// integrity codes itself, and this is one the route provokes for
+			// itself: a checksum is verified because corsConfigBody adds it to
+			// the reader, not because any authentication path does.
+			// TestPutBucketCorsHandler drives it end to end - both a value that
+			// does not match the body and one promised in a trailer that never
+			// arrives - so what this case pins is the code such a failure keeps on
+			// its way back out through the classifier.
 			name: "aTrailingChecksumMismatchKeepsItsOwnCode",
 			err: corsConfigReadError{cause: hash.ChecksumMismatch{
 				Want: "kAFQmDzST7DWlj99KOF/cg==",
