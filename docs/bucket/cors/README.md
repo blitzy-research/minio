@@ -103,7 +103,7 @@ A request whose credentials do not permit the operation fails with `403 AccessDe
 - `MaxAgeSeconds` is a **non-negative** integer.
 - No origin or header name contains a control character.
 
-A rejection is a `MalformedXML` error whose `Message` names the cause, the rule that carries it, and the offending value, with rules numbered from zero in document order. Submitting a rule whose only `AllowedMethod` is `PATCH` produces the following body, shown here indented for readability:
+A rejection is a `MalformedXML` error whose `Message` names the cause, the rule that carries it, and the offending value, with rules numbered from zero in document order. Submitting a rule whose only `AllowedMethod` is `PATCH` produces the following body, shown here indented for readability and with the `RequestId` and `HostId` that identify the request and the server it reached:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -113,7 +113,7 @@ A rejection is a `MalformedXML` error whose `Message` names the cause, the rule 
   <BucketName>mybucket</BucketName>
   <Resource>/mybucket</Resource>
   <RequestId>18C78572B8497F72</RequestId>
-  <HostId>3l137</HostId>
+  <HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId>
 </Error>
 ```
 
