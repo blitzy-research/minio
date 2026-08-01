@@ -54,11 +54,12 @@ const (
 	// work is the product of two lists a bucket owner and a client choose
 	// separately. Both are individually bounded - a stored document is at most
 	// maxBucketCORSConfigSize, which holds on the order of four thousand
-	// AllowedHeader values, and a request admitted by isHTTPHeaderSizeTooLarge
-	// carries at most eight kilobytes of headers, which names on the order of
-	// four thousand of them - but their product is on the order of sixteen
-	// million, and a preflight is unauthenticated, so nothing else stands between
-	// a client and that product being spent per request.
+	// AllowedHeader values, and a request admitted by
+	// corsPreflightHeadersTooLarge carries at most maxHeaderSize bytes of
+	// headers, which names on the order of four thousand of them - but their
+	// product is on the order of sixteen million, and a preflight is
+	// unauthenticated, so nothing else stands between a client and that product
+	// being spent per request.
 	//
 	// This ceiling is an order of magnitude below that product and two orders
 	// above what any real preflight costs: a browser asks about a handful of
@@ -156,7 +157,7 @@ var errCORSPreflightHostNotAccepted = errors.New(
 
 // errCORSPreflightHeadersTooLarge is the reason reported when a preflight is
 // refused because it carries more header bytes than this server admits, which is
-// the same limit setRequestLimitMiddleware applies to every other request.
+// the ceiling setRequestLimitMiddleware applies to every other request.
 //
 // It names no header and no size, because both come from the request.
 var errCORSPreflightHeadersTooLarge = errors.New(
@@ -870,6 +871,46 @@ func (m corsHeaderMatcher) allows(reqHeader string, budget *corsMatchBudget) boo
 	return false
 }
 
+// corsPreflightHeadersTooLarge reports whether a request carries more header
+// bytes than this server admits, applying the two ceilings
+// setRequestLimitMiddleware applies to every other request: maxHeaderSize over
+// all of the headers, and maxUserDataSize over the user metadata among them.
+//
+// It counts them here rather than calling isHTTPHeaderSizeTooLarge, the helper
+// that middleware uses, because that helper measures each field name once
+// against Header.Get - the first value of the field, and only that one - while
+// this layer reads every value of Access-Control-Request-Headers, splits them
+// into one list of requested headers, and echoes that whole list back on a
+// matched rule. A request that repeats a field would therefore be measured by a
+// fraction of what it carries and of what answering it costs, and a preflight is
+// unauthenticated, so that fraction would be a client's to choose. Every value
+// of every field is summed instead, with the field name counted once per value,
+// the way the wire carries it.
+//
+// Counting at least as much as the inner limit does keeps the two layers
+// consistent in the only direction that is safe: a preflight this refuses may or
+// may not have been admitted further in, while a preflight this admits is one
+// that layer admits as well.
+func corsPreflightHeadersTooLarge(header http.Header) bool {
+	var size, userSize int
+	for key, values := range header {
+		for _, value := range values {
+			length := len(key) + len(value)
+			size += length
+			for _, prefix := range userMetadataKeyPrefixes {
+				if stringsHasPrefixFold(key, prefix) {
+					userSize += length
+					break
+				}
+			}
+			if userSize > maxUserDataSize || size > maxHeaderSize {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // bucketCORSPreflightMiddleware answers browser CORS preflight requests from
 // the CORS configuration stored on the target bucket.
 //
@@ -918,13 +959,16 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 
 		// A request carrying more header bytes than this server admits is refused
 		// here for the same reason a Host it does not accept is, just below:
-		// setRequestLimitMiddleware answers HTTP 413 for it, so the request this
-		// preflight asks about could never be served, and delegating the
-		// preflight would answer it out of the most permissive setting the server
-		// has. Checking it before anything else is read from the headers is also
-		// what bounds every step that follows, since the lists this layer parses
-		// and compares are the ones those bytes carry.
-		if isHTTPHeaderSizeTooLarge(r.Header) {
+		// setRequestLimitMiddleware refuses it before any bucket handler runs, so
+		// the request this preflight asks about could never be served, and
+		// delegating the preflight would answer it out of the most permissive
+		// setting the server has. Checking it before anything else is read from
+		// the headers is also what bounds every step that follows, since the
+		// lists this layer parses, compares and echoes back are the ones those
+		// bytes carry - which is why every value of every repeated field counts
+		// towards the ceiling here, rather than the first value of each field
+		// alone.
+		if corsPreflightHeadersTooLarge(r.Header) {
 			corsPreflightRefused.report(errCORSPreflightHeadersTooLarge)
 			writeCORSPreflightDenied(w)
 			return
@@ -1240,13 +1284,14 @@ func writeCORSPreflightDenied(w http.ResponseWriter) {
 // matches when it covers every header the request asks about and a header that
 // was never compared against the rules cannot be known to be covered. Nothing
 // about the length is refused here, and nothing needs to be: the caller admits
-// only requests that carry no more header bytes than isHTTPHeaderSizeTooLarge
-// allows, which caps this list at a few thousand names however they are spread
-// across repeated fields, and the cost of comparing them against the rules is
-// bounded separately by maxCORSPreflightMatchCost. Both of those bounds are the
-// caller's to apply, so passing an unbounded header here is a programming error
-// rather than something to be silently truncated - truncating would drop names
-// that a rule then would not have to cover.
+// only requests that carry no more header bytes than
+// corsPreflightHeadersTooLarge allows, which counts every value of every
+// repeated field and therefore caps this list at a few thousand names however
+// they are spread across those fields, and the cost of comparing them against
+// the rules is bounded separately by maxCORSPreflightMatchCost. Both of those
+// bounds are the caller's to apply, so passing an unbounded header here is a
+// programming error rather than something to be silently truncated - truncating
+// would drop names that a rule then would not have to cover.
 func parseCORSRequestHeaders(h http.Header) []string {
 	values := h.Values("Access-Control-Request-Headers")
 	if len(values) == 0 {

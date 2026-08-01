@@ -64,17 +64,18 @@ type BucketMetadataSys struct {
 	// means the permissive server-wide origin list, relaxing a restrictive
 	// bucket for as long as its metadata stays unreadable. Nor is an entry that
 	// is merely present enough to vouch for: a bucket whose owner has just
-	// tightened or removed its rules on another node keeps answering from the
-	// superseded copy if the reload this node was asked to perform failed, so
-	// an entry from before a failed load is treated as unknown rather than
+	// tightened or removed its rules keeps answering from the superseded copy
+	// if the refresh that would have brought that change in failed, so an entry
+	// from before a failed load is treated as unknown rather than
 	// authoritative.
 	//
 	// An entry is therefore added on every failed load, whether or not metadata
 	// for the bucket is already in hand, and removed only once a load succeeds
 	// or the bucket's metadata is set or replaced outright - never merely
 	// because something is cached. Its growth is bounded by the set of buckets
-	// the backend reports, since only loads of listed buckets and reloads a
-	// peer asks for are recorded.
+	// the backend reports, since the only loads recorded here are of buckets
+	// listed from it: the initial load of the cache, and the refresh that walks
+	// the same listing afterwards.
 	unavailableBuckets map[string]struct{}
 }
 
@@ -143,9 +144,11 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 // It is recorded unconditionally, including for a bucket whose metadata is
 // already in hand. An entry left by an earlier load says what the bucket's
 // configuration was, not what it is: the load that just failed is precisely the
-// one that would have told this node that the bucket's rules changed. Treating
-// that copy as authoritative is what would let a tightened or deleted
-// configuration keep being served from the copy it replaced.
+// one that would have shown this cache that the bucket's rules changed - which
+// is how a change made through another node reaches it once the write's own
+// reload has come and gone. Treating that copy as authoritative is what would
+// let a tightened or deleted configuration keep being served from the copy it
+// replaced.
 func (sys *BucketMetadataSys) markMetadataUnavailable(bucket string) {
 	sys.Lock()
 	defer sys.Unlock()

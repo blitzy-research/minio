@@ -3977,53 +3977,96 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 	// A request carrying more header bytes than the server admits is refused
 	// before anything is read from those headers, so the refusal cannot depend on
 	// the bucket at all. Delegating it would answer, out of the permissive
-	// server-wide default, a request the server itself answers 413 for.
+	// server-wide default, a request the server itself refuses outright.
+	//
+	// The two fixtures carry the same excess differently, and both have to be
+	// refused. The first states it in a single Access-Control-Request-Headers
+	// value. The second opens with a value so ordinary that an accounting reading
+	// only the first value of each field would find nothing to object to, and
+	// carries the rest of the excess in further fields of the same name - which is
+	// the shape that matters, because this layer reads every value of that field,
+	// joins them into one requested-header list, and echoes that whole list back
+	// on a match.
 	t.Run("headersLargerThanTheServerAdmitsAreRefused", func(t *testing.T) {
-		oversized := strings.Join(corsRequestedHeaderNames(4096), ",")
+		names := corsRequestedHeaderNames(4096)
 
-		for _, tc := range []struct {
-			name  string
-			setup func(t *testing.T)
+		for _, fixture := range []struct {
+			name    string
+			request func() *http.Request
 		}{
 			{
-				name: "forABucketWithPermissiveRules",
-				setup: func(t *testing.T) {
-					t.Helper()
-					setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
-				},
+				name:    "statedInOneValue",
+				request: func() *http.Request { return preflight(strings.Join(names, ",")) },
 			},
 			{
-				// No configuration at all, which is the one state that would
-				// otherwise delegate. The size limit outranks it.
-				name: "forABucketWithoutAConfiguration",
-				setup: func(t *testing.T) {
-					t.Helper()
-					setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+				name: "spreadAcrossRepeatedFields",
+				request: func() *http.Request {
+					req := preflight("x-amz-acl")
+					for chunk := range slices.Chunk(names, 256) {
+						req.Header.Add("Access-Control-Request-Headers", strings.Join(chunk, ","))
+					}
+					return req
 				},
 			},
 		} {
-			t.Run(tc.name, func(t *testing.T) {
-				tc.setup(t)
-				reporter := installTestCORSPreflightReporter(t)
+			t.Run(fixture.name, func(t *testing.T) {
+				for _, tc := range []struct {
+					name  string
+					setup func(t *testing.T)
+				}{
+					{
+						name: "forABucketWithPermissiveRules",
+						setup: func(t *testing.T) {
+							t.Helper()
+							setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, allowEverything)
+						},
+					},
+					{
+						// No configuration at all, which is the one state that
+						// would otherwise delegate. The size limit outranks it.
+						name: "forABucketWithoutAConfiguration",
+						setup: func(t *testing.T) {
+							t.Helper()
+							setTestBucketCORSConfig(installTestBucketMetadataSys(t, true), bucket, nil)
+						},
+					},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						tc.setup(t)
+						reporter := installTestCORSPreflightReporter(t)
 
-				req := preflight(oversized)
-				if !isHTTPHeaderSizeTooLarge(req.Header) {
-					t.Fatalf("the fixture must exceed the server's header size limit, %d name(s) did not",
-						len(corsRequestedHeaderNames(4096)))
-				}
+						req := fixture.request()
+						if !corsPreflightHeadersTooLarge(req.Header) {
+							t.Fatalf("the fixture must exceed the header size limit, %d name(s) across %d field(s) did not",
+								len(names), len(req.Header.Values("Access-Control-Request-Headers")))
+						}
 
-				got, rec := serve(t, req)
-				if got != corsOutcomeDenied {
-					t.Fatalf("expected an oversized preflight to be refused, it was %s (status %d, headers %v)",
-						got, rec.Code, rec.Header())
-				}
-				for _, name := range corsPreflightAllowHeaders {
-					if value := rec.Header().Get(name); value != "" {
-						t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
-					}
-				}
-				if reportedAt, _ := corsPreflightReporterState(t, reporter); reportedAt.IsZero() {
-					t.Error("expected an oversized preflight to be reported")
+						got, rec := serve(t, req)
+						if got != corsOutcomeDenied {
+							t.Fatalf("expected an oversized preflight to be refused, it was %s (status %d, headers %v)",
+								got, rec.Code, rec.Header())
+						}
+						for _, name := range corsPreflightAllowHeaders {
+							if value := rec.Header().Get(name); value != "" {
+								t.Errorf("expected a refused preflight to carry no %s, got %q", name, value)
+							}
+						}
+						// Nothing but the variance the answer depends on, so the
+						// refusal reports none of the names it declined to read.
+						if got := rec.Header().Values("Vary"); len(got) == 0 {
+							t.Error("expected a refused preflight to declare its variance")
+						}
+						// One report, whatever the request carried: the reason is
+						// the server's own text, and the volume is bounded by the
+						// reporter rather than by how many fields arrived.
+						reportedAt, unreported := corsPreflightReporterState(t, reporter)
+						if reportedAt.IsZero() {
+							t.Error("expected an oversized preflight to be reported")
+						}
+						if unreported != 0 {
+							t.Errorf("expected a single refusal to be reported once, %d went unreported", unreported)
+						}
+					})
 				}
 			})
 		}
@@ -4038,7 +4081,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		reqHeaders := strings.Join(names, ",")
 
 		req := preflight(reqHeaders)
-		if isHTTPHeaderSizeTooLarge(req.Header) {
+		if corsPreflightHeadersTooLarge(req.Header) {
 			t.Fatalf("the fixture must be admissible, %d name(s) were not", len(names))
 		}
 
@@ -4094,7 +4137,7 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 		reporter := installTestCORSPreflightReporter(t)
 
 		req := preflight(reqHeaders)
-		if isHTTPHeaderSizeTooLarge(req.Header) {
+		if corsPreflightHeadersTooLarge(req.Header) {
 			t.Fatal("the fixture must be a request the server admits, or the size limit rather than the allowance would refuse it")
 		}
 
@@ -4178,6 +4221,146 @@ func TestBucketCorsPreflightMiddlewareBoundedWork(t *testing.T) {
 				requests-1, requests, unreported)
 		}
 	})
+}
+
+// TestCorsPreflightHeadersTooLarge pins the accounting a preflight is admitted
+// by, which is the only bound standing between an unauthenticated client and the
+// work its request asks this layer for.
+//
+// What it has to measure is a request whose header fields may repeat: the
+// requested-header list is read from every value of Access-Control-Request-Headers
+// and echoed back in full on a match, so every value of every field counts, with
+// the field name counted once per value the way the wire carries it. Measuring the
+// first value of each field alone - which is what the server-wide helper does, and
+// precisely what this function exists in order not to do - would let a client
+// state a modest first value and carry the rest of the list in further fields of
+// the same name.
+func TestCorsPreflightHeadersTooLarge(t *testing.T) {
+	const requestedHeaders = "Access-Control-Request-Headers"
+
+	// bytes returns a header value of exactly the requested length, so a fixture
+	// states how many header bytes it carries rather than implying it.
+	bytesOfLength := func(length int) string { return strings.Repeat("x", length) }
+
+	// preflightHeader returns the fields an ordinary browser preflight carries,
+	// which every fixture below starts from.
+	preflightHeader := func() http.Header {
+		header := http.Header{}
+		header.Set("Origin", "https://www.example1.com")
+		header.Set("Access-Control-Request-Method", http.MethodPut)
+		return header
+	}
+
+	testCases := []struct {
+		name   string
+		header func() http.Header
+		want   bool
+	}{
+		{
+			name: "anOrdinaryPreflightIsAdmitted",
+			header: func() http.Header {
+				header := preflightHeader()
+				header.Set(requestedHeaders, "content-type, x-amz-acl")
+				return header
+			},
+			want: false,
+		},
+		{
+			name: "aValueFillingTheCeilingIsStillAdmitted",
+			header: func() http.Header {
+				header := http.Header{}
+				header.Set(requestedHeaders, bytesOfLength(maxHeaderSize-len(requestedHeaders)))
+				return header
+			},
+			want: false,
+		},
+		{
+			name: "oneValueOverTheCeilingIsRefused",
+			header: func() http.Header {
+				header := http.Header{}
+				header.Set(requestedHeaders, bytesOfLength(maxHeaderSize-len(requestedHeaders)+1))
+				return header
+			},
+			want: true,
+		},
+		{
+			// The regression this function exists for: a first value nothing
+			// could object to, and the excess in further fields of the same
+			// name. An accounting that read Header.Get alone would admit it.
+			name: "excessSpreadAcrossRepeatedFieldsIsRefused",
+			header: func() http.Header {
+				header := preflightHeader()
+				header.Set(requestedHeaders, "x-amz-acl")
+				for range 8 {
+					header.Add(requestedHeaders, bytesOfLength(maxHeaderSize/8))
+				}
+				return header
+			},
+			want: true,
+		},
+		{
+			// Repetition is not itself the fault: fields that repeat while their
+			// values still fit inside the ceiling are admitted, so a gateway that
+			// splits one list across several fields is not turned away for it.
+			name: "repeatedFieldsInsideTheCeilingAreAdmitted",
+			header: func() http.Header {
+				header := preflightHeader()
+				for range 8 {
+					header.Add(requestedHeaders, bytesOfLength(512))
+				}
+				return header
+			},
+			want: false,
+		},
+		{
+			// Two values whose bytes alone would just fit, and do not once each
+			// one carries its field name - which is what a second field costs on
+			// the wire.
+			name: "theFieldNameCountsOncePerValue",
+			header: func() http.Header {
+				header := http.Header{}
+				half := (maxHeaderSize - len(requestedHeaders)) / 2
+				header.Add(requestedHeaders, bytesOfLength(half))
+				header.Add(requestedHeaders, bytesOfLength(maxHeaderSize-len(requestedHeaders)-half))
+				return header
+			},
+			want: true,
+		},
+		{
+			// The second ceiling this server applies. User metadata is bounded
+			// well below the total, and repetition must not evade that bound
+			// either, even though the request stays far inside maxHeaderSize.
+			name: "repeatedUserMetadataIsRefusedByItsOwnCeiling",
+			header: func() http.Header {
+				header := preflightHeader()
+				for range 4 {
+					header.Add("x-amz-meta-tag", bytesOfLength(maxUserDataSize/4))
+				}
+				return header
+			},
+			want: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			header := testCase.header()
+
+			if got := corsPreflightHeadersTooLarge(header); got != testCase.want {
+				t.Fatalf("expected %t, got %t for %d field(s) carrying %d value(s)",
+					testCase.want, got, len(header), len(header.Values(requestedHeaders)))
+			}
+
+			// Whatever this accounting admits, the request-limit middleware
+			// inside the router admits as well: every value of every field is
+			// counted here, so this can only ever refuse more. A preflight
+			// answered from a bucket's rules is therefore never one the request
+			// it precedes would have been refused for carrying.
+			if isHTTPHeaderSizeTooLarge(header) && !corsPreflightHeadersTooLarge(header) {
+				t.Fatal("expected every request the server-wide limit refuses to be refused here too")
+			}
+		})
+	}
 }
 
 // TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace pins the resource half
@@ -4787,6 +4970,12 @@ func TestBucketMetadataDefaultTimestampsCORS(t *testing.T) {
 // looking for an XML fault that does not exist while the digest it declared stays
 // wrong, and it would make an integrity failure indistinguishable from a schema
 // violation on the wire.
+//
+// A body that simply stopped early is the third case, and it is a client fault
+// with an S3 code of its own: IncompleteBody, HTTP 400. Only a failure that says
+// nothing about the client - an unknown transport error - is reported as a server
+// error, so a truncated upload is never answered with a 500 that invites the
+// client to retry against a server that was working correctly.
 func TestCorsConfigAPIError(t *testing.T) {
 	ctx := t.Context()
 
@@ -4850,11 +5039,32 @@ func TestCorsConfigAPIError(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			// A client that disappears mid-upload is not a client that sent bad
-			// XML. There is no S3 code for an unreadable body, so it is reported
-			// the way every other unexpected server side failure is, which is
-			// what the sibling configuration handlers do too.
-			name:       "anUnreadableBodyIsNotReportedAsBadXML",
+			// A client that sends fewer bytes than it said it would is not a
+			// client that sent bad XML either, and S3 has a code that says
+			// exactly what went wrong: the body was incomplete. Reporting it as a
+			// server error would blame the server for a request the client cut
+			// short, and reporting it as MalformedXML would send the client
+			// looking for a schema fault in a document it never finished sending.
+			name:       "aBodyThatEndedEarlyIsAnIncompleteBody",
+			err:        corsConfigReadError{cause: io.ErrUnexpectedEOF},
+			wantCode:   "IncompleteBody",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// The transport wraps that condition on its way up in some cases, so
+			// the classification has to look through the chain here as well.
+			name: "aWrappedEarlyEndIsStillAnIncompleteBody",
+			err: corsConfigReadError{cause: fmt.Errorf("reading the request body: %w",
+				io.ErrUnexpectedEOF)},
+			wantCode:   "IncompleteBody",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// A failure neither the document nor the client's own declarations
+			// account for stays a server error, which is what the sibling
+			// configuration handlers report for one too. It is deliberately not
+			// IncompleteBody: nothing here says the client sent too little.
+			name:       "anUnknownTransportFailureIsAServerError",
 			err:        corsConfigReadError{cause: transportErr},
 			wantCode:   "InternalError",
 			wantStatus: http.StatusInternalServerError,
@@ -4904,11 +5114,12 @@ func TestCorsConfigReadError(t *testing.T) {
 	}
 }
 
-// TestCORSConfigBody covers the one property of corsConfigBody the routed tests
+// TestCORSConfigBody covers the properties of corsConfigBody the routed tests
 // cannot reach: a body that already verifies is handed over with its verification
-// intact rather than replaced.
+// intact rather than replaced, and a declaration that is not a digest at all is
+// not treated as one.
 //
-// This is the presigned V4 case. Such a request declares its payload digest in
+// The first is the presigned V4 case. Such a request declares its payload digest in
 // the query string rather than in a header, and authentication has already
 // installed a reader that verifies it. Wrapping that body a second time around a
 // header derived digest would not add a check, it would take one away: merging an
@@ -5030,6 +5241,75 @@ func TestCORSConfigBody(t *testing.T) {
 				}
 				if body != nil {
 					t.Fatalf("expected no reader alongside a refusal, got %T", body)
+				}
+			})
+		}
+	})
+
+	t.Run("whatS3DefinesInPlaceOfADigestIsNotADigest", func(t *testing.T) {
+		// UNSIGNED-PAYLOAD and its trailing form are the values S3 defines for a
+		// client that is declaring no payload digest at all, so neither may be
+		// mistaken for a malformed one. skipContentSha256Cksum is what draws that
+		// distinction for the whole server, and consulting it rather than reading
+		// the header directly is what keeps this handler's answer to such a
+		// declaration the same as every other handler's.
+		//
+		// The empty-payload digest is the one value whose treatment depends on how
+		// the deployment was started, and this pins that this handler inherits the
+		// decision rather than making one of its own. A client that sends a
+		// non-empty body while declaring the SHA-256 of an empty one is broken; in
+		// the default strict-compatibility mode the mismatch is reported, while a
+		// deployment started with --no-compat has asked to tolerate exactly those
+		// clients.
+		testCases := []struct {
+			name string
+			// declared is the x-amz-content-sha256 value the request carries.
+			declared string
+			// strict is the compatibility mode the deployment runs in.
+			strict bool
+			// wantVerified says whether reading the body reports the mismatch
+			// between what was declared and the bytes that arrived.
+			wantVerified bool
+		}{
+			{name: "unsignedPayloadDeclaresNoDigest", declared: unsignedPayload, strict: true},
+			{name: "aTrailingUnsignedPayloadDeclaresNoneEither", declared: unsignedPayloadTrailer, strict: true},
+			{name: "anEmptyPayloadDigestIsVerifiedWhenStrict", declared: emptySHA256, strict: true, wantVerified: true},
+			{name: "anEmptyPayloadDigestIsToleratedWithoutStrictCompatibility", declared: emptySHA256, strict: false},
+		}
+
+		for _, testCase := range testCases {
+			t.Run(testCase.name, func(t *testing.T) {
+				strict := globalServerCtxt.StrictS3Compat
+				t.Cleanup(func() { globalServerCtxt.StrictS3Compat = strict })
+				globalServerCtxt.StrictS3Compat = testCase.strict
+
+				// A non-empty body, so a declaration that is verified reports the
+				// mismatch while one that is skipped reads through to its end. The
+				// length is what the empty-payload case turns on, and
+				// httptest.NewRequest declares it from the reader.
+				request := httptest.NewRequest(http.MethodPut, "/blitzy-cors-config-body?cors",
+					bytes.NewReader(document))
+				request.Header.Set(xhttp.AmzContentSha256, testCase.declared)
+
+				body, apiErr := corsConfigBody(GlobalContext, request)
+				if apiErr != ErrNone {
+					t.Fatalf("expected the body to be accepted, got the API error code %v", apiErr)
+				}
+
+				read, err := io.ReadAll(body)
+				if testCase.wantVerified {
+					var mismatch hash.SHA256Mismatch
+					if !errors.As(err, &mismatch) {
+						t.Fatalf("expected reading the body to report a SHA256 mismatch, got %v", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("expected the body to read through unverified, got %v", err)
+				}
+				if !bytes.Equal(read, document) {
+					t.Fatalf("expected the document to be read back unchanged, got %q",
+						truncateForError(string(read)))
 				}
 			})
 		}
@@ -5231,6 +5511,43 @@ func testPutBucketCorsHandler(obj ObjectLayer, instanceType, bucketName string, 
 	// creation rather than from the write below is distinguishable from one this
 	// test really produced.
 	start := UTCNow()
+
+	// A body that stops short of the length the client declared is a request that
+	// was never delivered, not a document that failed to validate, and S3 names
+	// that exactly: IncompleteBody, HTTP 400. The transport reports the shortfall
+	// to the handler while the document is being read, which is what the body
+	// below reproduces - half of the canonical document, then an unexpected end of
+	// input where the rest should have been. Everything else about the request is
+	// beyond reproach: it is signed, its digests were computed over the whole
+	// document, and the half that does arrive is well-formed as far as it goes, so
+	// the answer is attributable to nothing but the body ending early. Answering
+	// MalformedXML would send the client looking for a schema fault in a document
+	// it never finished sending, and answering InternalError would blame this
+	// server for the client's own truncated request.
+	//
+	// This case runs before anything has been stored, so the bucket still having
+	// no configuration afterwards is evidence that a request cut short is refused
+	// whole rather than half-applied.
+	t.Run("aBodyThatEndedEarlyIsAnIncompleteBody", func(t *testing.T) {
+		request := newSignedCORSRequest(t, http.MethodPut, bucketName,
+			[]byte(corsCanonicalDocument), creds)
+		request.Body = io.NopCloser(io.MultiReader(
+			strings.NewReader(corsCanonicalDocument[:len(corsCanonicalDocument)/2]),
+			iotest.ErrReader(io.ErrUnexpectedEOF)))
+
+		rec := httptest.NewRecorder()
+		apiRouter.ServeHTTP(rec, request)
+
+		errorResponse := assertCORSHandlerError(t, instanceType, rec, "IncompleteBody", http.StatusBadRequest)
+		if want := "You did not provide the number of bytes specified by the Content-Length HTTP header."; errorResponse.Message != want {
+			t.Fatalf("%s: expected the message %q, got %q", instanceType, want, errorResponse.Message)
+		}
+
+		if _, _, err := globalBucketMetadataSys.GetCORSConfig(bucketName); !isBucketCORSConfigNotFound(err) {
+			t.Fatalf("%s: expected the bucket to still have no CORS configuration, got %v",
+				instanceType, err)
+		}
+	})
 
 	// A document whose shape is valid and whose length is not, so the refusal is
 	// attributable to the ceiling rather than to the schema.

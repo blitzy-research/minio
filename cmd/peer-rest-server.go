@@ -541,15 +541,6 @@ func (s *peerRESTServer) LoadBucketMetadataHandler(mss *grid.MSS) (np grid.NoPay
 
 	meta, err := loadBucketMetadata(context.Background(), objAPI, bucketName)
 	if err != nil {
-		// This reload was requested because the bucket's metadata changed
-		// elsewhere, so failing it leaves whatever copy this node holds
-		// superseded by a change it never saw. Record that the bucket's
-		// metadata cannot be vouched for, so a cache-only reader such as the
-		// CORS preflight evaluator refuses rather than answering out of the
-		// copy the change was meant to replace.
-		if globalBucketMetadataSys != nil {
-			globalBucketMetadataSys.markMetadataUnavailable(bucketName)
-		}
 		return np, grid.NewRemoteErr(err)
 	}
 

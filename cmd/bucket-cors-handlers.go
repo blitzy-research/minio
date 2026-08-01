@@ -168,20 +168,33 @@ func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCo
 //
 // A body that could not be read did not fail to validate, and answering
 // MalformedXML for it would be wrong twice over: the client is told its XML is at
-// fault when it may be perfectly well-formed, and the real fault is hidden.
-// corsConfigBody hands the handler a body that verifies Content-MD5,
-// x-amz-content-sha256 and any x-amz-checksum-* the client declared while the
-// document is consumed, so a mismatch surfaces from the read and already has an
-// S3 error code of its own - BadDigest, XAmzContentSHA256Mismatch or
-// XAmzContentChecksumMismatch. Such a failure is therefore unwrapped and mapped
-// like any other server error, which also keeps a disconnecting client from being
-// reported as having sent bad XML.
+// fault when it may be perfectly well-formed, and the real fault is hidden. Two
+// kinds of failure surface from the read, and each keeps the S3 error code that
+// names it:
+//
+//   - An integrity failure. corsConfigBody hands the handler a body that verifies
+//     Content-MD5, x-amz-content-sha256 and any x-amz-checksum-* the client
+//     declared while the document is consumed, so a mismatch surfaces from the
+//     read already carrying its own code - BadDigest, XAmzContentSHA256Mismatch
+//     or XAmzContentChecksumMismatch.
+//   - A body that stopped short of what the client said it was sending, which the
+//     transport reports as an unexpected end of input. S3 answers IncompleteBody
+//     for exactly that, and this server maps it there through toObjectErr, the
+//     same conversion the object write path applies to a read that ended early.
+//
+// The cause is therefore unwrapped and handed to toObjectErr before toAPIError.
+// toObjectErr converts an early end of input, a short write and an expired
+// deadline into IncompleteBody, and returns everything else - the integrity
+// failures above included - unchanged for toAPIError to map on its own. A cause
+// neither of them recognizes remains a server error, which is what an unknown
+// transport failure is.
 func corsConfigAPIError(ctx context.Context, err error) APIError {
 	var readErr corsConfigReadError
 	if errors.As(err, &readErr) {
-		// toAPIError switches on the concrete type, so the cause is handed over
-		// unwrapped.
-		return toAPIError(ctx, readErr.cause)
+		// toObjectErr and toAPIError both switch on the concrete type, so the
+		// cause is handed over unwrapped rather than as the corsConfigReadError
+		// that carried it back here.
+		return toAPIError(ctx, toObjectErr(readErr.cause))
 	}
 
 	apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
