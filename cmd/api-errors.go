@@ -2373,6 +2373,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrNoSuchBucketSSEConfig
 	case BucketTaggingNotFound:
 		apiErr = ErrBucketTaggingNotFound
+	case BucketCORSConfigNotFound:
+		apiErr = ErrNoSuchCORSConfiguration
 	case BucketObjectLockConfigNotFound:
 		apiErr = ErrObjectLockConfigurationNotFound
 	case BucketQuotaConfigNotFound:

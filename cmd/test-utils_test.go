@@ -1373,6 +1373,13 @@ func getBucketLifecycleURL(endPoint, bucketName string) (ret string) {
 	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
 }
 
+// return URL For set/get/delete CORS configuration of the bucket.
+func getBucketCORSURL(endPoint, bucketName string) string {
+	queryValue := url.Values{}
+	queryValue.Set("cors", "")
+	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
+}
+
 // return URL for listing objects in the bucket with V1 legacy API.
 func getListObjectsV1URL(endPoint, bucketName, prefix, maxKeys, encodingType string) string {
 	queryValue := url.Values{}

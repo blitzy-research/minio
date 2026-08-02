@@ -112,11 +112,6 @@ var rejectedBucketAPIs = []rejectedAPI{
 		queries: []string{"inventory", ""},
 	},
 	{
-		api:     "cors",
-		methods: []string{http.MethodPut, http.MethodDelete},
-		queries: []string{"cors", ""},
-	},
-	{
 		api:     "metrics",
 		methods: []string{http.MethodGet, http.MethodPut, http.MethodDelete},
 		queries: []string{"metrics", ""},
@@ -459,18 +454,6 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPut).
 			HandlerFunc(s3APIMiddleware(api.PutBucketACLHandler)).
 			Queries("acl", "")
-		// GetBucketCors - this is a dummy call.
-		router.Methods(http.MethodGet).
-			HandlerFunc(s3APIMiddleware(api.GetBucketCorsHandler)).
-			Queries("cors", "")
-		// PutBucketCors - this is a dummy call.
-		router.Methods(http.MethodPut).
-			HandlerFunc(s3APIMiddleware(api.PutBucketCorsHandler)).
-			Queries("cors", "")
-		// DeleteBucketCors - this is a dummy call.
-		router.Methods(http.MethodDelete).
-			HandlerFunc(s3APIMiddleware(api.DeleteBucketCorsHandler)).
-			Queries("cors", "")
 		// GetBucketWebsiteHandler - this is a dummy call.
 		router.Methods(http.MethodGet).
 			HandlerFunc(s3APIMiddleware(api.GetBucketWebsiteHandler)).
@@ -500,6 +483,19 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodDelete).
 			HandlerFunc(s3APIMiddleware(api.DeleteBucketTaggingHandler)).
 			Queries("tagging", "")
+
+		// GetBucketCors
+		router.Methods(http.MethodGet).
+			HandlerFunc(s3APIMiddleware(api.GetBucketCorsHandler)).
+			Queries("cors", "")
+		// PutBucketCors
+		router.Methods(http.MethodPut).
+			HandlerFunc(s3APIMiddleware(api.PutBucketCorsHandler)).
+			Queries("cors", "")
+		// DeleteBucketCors
+		router.Methods(http.MethodDelete).
+			HandlerFunc(s3APIMiddleware(api.DeleteBucketCorsHandler)).
+			Queries("cors", "")
 
 		// ListMultipartUploads
 		router.Methods(http.MethodGet).
@@ -693,5 +689,22 @@ func corsHandler(handler http.Handler) http.Handler {
 		ExposedHeaders:   commonS3Headers,
 		AllowCredentials: true,
 	}
-	return cors.New(opts).Handler(handler)
+	// The per-bucket CORS evaluator wraps the handler built above instead of
+	// being installed on the mux, because no mux route is registered for
+	// OPTIONS: only an outer HTTP layer sees a browser preflight at all. A
+	// preflight for a bucket whose own CORS rules the evaluator cannot produce -
+	// it has none stored, or they are not in hand yet - is delegated, so the
+	// server-wide allow-origin behavior configured above stays in force for
+	// exactly the requests it governed before; one this server would not serve at
+	// all is refused rather than answered out of these permissive settings.
+	//
+	// Only a preflight is ever answered here. Every other request, including a
+	// cross-origin request simple enough that a browser sends no preflight for
+	// it, is delegated to the handler above and keeps taking its CORS response
+	// headers from the server-wide allow-origin list alone.
+	//
+	// That placement also puts it ahead of the middlewares the mux applies, so it
+	// cannot rely on them having screened the request and repeats their admission
+	// checks itself.
+	return bucketCORSPreflightMiddleware(cors.New(opts).Handler(handler))
 }

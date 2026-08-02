@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	bucketsse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
@@ -80,6 +81,7 @@ type BucketMetadata struct {
 	ReplicationConfigXML        []byte
 	BucketTargetsConfigJSON     []byte
 	BucketTargetsConfigMetaJSON []byte
+	CORSConfigXML               []byte
 
 	PolicyConfigUpdatedAt            time.Time
 	ObjectLockConfigUpdatedAt        time.Time
@@ -92,6 +94,7 @@ type BucketMetadata struct {
 	NotificationConfigUpdatedAt      time.Time
 	BucketTargetsConfigUpdatedAt     time.Time
 	BucketTargetsConfigMetaUpdatedAt time.Time
+	CORSConfigUpdatedAt              time.Time
 	// Add a new UpdatedAt field and update lastUpdate function
 
 	// Unexported fields. Must be updated atomically.
@@ -106,6 +109,7 @@ type BucketMetadata struct {
 	replicationConfig      *replication.Config
 	bucketTargetConfig     *madmin.BucketTargets
 	bucketTargetConfigMeta map[string]string
+	corsConfig             *miniogocors.Config
 }
 
 // newBucketMetadata creates BucketMetadata with the supplied name and Created to Now.
@@ -159,6 +163,9 @@ func (b BucketMetadata) lastUpdate() (t time.Time) {
 	}
 	if b.BucketTargetsConfigMetaUpdatedAt.After(t) {
 		t = b.BucketTargetsConfigMetaUpdatedAt
+	}
+	if b.CORSConfigUpdatedAt.After(t) {
+		t = b.CORSConfigUpdatedAt
 	}
 
 	return t
@@ -308,6 +315,17 @@ func (b *BucketMetadata) parseAllConfigs(ctx context.Context, objectAPI ObjectLa
 		}
 	} else {
 		b.taggingConfig = nil
+	}
+
+	// Clear the parsed configuration when the persisted XML is absent so
+	// deletion cannot leave stale CORS rules in memory.
+	if len(b.CORSConfigXML) != 0 {
+		b.corsConfig, err = miniogocors.ParseBucketCorsConfig(bytes.NewReader(b.CORSConfigXML))
+		if err != nil {
+			return err
+		}
+	} else {
+		b.corsConfig = nil
 	}
 
 	if bytes.Equal(b.ObjectLockConfigXML, enabledBucketObjectLockConfig) {
@@ -495,6 +513,10 @@ func (b *BucketMetadata) defaultTimestamps() {
 
 	if b.BucketTargetsConfigMetaUpdatedAt.IsZero() {
 		b.BucketTargetsConfigMetaUpdatedAt = b.Created
+	}
+
+	if b.CORSConfigUpdatedAt.IsZero() {
+		b.CORSConfigUpdatedAt = b.Created
 	}
 }
 

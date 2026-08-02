@@ -398,6 +398,13 @@ func (e BucketSSEConfigNotFound) Error() string {
 	return "No bucket encryption configuration found for bucket: " + e.Bucket
 }
 
+// BucketCORSConfigNotFound - no bucket CORS configuration found
+type BucketCORSConfigNotFound GenericError
+
+func (e BucketCORSConfigNotFound) Error() string {
+	return "No bucket CORS configuration found for bucket: " + e.Bucket
+}
+
 // BucketTaggingNotFound - no bucket tags found
 type BucketTaggingNotFound GenericError
 
