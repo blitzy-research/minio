@@ -331,11 +331,24 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 		if len(rule.AllowedOrigin) == 0 {
 			return nil, fmt.Errorf("CORSRule %d must contain at least one AllowedOrigin", i)
 		}
-		// An AllowedOrigin element that carries no value, whether it was
-		// written empty or held nothing but whitespace, is accepted as AWS
-		// accepts it. It names the empty origin, which no browser can send, so
-		// such a value can only ever fail to match: the rule denies, and being
-		// permissive here cannot widen anything.
+		// A rule also has to name an origin that survives being stored. The
+		// vendored model tags AllowedOrigin omitempty, and encoding/xml applies
+		// omitempty to every element of a slice, so an AllowedOrigin carrying no
+		// value - written empty, or holding nothing but the whitespace that
+		// normalization has just removed - is dropped from the canonical
+		// document the handler persists and hands back. A rule whose every
+		// AllowedOrigin is empty would therefore be stored, and returned by GET,
+		// as a rule with no AllowedOrigin at all: a document the check above
+		// refuses. That breaks reapplying what was read - "mc cors get" into "mc
+		// cors set", or "aws s3api get-bucket-cors" into "put-bucket-cors" - and
+		// it leaves bucket metadata holding a configuration no request could
+		// have created. Such a rule can never match anything either, because no
+		// browser can send the empty origin, so refusing it withholds nothing
+		// and tells the bucket owner what is wrong instead of answering 200 for
+		// a rule that does nothing. An empty value sitting alongside one that
+		// carries a value stays accepted, as AWS accepts it: dropping it narrows
+		// nothing, and what is stored is still a document this function accepts.
+		namesAnOrigin := false
 		for _, origin := range rule.AllowedOrigin {
 			// A bare "*" and a single embedded wildcard such as
 			// "http://www.example.*" are both legal, more than one is not.
@@ -345,6 +358,12 @@ func validateBucketCorsConfig(r io.Reader) (*miniogocors.Config, error) {
 			if corsValueHasControlCharacter(origin) {
 				return nil, fmt.Errorf("CORSRule %d has AllowedOrigin %q containing a control character", i, origin)
 			}
+			if origin != "" {
+				namesAnOrigin = true
+			}
+		}
+		if !namesAnOrigin {
+			return nil, fmt.Errorf("CORSRule %d must contain an AllowedOrigin that is not empty", i)
 		}
 
 		for _, header := range rule.AllowedHeader {

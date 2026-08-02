@@ -951,13 +951,47 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 		{
-			// Trimming a value to nothing leaves the rule matching nothing,
-			// which is the same outcome an explicitly empty AllowedOrigin has
-			// and is therefore accepted rather than refused: a rule that
-			// matches nothing can only ever deny.
-			name:      "normalization/whitespaceOnlyAllowedOriginIsAccepted",
-			xml:       corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>   </AllowedOrigin>`)),
+			// Trimming the only AllowedOrigin to nothing leaves a rule that no
+			// request can match, and one that cannot be stored either: the
+			// canonical document drops an empty value, so what GET would hand
+			// back is a rule with no AllowedOrigin at all - a document this
+			// same function refuses. It is refused on the way in instead.
+			name:             "normalization/whitespaceOnlyAllowedOriginIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>   </AllowedOrigin>`)),
+			wantErrSubstring: "CORSRule 0 must contain an AllowedOrigin that is not empty",
+		},
+		{
+			name:             "normalization/explicitlyEmptyAllowedOriginIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin></AllowedOrigin>`)),
+			wantErrSubstring: "CORSRule 0 must contain an AllowedOrigin that is not empty",
+		},
+		{
+			name:             "normalization/selfClosingAllowedOriginIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin/>`)),
+			wantErrSubstring: "CORSRule 0 must contain an AllowedOrigin that is not empty",
+		},
+		{
+			name:             "normalization/everyAllowedOriginEmptyIsRejected",
+			xml:              corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin></AllowedOrigin><AllowedOrigin>  </AllowedOrigin>`)),
+			wantErrSubstring: "CORSRule 0 must contain an AllowedOrigin that is not empty",
+		},
+		{
+			// An empty value alongside one that carries a value stays accepted:
+			// dropping the empty one narrows nothing, and the rule still names
+			// an origin, so the stored document remains one that is accepted.
+			name:      "normalization/emptyAllowedOriginBesideARealOneIsAccepted",
+			xml:       corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin></AllowedOrigin><AllowedOrigin>https://app.example.com</AllowedOrigin>`)),
 			wantRules: 1,
+		},
+		{
+			// The second rule is the offending one, so the index reported has
+			// to be its own and not the first rule's.
+			name: "normalization/emptyAllowedOriginIsReportedAgainstItsOwnRule",
+			xml: corsTestDoc(
+				corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>https://app.example.com</AllowedOrigin>`) +
+					corsTestRule(`<AllowedMethod>GET</AllowedMethod><AllowedOrigin> </AllowedOrigin>`),
+			),
+			wantErrSubstring: "CORSRule 1 must contain an AllowedOrigin that is not empty",
 		},
 		{
 			// Normalization must not reach inside a value: an interior space is
@@ -1468,6 +1502,201 @@ func TestValidateBucketCorsConfigCanonicalDocument(t *testing.T) {
 			t.Errorf("expected the round trip to be byte identical\n got: %s\nwant: %s", got, corsCanonicalDocument)
 		}
 	})
+}
+
+// corsRuleWithoutEmptyValues returns the rule with every value carrying no
+// content removed, which is precisely the set of values encoding/xml drops for a
+// slice field tagged omitempty.
+func corsRuleWithoutEmptyValues(rule miniogocors.Rule) miniogocors.Rule {
+	compact := func(values []string) []string {
+		var kept []string
+		for _, value := range values {
+			if value != "" {
+				kept = append(kept, value)
+			}
+		}
+		return kept
+	}
+	rule.AllowedHeader = compact(rule.AllowedHeader)
+	rule.AllowedMethod = compact(rule.AllowedMethod)
+	rule.AllowedOrigin = compact(rule.AllowedOrigin)
+	rule.ExposeHeader = compact(rule.ExposeHeader)
+	return rule
+}
+
+// TestValidateBucketCorsConfigCanonicalFormIsAFixedPoint asserts the invariant
+// that lets a stored configuration be read back and reapplied by any client.
+//
+// The handler does not persist the bytes it received. It persists the canonical
+// xml.Marshal of the configuration it parsed, and that same marshaling is what
+// GET hands back. So whatever a client reads has to be a document this server
+// accepts, and writing it back unchanged has to change nothing - otherwise "mc
+// cors get" piped into "mc cors set", or "aws s3api get-bucket-cors" piped into
+// "put-bucket-cors", fails against a configuration this server itself produced,
+// and bucket metadata can come to hold a document no request could have created.
+//
+// Canonicalization is deliberately not the identity: it drops a value that is
+// empty, a MaxAgeSeconds of zero and an absent ID, fills in an omitted xmlns
+// attribute, escapes what has to be escaped, discards indentation, and orders a
+// rule's elements by the model's field order rather than the document's. Every
+// one of those transformations is exercised below, and each has to settle after a
+// single pass.
+func TestValidateBucketCorsConfigCanonicalFormIsAFixedPoint(t *testing.T) {
+	testCases := []struct {
+		name string
+		xml  string
+	}{
+		{
+			name: "awsCanonicalFixture",
+			xml:  corsCanonicalDocument,
+		},
+		{
+			name: "minimalRule",
+			xml:  corsTestDoc(corsTestRule(corsMinimalRuleBody)),
+		},
+		{
+			// The canonical form is longer than what arrived: it declares the
+			// namespace the client left out.
+			name: "omittedXMLNSAttributeIsFilledIn",
+			xml:  `<CORSConfiguration>` + corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+		},
+		{
+			// Indentation reaches the decoder as part of every value, and
+			// normalization removes it.
+			name: "indentedDocumentIsFlattened",
+			xml: "<CORSConfiguration xmlns=\"" + s3CORSNamespace + "\">\n" +
+				"  <CORSRule>\n" +
+				"    <ID>\n      spaced out\n    </ID>\n" +
+				"    <AllowedOrigin>\n      https://app.example.com\n    </AllowedOrigin>\n" +
+				"    <AllowedMethod>\n      GET\n    </AllowedMethod>\n" +
+				"    <AllowedHeader>\n      content-type\n    </AllowedHeader>\n" +
+				"    <ExposeHeader>\n      ETag\n    </ExposeHeader>\n" +
+				"    <MaxAgeSeconds>\n      900\n    </MaxAgeSeconds>\n" +
+				"  </CORSRule>\n" +
+				"</CORSConfiguration>\n",
+		},
+		{
+			name: "cdataBecomesPlainText",
+			xml: corsTestDoc(corsTestRule(
+				`<AllowedMethod>GET</AllowedMethod><AllowedOrigin><![CDATA[https://app.example.com]]></AllowedOrigin>`,
+			)),
+		},
+		{
+			// An empty value is dropped by the marshaler, so the rule has to
+			// still name an origin without it - which is why a rule whose every
+			// AllowedOrigin is empty is refused rather than stored.
+			name: "emptyAllowedOriginIsDropped",
+			xml: corsTestDoc(corsTestRule(
+				`<AllowedMethod>GET</AllowedMethod><AllowedOrigin></AllowedOrigin>` +
+					`<AllowedOrigin>https://app.example.com</AllowedOrigin>`,
+			)),
+		},
+		{
+			name: "emptyAllowedHeaderAndExposeHeaderAreDropped",
+			xml: corsTestDoc(corsTestRule(
+				corsMinimalRuleBody + `<AllowedHeader></AllowedHeader><ExposeHeader>  </ExposeHeader>`,
+			)),
+		},
+		{
+			name: "emptyIDAndZeroMaxAgeSecondsAreDropped",
+			xml: corsTestDoc(corsTestRule(
+				corsMinimalRuleBody + `<ID></ID><MaxAgeSeconds>0</MaxAgeSeconds>`,
+			)),
+		},
+		{
+			// The elements arrive in an order the model does not use, so the
+			// canonical form reorders them.
+			name: "ruleElementsAreReordered",
+			xml: corsTestDoc(corsTestRule(
+				`<MaxAgeSeconds>120</MaxAgeSeconds><ID>reordered</ID>` +
+					`<ExposeHeader>ETag</ExposeHeader><AllowedOrigin>https://app.example.com</AllowedOrigin>` +
+					`<AllowedMethod>GET</AllowedMethod><AllowedHeader>content-type</AllowedHeader>`,
+			)),
+		},
+		{
+			// Characters the encoder escapes grow the document, and the escaped
+			// form has to decode back to the same value.
+			name: "escapedCharactersSurvive",
+			xml: corsTestDoc(corsTestRule(
+				`<AllowedMethod>GET</AllowedMethod>` +
+					`<AllowedOrigin>https://a&amp;b.example.com</AllowedOrigin>` +
+					`<ID>a &lt;b&gt; &quot;c&quot; &amp; d</ID>`,
+			)),
+		},
+		{
+			name: "multipleRulesKeepDocumentOrder",
+			xml: corsTestDoc(
+				corsTestRule(`<ID>first</ID><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>`),
+				corsTestRule(`<ID>second</ID><AllowedMethod>PUT</AllowedMethod><AllowedOrigin>https://b.example.com</AllowedOrigin>`),
+				corsTestRule(`<ID>third</ID><AllowedMethod>HEAD</AllowedMethod><AllowedOrigin>https://c.example.*</AllowedOrigin>`),
+			),
+		},
+		{
+			name: "exactlyTheRuleCap",
+			xml:  corsTestDoc(slices.Repeat([]string{corsTestRule(corsMinimalRuleBody)}, maxBucketCORSRules)...),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := validateBucketCorsConfig(strings.NewReader(tc.xml))
+			if err != nil {
+				t.Fatalf("the document must be accepted, got error: %v", err)
+			}
+
+			// This is the document the handler persists and GET returns.
+			stored, err := xml.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("marshaling the accepted configuration must succeed, got error: %v", err)
+			}
+
+			// A client reading it back and writing it unchanged must succeed.
+			reparsed, err := validateBucketCorsConfig(bytes.NewReader(stored))
+			if err != nil {
+				t.Fatalf("the stored document must itself be accepted, got error: %v\nstored: %s",
+					err, truncateForError(string(stored)))
+			}
+
+			restored, err := xml.Marshal(reparsed)
+			if err != nil {
+				t.Fatalf("marshaling the reparsed configuration must succeed, got error: %v", err)
+			}
+			if !bytes.Equal(stored, restored) {
+				t.Errorf("the canonical form must be a fixed point\nfirst pass:  %s\nsecond pass: %s",
+					truncateForError(string(stored)), truncateForError(string(restored)))
+			}
+			// Canonicalization may remove a value that carries no content, and
+			// nothing else: never a value that carries content, and never a
+			// character of one. Comparing both sides with their empty values
+			// removed states exactly that, and still fails if a real value were
+			// dropped, altered or reordered.
+			if len(reparsed.CORSRules) != len(cfg.CORSRules) {
+				t.Fatalf("expected the stored document to keep %d rules, got %d",
+					len(cfg.CORSRules), len(reparsed.CORSRules))
+			}
+			for i := range cfg.CORSRules {
+				want := corsRuleWithoutEmptyValues(cfg.CORSRules[i])
+				got := corsRuleWithoutEmptyValues(reparsed.CORSRules[i])
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("rule %d changed across the round trip\n got: %+v\nwant: %+v", i, got, want)
+				}
+			}
+			if reparsed.XMLNS != s3CORSNamespace {
+				t.Errorf("expected the stored document to carry namespace %q, got %q", s3CORSNamespace, reparsed.XMLNS)
+			}
+
+			// Every rule of the stored document has to satisfy the minimum
+			// element counts, which is what makes it acceptable input.
+			for i, rule := range reparsed.CORSRules {
+				if len(rule.AllowedOrigin) == 0 {
+					t.Errorf("stored rule %d has no AllowedOrigin, so it could never be reapplied", i)
+				}
+				if len(rule.AllowedMethod) == 0 {
+					t.Errorf("stored rule %d has no AllowedMethod, so it could never be reapplied", i)
+				}
+			}
+		})
+	}
 }
 
 // TestValidateBucketCorsConfigCanonicalSizeCeiling covers the document that
