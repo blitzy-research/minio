@@ -896,6 +896,49 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 			body:        `<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`,
 			description: "CORSRule 0 must contain at least one AllowedOrigin",
 		},
+		// A document that repeats an attribute on any element is one that no
+		// conforming XML parser will read: XML 1.0 forbids a repeated attribute
+		// name and the Namespaces specification extends that to two attributes
+		// whose expanded names are equal however they were spelled. Go's decoder
+		// enforces neither, so each of the bodies below has to be refused
+		// explicitly rather than accepted, stored and handed back as valid.
+		{
+			name: "duplicate default namespace declaration",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns="` + s3CORSNamespace + `">` +
+				`<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			description: `The element "CORSConfiguration" declares the attribute "xmlns" more than once`,
+		},
+		{
+			name: "duplicate ordinary attribute on the root element",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" foo="1" foo="2">` +
+				`<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			description: `The element "CORSConfiguration" declares the attribute "foo" more than once`,
+		},
+		{
+			name: "duplicate ordinary attribute on a CORSRule",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `"><CORSRule bar="1" bar="2">` +
+				`<AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			description: `The element "CORSRule" declares the attribute "bar" more than once`,
+		},
+		{
+			name: "duplicate ordinary attribute on a value element",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `"><CORSRule>` +
+				`<AllowedMethod>GET</AllowedMethod><AllowedOrigin baz="1" baz="2">*</AllowedOrigin>` +
+				`</CORSRule></CORSConfiguration>`,
+			description: `The element "AllowedOrigin" declares the attribute "baz" more than once`,
+		},
+		{
+			name: "duplicate namespace prefix declaration",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:a="urn:one" xmlns:a="urn:two">` +
+				`<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			description: `The element "CORSConfiguration" declares the attribute "xmlns:a" more than once`,
+		},
+		{
+			name: "duplicate expanded attribute reached through two prefixes",
+			body: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:p="urn:x" xmlns:q="urn:x" p:k="1" q:k="2">` +
+				`<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>`,
+			description: `The element "CORSConfiguration" declares the attribute "{urn:x}k" more than once`,
+		},
 	}
 
 	for _, malformedConfig := range malformedConfigs {
@@ -956,6 +999,69 @@ func (s *TestSuiteCommon) TestBucketCORSMalformedXML(c *check) {
 	c.Assert(err, nil)
 	verifyError(c, response, "NoSuchCORSConfiguration", "The CORS configuration does not exist", http.StatusNotFound)
 	closeResponseBody(c, response)
+
+	// A rejected configuration must also leave a configuration that was already
+	// stored exactly as it was. Proving nothing is stored on an unconfigured
+	// bucket is the weaker half of the contract: the damaging failure is a
+	// malformed document that is accepted and replaces a valid configuration,
+	// which is silent because the client is told the request succeeded.
+	//
+	// The stored document is read back over the wire before and after every
+	// rejection and compared byte for byte, so a configuration that was replaced,
+	// partially updated or deleted is all detected the same way.
+	request, err = newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+		int64(len(corsSuiteConfig)), bytes.NewReader([]byte(corsSuiteConfig)),
+		s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+	closeResponseBody(c, response)
+
+	request, err = newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+	storedDocument, err := io.ReadAll(response.Body)
+	c.Assert(err, nil)
+	closeResponseBody(c, response)
+	if len(storedDocument) == 0 {
+		c.Fatalf("Expected the stored CORS configuration to be returned before the rejection cases run")
+	}
+
+	for _, malformedConfig := range malformedConfigs {
+		badRequest, err := newTestSignedRequest(http.MethodPut, getBucketCORSURL(s.endPoint, bucketName),
+			int64(len(malformedConfig.body)), bytes.NewReader([]byte(malformedConfig.body)),
+			s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		badResponse, err := s.client.Do(badRequest)
+		c.Assert(err, nil)
+		errorResponse := getErrorResponse(c, badResponse)
+		c.Assert(errorResponse.Code, "MalformedXML")
+		c.Assert(badResponse.StatusCode, http.StatusBadRequest)
+		closeResponseBody(c, badResponse)
+
+		getRequest, err := newTestSignedRequest(http.MethodGet, getBucketCORSURL(s.endPoint, bucketName),
+			0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+
+		getResponse, err := s.client.Do(getRequest)
+		c.Assert(err, nil)
+		c.Assert(getResponse.StatusCode, http.StatusOK)
+		currentDocument, err := io.ReadAll(getResponse.Body)
+		c.Assert(err, nil)
+		closeResponseBody(c, getResponse)
+
+		if !bytes.Equal(currentDocument, storedDocument) {
+			c.Fatalf("Expected the stored CORS configuration to survive the rejected %s configuration, it was %s instead of %s",
+				malformedConfig.name, string(currentDocument), string(storedDocument))
+		}
+	}
 }
 
 // TestBucketCORSPreflight verifies that an OPTIONS preflight allowed by a stored

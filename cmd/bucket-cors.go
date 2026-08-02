@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -71,6 +72,25 @@ const (
 	// every one of them would let whoever sends them decide how much a
 	// deployment logs.
 	corsPreflightRefusalReportInterval = time.Minute
+
+	// Most preflight requests that may read a bucket's stored metadata from the
+	// backend at the same time.
+	//
+	// Such a read happens only while the bucket metadata cache is still loading
+	// and only for a bucket that cache does not yet hold, so it is bounded in
+	// time by startup; this bounds it in width as well. A preflight carries no
+	// credentials, so without a bound the number of concurrent backend reads
+	// would be chosen by whoever sends the requests. The gate is not waited on:
+	// a request that finds it full is refused rather than queued, which keeps
+	// the number of goroutines parked in this layer at the gate's width.
+	maxCORSPreflightConfigReads = 8
+
+	// Longest one such read may take before the preflight is refused instead.
+	//
+	// The read is a single metadata document from the local erasure set, so this
+	// is generous for the work involved while still bounding how long an
+	// unauthenticated request may occupy one of the slots above.
+	corsPreflightConfigReadTimeout = 2 * time.Second
 
 	// corsConfigXMLNS is the XML namespace of every S3 CORS document. A client
 	// either omits the namespace, in which case the parser defaults it to this
@@ -165,6 +185,23 @@ var errCORSPreflightHeadersTooLarge = errors.New(
 // cannot be allowed.
 var errCORSPreflightEvaluationTooCostly = errors.New(
 	"evaluating it against the bucket's CORS rules would cost more comparisons than this server performs for one preflight")
+
+// errCORSPreflightConfigReadsBusy is the reason reported when a preflight is
+// refused because as many of them as this server allows were already reading
+// bucket metadata from the backend, so this one would have had to wait for a slot
+// to establish whether its bucket has rules.
+//
+// Like every other refusal here it says nothing about what those rules are: they
+// were never read, which is why the request cannot be allowed.
+var errCORSPreflightConfigReadsBusy = errors.New(
+	"as many preflight requests as this server allows were already establishing a bucket's CORS configuration from its stored metadata")
+
+// corsPreflightConfigReads bounds how many preflight requests read bucket
+// metadata from the backend at the same time. It is a buffered channel used as a
+// counting gate, acquired without waiting: a request that cannot take a slot is
+// refused rather than parked, so this layer never holds more than
+// maxCORSPreflightConfigReads goroutines however many preflights arrive.
+var corsPreflightConfigReads = make(chan struct{}, maxCORSPreflightConfigReads)
 
 // corsRuleElementOrder lists the child elements of a CORSRule in the order a
 // cardinality violation is reported, so a rule that repeats more than one
@@ -447,6 +484,9 @@ func validateCorsDocumentSchema(data []byte) error {
 				return fmt.Errorf("%s contains unsupported element %q",
 					corsConfigurationElement, corsElementName(t.Name, root.Name.Space))
 			}
+			if err := validateCorsElementAttributes(t, root.Name.Space); err != nil {
+				return err
+			}
 			if err := validateCorsRuleElement(dec, root.Name.Space, index); err != nil {
 				return err
 			}
@@ -491,6 +531,12 @@ func corsDocumentRootElement(dec *xml.Decoder) (xml.StartElement, error) {
 				return xml.StartElement{}, fmt.Errorf("Unexpected root element %q, expected %s",
 					t.Name.Local, corsConfigurationElement)
 			}
+			// The root element's namespace is what every element below is
+			// required to carry, so its own attributes are checked against that
+			// namespace rather than against an enclosing one.
+			if err := validateCorsElementAttributes(t, t.Name.Space); err != nil {
+				return xml.StartElement{}, err
+			}
 			return t, nil
 		case xml.CharData:
 			if len(bytes.TrimSpace(t)) != 0 {
@@ -521,6 +567,9 @@ func validateCorsRuleElement(dec *xml.Decoder, space string, index int) error {
 			if _, known := corsRuleElements[t.Name.Local]; !known || t.Name.Space != space {
 				return fmt.Errorf("%s %d contains unsupported element %q",
 					corsRuleElement, index, corsElementName(t.Name, space))
+			}
+			if err := validateCorsElementAttributes(t, space); err != nil {
+				return err
 			}
 			seen[t.Name.Local]++
 			if err := validateCorsRuleValueElement(dec, space, index, t.Name.Local); err != nil {
@@ -554,9 +603,11 @@ func validateCorsRuleElement(dec *xml.Decoder, space string, index int) error {
 // discarded by the document model, leaving the client no way to learn that the
 // value it configured was ignored.
 //
-// An attribute on the element is deliberately ignored rather than rejected:
-// unlike a nested element, it cannot be mistaken for a configured value, so
-// ignoring it cannot mislead the client about what was stored.
+// An attribute that appears once on the element is deliberately ignored rather
+// than rejected: unlike a nested element, it cannot be mistaken for a configured
+// value, so ignoring it cannot mislead the client about what was stored. One
+// that appears twice is a different matter and is refused before this point, by
+// validateCorsElementAttributes.
 func validateCorsRuleValueElement(dec *xml.Decoder, space string, index int, name string) error {
 	for {
 		tok, err := dec.Token()
@@ -574,6 +625,62 @@ func validateCorsRuleValueElement(dec *xml.Decoder, space string, index int, nam
 				corsConfigurationElement)
 		}
 	}
+}
+
+// validateCorsElementAttributes enforces that no element of the document carries
+// the same attribute twice. space is the namespace of the document, and is used
+// only to render the element's name in a failure.
+//
+// This is a well-formedness constraint rather than a MinIO restriction: XML 1.0
+// forbids an element from repeating an attribute name, and the Namespaces
+// specification extends that to two attributes whose expanded names are equal,
+// however they were spelled. Go's decoder enforces neither, so a document that
+// every conforming XML parser refuses would otherwise be accepted here, stored,
+// and handed back to clients as though it had been valid all along - replacing a
+// configuration that was.
+//
+// Comparing the resolved xml.Name is what makes one check cover every spelling.
+// The decoder reports a default xmlns declaration as the unprefixed name xmlns, a
+// prefix declaration as that prefix within the reserved xmlns space, and a
+// prefixed attribute with its prefix already replaced by the namespace it is
+// bound to. Two attributes therefore compare equal exactly when their expanded
+// names are equal: repeated identical declarations, a repeated ordinary
+// attribute, and one name reached through two prefixes bound to the same
+// namespace are all one comparison, while a document that spells each of its
+// attributes once compares unequal throughout.
+func validateCorsElementAttributes(elem xml.StartElement, space string) error {
+	// An element carrying at most one attribute cannot repeat one, and elements
+	// with no attributes at all are the overwhelming majority, so nothing is
+	// allocated for them.
+	if len(elem.Attr) < 2 {
+		return nil
+	}
+
+	seen := make(map[xml.Name]struct{}, len(elem.Attr))
+	for _, attr := range elem.Attr {
+		if _, dup := seen[attr.Name]; dup {
+			return fmt.Errorf("The element %q declares the attribute %q more than once",
+				corsElementName(elem.Name, space), corsAttributeName(attr.Name))
+		}
+		seen[attr.Name] = struct{}{}
+	}
+	return nil
+}
+
+// corsAttributeName renders an attribute name for a client visible error, in the
+// form the document spelled it rather than in the resolved form the decoder
+// reports: a namespace declaration reads as xmlns or xmlns:prefix, an ordinary
+// attribute by its bare name, and one belonging to a namespace in the
+// conventional {namespace}local form, since the prefix it was written with is not
+// preserved.
+func corsAttributeName(name xml.Name) string {
+	switch name.Space {
+	case "":
+		return name.Local
+	case "xmlns":
+		return "xmlns:" + name.Local
+	}
+	return "{" + name.Space + "}" + name.Local
 }
 
 // validateCorsDocumentTrailer enforces that nothing of substance follows the
@@ -921,19 +1028,21 @@ func corsPreflightHeadersTooLarge(header http.Header) bool {
 //
 //   - Delegated, which keeps the server-wide MINIO_API_CORS_ALLOW_ORIGIN setting
 //     in force for it: the request is not a preflight, addresses the server root
-//     or no syntactically valid bucket, or names a bucket whose own CORS rules
-//     this layer cannot produce - it has none stored, the metadata subsystem is
-//     absent or still loading, the lookup failed, or what is stored carries no
-//     rule. Delegating on every one of those is what leaves a bucket without a
-//     configuration of its own behaving exactly as it did before this layer
-//     existed.
+//     or no syntactically valid bucket, or names a bucket that demonstrably has
+//     no CORS configuration of its own - none is stored, or the bucket does not
+//     exist - or one whose stored configuration carries no rule. Delegating on
+//     every one of those is what leaves a bucket without a configuration of its
+//     own behaving exactly as it did before this layer existed.
 //   - Allowed, on the first rule that matches: HTTP 200 with the CORS response
 //     headers that rule configures.
 //   - Denied, HTTP 200 carrying no Access-Control-Allow-* header, which is how a
 //     browser learns the request is refused: the bucket has rules and none of
-//     them allows this request, or the request is one the server itself would
-//     refuse outright, so the request this preflight asks about could never be
-//     served whatever any rule says.
+//     them allows this request, the request is one the server itself would refuse
+//     outright, so the request this preflight asks about could never be served
+//     whatever any rule says, or the bucket's configuration could not be
+//     established at all - in which case rules that were never read cannot be
+//     known to allow the request, and answering it from the server-wide setting
+//     would let a configured bucket's own rules be bypassed.
 func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match the rs/cors preflight gate, plus the Origin that a matched rule
@@ -1016,15 +1125,29 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		cfg, err := preflightCORSConfig(bucket)
-		if err != nil || cfg == nil || len(cfg.CORSRules) == 0 {
-			// The bucket has no rules of its own to answer this preflight from,
-			// whichever way that came about: it carries no configuration, the
-			// metadata subsystem is absent or has not finished loading, the
-			// lookup failed, or what is stored carries no rule. Every one of
-			// those hands the request to the server-wide handler, which is what
-			// keeps the MINIO_API_CORS_ALLOW_ORIGIN setting in force for exactly
-			// the requests it governed before this layer existed.
+		cfg, err := preflightCORSConfig(r.Context(), bucket)
+		switch {
+		case err != nil && !corsPreflightConfigAbsent(err):
+			// Whether this bucket has rules of its own could not be
+			// established, so the request is refused rather than answered from
+			// the server-wide setting: a bucket whose rules were never read
+			// cannot be known to allow it, and answering it globally is exactly
+			// how a configured bucket's own rules would be bypassed. Like the
+			// refusals above this says something about how this request was
+			// handled rather than what the bucket's rules say, so it is
+			// reported at the same bounded rate, naming only the validated
+			// bucket.
+			corsPreflightRefused.report(fmt.Errorf(
+				"for bucket %s, its CORS configuration could not be established: %w", bucket, err))
+			writeCORSPreflightDenied(w)
+			return
+		case err != nil, cfg == nil, len(cfg.CORSRules) == 0:
+			// The bucket demonstrably has no rules of its own to answer this
+			// preflight from: it carries no configuration, it does not exist, or
+			// what is stored carries no rule. Every one of those hands the
+			// request to the server-wide handler, which is what keeps the
+			// MINIO_API_CORS_ALLOW_ORIGIN setting in force for exactly the
+			// requests it governed before this layer existed.
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1077,34 +1200,137 @@ func bucketCORSPreflightMiddleware(next http.Handler) http.Handler {
 }
 
 // preflightCORSConfig returns the CORS configuration a bucket's own rules are to
-// be read from when answering a preflight request, or an error when the bucket
-// has none this layer can use.
+// be read from when answering a preflight request, or an error saying either that
+// the bucket demonstrably has none or that its configuration could not be
+// established. corsPreflightConfigAbsent tells those two apart, and the caller
+// disposes of the request accordingly: a bucket with no configuration is answered
+// by the server-wide handler, while one whose configuration is unknown is
+// refused.
 //
-// The lookup is strictly in-memory, through BucketMetadataSys.Get, which reads
-// the bucket metadata cache under its own lock and reports errConfigNotFound for
-// a bucket it does not hold. An unauthenticated preflight names its bucket in the
-// request path, so going through the loading accessor GetCORSConfig instead would
-// let anyone turn a stream of made-up names into backend metadata reads, with
-// work that outlives the request because that accessor is not request scoped.
-// Reading the cache directly is how the rest of the server resolves a bucket
-// ahead of the router too - collectAPIStats does the same to decide whether a
-// request names a bucket that exists.
+// The lookup is in-memory whenever the answer is authoritative there, through
+// BucketMetadataSys.Get, which reads the bucket metadata cache under its own lock
+// and reports errConfigNotFound for a bucket it does not hold. Once that cache
+// has finished loading it holds every bucket that exists, so a miss is a
+// confirmed absence and no further work is done - which is the whole of the
+// steady state.
 //
-// The configuration returned is the one parseAllConfigs produced when the
-// metadata was loaded, which is exactly what GetCORSConfig hands back, so both
-// paths answer a bucket's rules from the same parsed document.
-func preflightCORSConfig(bucket string) (*miniogocors.Config, error) {
-	if globalBucketMetadataSys == nil {
+// While the cache is still loading a miss says nothing at all: the bucket may
+// have rules that simply have not been read yet. Answering such a request from
+// the server-wide setting would let a bucket's own rules be bypassed for as long
+// as loading takes, so the configuration is instead established from the backend,
+// for that one bucket, by corsBackendCORSConfig.
+//
+// Note the loading accessor GetCORSConfig is deliberately not used for this. It
+// is not request scoped, it migrates legacy configuration, and it caches whatever
+// it loads - including the default metadata it invents for a bucket that does not
+// exist - so an unauthenticated preflight naming made-up buckets could grow the
+// metadata cache without bound and leave work running after the request that
+// started it was gone.
+func preflightCORSConfig(ctx context.Context, bucket string) (*miniogocors.Config, error) {
+	sys := globalBucketMetadataSys
+	if sys == nil {
 		return nil, errServerNotInitialized
 	}
-	meta, err := globalBucketMetadataSys.Get(bucket)
+
+	meta, err := sys.Get(bucket)
+	if err == nil {
+		if meta.corsConfig == nil {
+			return nil, BucketCORSConfigNotFound{Bucket: bucket}
+		}
+		return meta.corsConfig, nil
+	}
+	if sys.Initialized() {
+		// The cache holds every bucket that exists, so this bucket has no
+		// configuration of its own - it has none stored, or it does not exist.
+		return nil, err
+	}
+
+	return corsBackendCORSConfig(ctx, bucket)
+}
+
+// corsBackendCORSConfig establishes one bucket's CORS configuration from its
+// stored metadata document, for a preflight request that arrived while the bucket
+// metadata cache was still loading.
+//
+// The read is deliberately the narrowest one that answers the question:
+// readBucketMetadata reads the single metadata document of this one bucket and
+// decodes it. Nothing is written to the cache, no legacy configuration is
+// migrated, and no other bucket is touched, so a preflight naming buckets that do
+// not exist leaves no trace and creates no work beyond its own bounded read.
+//
+// The work is bounded three ways, because a preflight is unauthenticated and its
+// rate is therefore chosen by whoever sends it: the read runs on the request's
+// own context, so a client that goes away takes its read with it; it is given
+// corsPreflightConfigReadTimeout to complete; and at most
+// maxCORSPreflightConfigReads of them run at once, with a request that finds the
+// gate full refused rather than queued behind it.
+//
+// A configuration is parsed here rather than taken from the metadata's own parsed
+// field because readBucketMetadata does not parse - parseAllConfigs is part of the
+// loading path this deliberately avoids. The same parser it would have used is
+// used here, so both paths answer a bucket's rules from the same document.
+func corsBackendCORSConfig(ctx context.Context, bucket string) (*miniogocors.Config, error) {
+	if isMinioMetaBucketName(bucket) {
+		// Not a bucket a client configures, and not one to read metadata for.
+		return nil, BucketCORSConfigNotFound{Bucket: bucket}
+	}
+
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		// There is nothing to read the configuration from yet, so whether this
+		// bucket has rules is unknown and the preflight is refused rather than
+		// answered from the server-wide setting. The request it asks about could
+		// not be served either: every S3 handler answers ErrServerNotInitialized
+		// while the object layer is absent.
+		return nil, errServerNotInitialized
+	}
+
+	select {
+	case corsPreflightConfigReads <- struct{}{}:
+		defer func() { <-corsPreflightConfigReads }()
+	default:
+		return nil, errCORSPreflightConfigReadsBusy
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, corsPreflightConfigReadTimeout)
+	defer cancel()
+
+	meta, err := readBucketMetadata(ctx, objAPI, bucket)
+	if err != nil {
+		// errConfigNotFound is the bucket having no metadata document at all,
+		// which is a confirmed absence: it has no configuration, or it does not
+		// exist. Anything else leaves the configuration unknown.
+		return nil, err
+	}
+	if len(meta.CORSConfigXML) == 0 {
+		return nil, BucketCORSConfigNotFound{Bucket: bucket}
+	}
+
+	cfg, err := miniogocors.ParseBucketCorsConfig(bytes.NewReader(meta.CORSConfigXML))
 	if err != nil {
 		return nil, err
 	}
-	if meta.corsConfig == nil {
-		return nil, BucketCORSConfigNotFound{Bucket: bucket}
+	return cfg, nil
+}
+
+// corsPreflightConfigAbsent reports whether err says the bucket has no CORS
+// configuration of its own, as opposed to saying its configuration could not be
+// established.
+//
+// Only these two errors mean absence. BucketCORSConfigNotFound is the sentinel
+// the metadata layer raises for a bucket whose metadata carries no CORS document,
+// and errConfigNotFound is a bucket the loaded cache does not hold or one with no
+// metadata document at all - a bucket that has no configuration, or that does not
+// exist. Every other error - the object layer or the metadata subsystem being
+// absent, a read that failed or timed out, a document that would not parse, the
+// read gate being full - says the answer is unknown, and an unknown answer is
+// never treated as an absent configuration.
+func corsPreflightConfigAbsent(err error) bool {
+	if err == nil {
+		return false
 	}
-	return meta.corsConfig, nil
+	var notFound BucketCORSConfigNotFound
+	return errors.As(err, &notFound) || errors.Is(err, errConfigNotFound)
 }
 
 // corsPreflightRefusalReporter reports that preflight requests are being refused
@@ -1161,10 +1387,20 @@ func (r *corsPreflightRefusalReporter) report(reason error) {
 		return
 	}
 
-	// A warning, and not an audit entry: the condition describes the state of
-	// this server rather than the outcome of an authenticated operation, and the
+	// An event, and not an audit entry: the condition describes the state of this
+	// server rather than the outcome of an authenticated operation, and the
 	// preflight it refused reaches no audit path to begin with.
-	internalLogIf(GlobalContext, corsPreflightRefusalReport(reason, unreported), logger.WarningKind)
+	//
+	// An event and not an error either, because a refusal is a condition this
+	// layer expects and handles rather than a fault to be traced back to a line of
+	// code. logger.Event is the path that says so: it builds the entry with no
+	// stack, so the report carries the reason and nothing about the internals that
+	// produced it - no frames from this middleware, from the logger, or from
+	// net/http, all of which describe the same three call sites on every refusal
+	// and so tell an operator nothing a refusal has not already said. The reason is
+	// passed as an argument rather than as the format string so that nothing in it
+	// is read as a formatting verb.
+	logger.Event(GlobalContext, "cors", "%s", corsPreflightRefusalReport(reason, unreported))
 }
 
 // corsPreflightRefusalReport composes the diagnostic a report emits, carrying the

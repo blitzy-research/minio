@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -33,10 +34,13 @@ import (
 	"testing/iotest"
 	"time"
 
+	"github.com/minio/madmin-go/v3/logger/log"
 	miniogocors "github.com/minio/minio-go/v7/pkg/cors"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
+	types "github.com/minio/minio/internal/logger/target/loggertypes"
 	"github.com/minio/mux"
 	"github.com/minio/pkg/v3/policy"
 	"github.com/tinylib/msgp/msgp"
@@ -621,6 +625,132 @@ func TestValidateBucketCorsConfig(t *testing.T) {
 			wantRules: 1,
 		},
 
+		// No element may carry the same attribute twice. XML 1.0 forbids it
+		// outright and the Namespaces specification extends the prohibition to
+		// two attributes whose expanded names are equal however they were
+		// spelled, so every document below is one that a conforming parser
+		// refuses to read at all. Go's decoder enforces neither rule and reports
+		// the repetitions as ordinary attributes, so without an explicit check
+		// each of these was accepted, persisted, and handed back to clients as a
+		// configuration - replacing one that was actually valid.
+		{
+			name: "attributes/duplicateIdenticalDefaultNamespaceDeclarationIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns="` + s3CORSNamespace + `">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `The element "CORSConfiguration" declares the attribute "xmlns" more than once`,
+		},
+		{
+			// Two default declarations with different values are rejected for
+			// repeating the attribute rather than for the namespace the decoder
+			// happened to resolve last, so the client is told what is actually
+			// wrong with the document it sent.
+			name: "attributes/duplicateDifferingDefaultNamespaceDeclarationIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns="urn:evil">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `The element "CORSConfiguration" declares the attribute "xmlns" more than once`,
+		},
+		{
+			name: "attributes/duplicateOrdinaryAttributeOnTheRootIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" foo="1" foo="2">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `The element "CORSConfiguration" declares the attribute "foo" more than once`,
+		},
+		{
+			name:             "attributes/duplicateOrdinaryAttributeOnACORSRuleIsRejected",
+			xml:              corsTestDoc(`<CORSRule bar="1" bar="2">` + corsMinimalRuleBody + `</CORSRule>`),
+			wantErrSubstring: `The element "CORSRule" declares the attribute "bar" more than once`,
+		},
+		{
+			// A repetition on a value element is refused even though a single
+			// attribute there is deliberately ignored: one attribute cannot be
+			// mistaken for a configured value, while a document no parser will
+			// read cannot be stored as though it had been valid.
+			name: "attributes/duplicateOrdinaryAttributeOnAValueElementIsRejected",
+			xml: corsTestDoc(corsTestRule(`<AllowedMethod>GET</AllowedMethod>` +
+				`<AllowedOrigin baz="1" baz="2">https://example.com</AllowedOrigin>`)),
+			wantErrSubstring: `The element "AllowedOrigin" declares the attribute "baz" more than once`,
+		},
+		{
+			name: "attributes/duplicateNamespacePrefixDeclarationIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:a="urn:one" xmlns:a="urn:two">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `The element "CORSConfiguration" declares the attribute "xmlns:a" more than once`,
+		},
+		{
+			// The two attributes are spelled differently yet name the same
+			// expanded attribute, because both prefixes are bound to the same
+			// namespace. Comparing the resolved name is what catches it.
+			name: "attributes/duplicateExpandedAttributeReachedThroughTwoPrefixesIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:p="urn:x" xmlns:q="urn:x" p:k="1" q:k="2">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `The element "CORSConfiguration" declares the attribute "{urn:x}k" more than once`,
+		},
+		{
+			// The xml prefix is bound to its namespace without a declaration, so
+			// a repeated xml:lang is a repeated expanded name as well.
+			name: "attributes/duplicateReservedXMLAttributeIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xml:lang="en" xml:lang="fr">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `declares the attribute "{http://www.w3.org/XML/1998/namespace}lang" more than once`,
+		},
+		{
+			// An undeclared prefix leaves the attribute name unresolved, and two
+			// attributes carrying the same unresolved name are still the same
+			// name twice.
+			name: "attributes/duplicateAttributeWithAnUndeclaredPrefixIsRejected",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" q:k="1" q:k="2">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantErrSubstring: `declares the attribute "{q}k" more than once`,
+		},
+		{
+			// The repetition is on the third rule, which is reached only because
+			// every rule is walked rather than only the first.
+			name: "attributes/duplicateAttributeInALaterRuleIsRejected",
+			xml: corsTestDoc(
+				corsTestRule(corsMinimalRuleBody),
+				corsTestRule(corsMinimalRuleBody),
+				`<CORSRule dup="1" dup="2">`+corsMinimalRuleBody+`</CORSRule>`,
+			),
+			wantErrSubstring: `The element "CORSRule" declares the attribute "dup" more than once`,
+		},
+		{
+			// Distinct attributes are not a repetition, whatever their number,
+			// and a single attribute on any element remains ignored rather than
+			// refused, so the check adds no strictness AWS does not have.
+			name: "attributes/distinctAttributesAreAccepted",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:a="urn:one" xmlns:b="urn:two" a:k="1" b:k="2" foo="3" bar="4">` +
+				`<CORSRule note="one"><AllowedMethod lang="en">GET</AllowedMethod><AllowedOrigin lang="en">*</AllowedOrigin></CORSRule>` +
+				`</CORSConfiguration>`,
+			wantRules: 1,
+		},
+		{
+			// A prefixed attribute and an ordinary one that share a local name
+			// have different expanded names, so neither is a repetition of the
+			// other.
+			name: "attributes/aPrefixedAndAnUnprefixedAttributeSharingALocalNameAreAccepted",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" xmlns:a="urn:one" a:k="1" k="2">` +
+				corsTestRule(corsMinimalRuleBody) + `</CORSConfiguration>`,
+			wantRules: 1,
+		},
+		{
+			// The same attribute name on two different elements is not a
+			// repetition either: the constraint is per element.
+			name: "attributes/theSameAttributeNameOnDifferentElementsIsAccepted",
+			xml: `<CORSConfiguration xmlns="` + s3CORSNamespace + `" tag="root">` +
+				`<CORSRule tag="rule"><AllowedMethod tag="method">GET</AllowedMethod><AllowedOrigin tag="origin">*</AllowedOrigin></CORSRule>` +
+				`<CORSRule tag="rule"><AllowedMethod tag="method">PUT</AllowedMethod><AllowedOrigin tag="origin">*</AllowedOrigin></CORSRule>` +
+				`</CORSConfiguration>`,
+			wantRules: 2,
+		},
+		{
+			// The canonical AWS document declares the S3 namespace exactly once
+			// on its root element and nothing else anywhere, which is the shape
+			// every real client sends.
+			name:      "attributes/theCanonicalDocumentIsAccepted",
+			xml:       corsCanonicalDocument,
+			wantRules: 4,
+		},
+
 		// ID and MaxAgeSeconds may each appear at most once per rule. The parsed
 		// model stores both in a scalar field, so a repeated element decodes
 		// without complaint and silently keeps only the value that appears last;
@@ -1062,6 +1192,175 @@ func TestValidateBucketCorsConfigReadError(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected the error to wrap %v, got %v", wantErr, err)
+	}
+}
+
+// TestValidateCorsElementAttributes covers the well-formedness constraint that
+// no element may carry the same attribute twice, directly on the check rather
+// than through a document, so that the comparison and the client-visible
+// rendering of each attribute name form are pinned independently of the shape of
+// any particular document.
+//
+// The elements are built the way the decoder reports them - namespace
+// declarations resolved to the reserved xmlns space, prefixed attributes with
+// their prefix already replaced by the namespace it is bound to - because that
+// resolved form is what the check actually compares.
+func TestValidateCorsElementAttributes(t *testing.T) {
+	const xmlNamespace = "http://www.w3.org/XML/1998/namespace"
+
+	corsAttr := func(space, local, value string) xml.Attr {
+		return xml.Attr{Name: xml.Name{Space: space, Local: local}, Value: value}
+	}
+
+	testCases := []struct {
+		name string
+		elem xml.StartElement
+		// space is the namespace of the document, against which the element's
+		// own name is rendered.
+		space string
+		// wantErr is the exact failure, asserted verbatim because it reaches the
+		// client as the description of a MalformedXML error. An empty value means
+		// the element must be accepted.
+		wantErr string
+	}{
+		{
+			name:  "noAttributesIsAccepted",
+			elem:  xml.StartElement{Name: xml.Name{Space: s3CORSNamespace, Local: corsRuleElement}},
+			space: s3CORSNamespace,
+		},
+		{
+			name: "oneAttributeIsAccepted",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsConfigurationElement},
+				Attr: []xml.Attr{corsAttr("", "xmlns", s3CORSNamespace)},
+			},
+			space: s3CORSNamespace,
+		},
+		{
+			name: "aRepeatedDefaultNamespaceDeclarationIsRejected",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsConfigurationElement},
+				Attr: []xml.Attr{
+					corsAttr("", "xmlns", s3CORSNamespace),
+					corsAttr("", "xmlns", s3CORSNamespace),
+				},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "CORSConfiguration" declares the attribute "xmlns" more than once`,
+		},
+		{
+			name: "aRepeatedPrefixDeclarationIsRejectedAndRenderedWithItsPrefix",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsConfigurationElement},
+				Attr: []xml.Attr{
+					corsAttr("xmlns", "a", "urn:one"),
+					corsAttr("xmlns", "a", "urn:two"),
+				},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "CORSConfiguration" declares the attribute "xmlns:a" more than once`,
+		},
+		{
+			name: "aRepeatedOrdinaryAttributeIsRejectedAndRenderedBare",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsRuleElement},
+				Attr: []xml.Attr{corsAttr("", "foo", "1"), corsAttr("", "foo", "2")},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "CORSRule" declares the attribute "foo" more than once`,
+		},
+		{
+			name: "aRepeatedNamespacedAttributeIsRejectedAndRenderedExpanded",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: "AllowedOrigin"},
+				Attr: []xml.Attr{corsAttr("urn:x", "k", "1"), corsAttr("urn:x", "k", "2")},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "AllowedOrigin" declares the attribute "{urn:x}k" more than once`,
+		},
+		{
+			name: "aRepeatedReservedXMLAttributeIsRejected",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsConfigurationElement},
+				Attr: []xml.Attr{corsAttr(xmlNamespace, "lang", "en"), corsAttr(xmlNamespace, "lang", "fr")},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "CORSConfiguration" declares the attribute "{` + xmlNamespace + `}lang" more than once`,
+		},
+		{
+			// The element itself is in a foreign namespace, so it is named the
+			// way every other failure in this file names one.
+			name: "anElementOutsideTheDocumentNamespaceIsNamedExpanded",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: "urn:other", Local: corsRuleElement},
+				Attr: []xml.Attr{corsAttr("", "foo", "1"), corsAttr("", "foo", "2")},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "{urn:other}CORSRule" declares the attribute "foo" more than once`,
+		},
+		{
+			// Same local name, different namespaces: two attributes, not one
+			// repeated.
+			name: "twoAttributesSharingALocalNameInDifferentNamespacesAreAccepted",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsConfigurationElement},
+				Attr: []xml.Attr{corsAttr("urn:one", "k", "1"), corsAttr("urn:two", "k", "2"), corsAttr("", "k", "3")},
+			},
+			space: s3CORSNamespace,
+		},
+		{
+			// Values play no part in the comparison, so identical values on
+			// distinct names are accepted just as differing values on a repeated
+			// name are rejected.
+			name: "manyDistinctAttributesWithIdenticalValuesAreAccepted",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsRuleElement},
+				Attr: []xml.Attr{
+					corsAttr("", "a", "same"),
+					corsAttr("", "b", "same"),
+					corsAttr("xmlns", "c", "same"),
+					corsAttr("urn:x", "d", "same"),
+				},
+			},
+			space: s3CORSNamespace,
+		},
+		{
+			// The repetition is the last pair of a long list, which is reached
+			// only because every attribute is compared rather than only the
+			// first few.
+			name: "aRepetitionAtTheEndOfALongAttributeListIsRejected",
+			elem: xml.StartElement{
+				Name: xml.Name{Space: s3CORSNamespace, Local: corsRuleElement},
+				Attr: []xml.Attr{
+					corsAttr("", "a", "1"),
+					corsAttr("", "b", "2"),
+					corsAttr("", "c", "3"),
+					corsAttr("", "d", "4"),
+					corsAttr("", "e", "5"),
+					corsAttr("", "e", "6"),
+				},
+			},
+			space:   s3CORSNamespace,
+			wantErr: `The element "CORSRule" declares the attribute "e" more than once`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCorsElementAttributes(tc.elem, tc.space)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the element to be accepted, got error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected the element to be rejected with %q, got no error", tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Fatalf("expected the error %q, got %q", tc.wantErr, err)
+			}
+		})
 	}
 }
 
@@ -2850,11 +3149,30 @@ var corsPreflightAllowHeaders = []string{
 }
 
 // installTestBucketMetadataSys replaces the global bucket metadata system with a
-// fresh, empty one for the duration of the test, restoring the previous value
-// afterwards. A bucket is made known to it, with or without a CORS
+// fresh, empty and fully loaded one for the duration of the test, restoring the
+// previous value afterwards. A bucket is made known to it, with or without a CORS
 // configuration, through setTestBucketCORSConfig; every other bucket name is one
 // the cache does not hold.
+//
+// The system is marked loaded because that is the state of a running server, and
+// it is the state in which a bucket the cache does not hold demonstrably has no
+// configuration of its own. installLoadingTestBucketMetadataSys installs one that
+// is still loading, where the same miss says nothing at all.
 func installTestBucketMetadataSys(t *testing.T) *BucketMetadataSys {
+	t.Helper()
+
+	sys := installLoadingTestBucketMetadataSys(t)
+	sys.Lock()
+	sys.initialized = true
+	sys.Unlock()
+	return sys
+}
+
+// installLoadingTestBucketMetadataSys replaces the global bucket metadata system
+// with a fresh, empty one that has not finished loading, restoring the previous
+// value afterwards. It is the startup state: a bucket the cache does not hold may
+// still have a configuration that has not been read yet.
+func installLoadingTestBucketMetadataSys(t *testing.T) *BucketMetadataSys {
 	t.Helper()
 
 	saved := globalBucketMetadataSys
@@ -2863,6 +3181,21 @@ func installTestBucketMetadataSys(t *testing.T) *BucketMetadataSys {
 	sys := NewBucketMetadataSys()
 	globalBucketMetadataSys = sys
 	return sys
+}
+
+// installTestNoObjectLayer removes the object layer for the duration of the test,
+// restoring the previous value afterwards.
+//
+// It is stated explicitly wherever a case turns on the object layer being absent,
+// because the layer is a process-wide global that other tests in this package
+// install and leave behind: without this, whether a load-window lookup can reach
+// the backend at all would depend on which tests ran first.
+func installTestNoObjectLayer(t *testing.T) {
+	t.Helper()
+
+	saved := globalObjectAPI
+	t.Cleanup(func() { setObjectLayer(saved) })
+	setObjectLayer(nil)
 }
 
 // setTestBucketCORSConfig makes bucket known to sys carrying cfg as its parsed
@@ -2884,65 +3217,125 @@ func isCORSConfigNotFound(err error) bool {
 
 // TestPreflightCORSConfigIsCacheOnly pins the property the preflight evaluator
 // depends on. A preflight request carries no credentials and names its bucket in
-// a path the client chooses freely, so the lookup it performs must never read
-// from the backend and must never add an entry to the bucket metadata map -
-// otherwise a stream of made-up names turns into backend reads and into
-// permanent, unbounded memory growth.
+// a path the client chooses freely, so the lookup it performs must never add an
+// entry to the bucket metadata map - otherwise a stream of made-up names turns
+// into permanent, unbounded memory growth - and once the cache has finished
+// loading it must not read from the backend at all, because a miss then is
+// already a confirmed absence.
 //
-// Every outcome that produces no configuration is an error, and the caller
-// treats all of them alike by handing the request to the server-wide handler, so
-// what is asserted here is that the lookup answers a bucket's stored rules when
-// the cache holds them and answers nothing at all - at no cost - otherwise.
+// What the lookup reports matters as much as whether it succeeds: an absence and
+// an unestablished configuration are disposed of differently by the caller, and
+// corsPreflightConfigAbsent is what separates them. The cases below therefore
+// assert the exact error alongside the configuration.
 func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 	const (
 		knownBucket   = "blitzy-cors-known"
 		unknownBucket = "blitzy-cors-unknown"
 	)
+	ctx := context.Background()
 	cfg := corsTestConfig(miniogocors.Rule{
 		ID:            "only",
 		AllowedMethod: []string{http.MethodPut},
 		AllowedOrigin: []string{"https://www.example1.com"},
 	})
 
+	// An absent metadata subsystem establishes nothing about the bucket, so it
+	// is reported as an unestablished configuration rather than an absent one.
 	t.Run("anAbsentMetadataSubsystem", func(t *testing.T) {
 		saved := globalBucketMetadataSys
 		t.Cleanup(func() { globalBucketMetadataSys = saved })
 		globalBucketMetadataSys = nil
 
-		got, err := preflightCORSConfig(knownBucket)
+		got, err := preflightCORSConfig(ctx, knownBucket)
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
 		if !errors.Is(err, errServerNotInitialized) {
 			t.Fatalf("expected %v, got %v", errServerNotInitialized, err)
 		}
+		if corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected %v not to be read as an absent configuration", err)
+		}
 	})
 
-	t.Run("aBucketTheCacheDoesNotHold", func(t *testing.T) {
+	t.Run("aBucketALoadedCacheDoesNotHold", func(t *testing.T) {
 		sys := installTestBucketMetadataSys(t)
 
-		got, err := preflightCORSConfig(unknownBucket)
+		got, err := preflightCORSConfig(ctx, unknownBucket)
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
 		if err == nil {
 			t.Fatal("expected an error for a bucket the cache does not hold")
 		}
+		// A loaded cache holds every bucket that exists, so the miss is the
+		// bucket demonstrably having no configuration of its own.
+		if !corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected a miss on a loaded cache to read as an absent configuration, got %v", err)
+		}
 		if sys.Count() != 0 {
 			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
 		}
 	})
 
-	// The reserved bucket is never a CORS target, and the cache-only reader
-	// answers for it without consulting anything.
-	t.Run("theReservedBucket", func(t *testing.T) {
-		sys := installTestBucketMetadataSys(t)
+	// While the cache is still loading the very same miss says nothing about the
+	// bucket, so it must not be read as an absence: without an object layer to
+	// establish the configuration from, the outcome is unestablished.
+	t.Run("aBucketACacheThatIsStillLoadingDoesNotHold", func(t *testing.T) {
+		sys := installLoadingTestBucketMetadataSys(t)
+		installTestNoObjectLayer(t)
 
-		if _, err := preflightCORSConfig(minioMetaBucket); err == nil {
-			t.Fatal("expected the reserved bucket to have no CORS configuration")
+		got, err := preflightCORSConfig(ctx, unknownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if !errors.Is(err, errServerNotInitialized) {
+			t.Fatalf("expected %v, got %v", errServerNotInitialized, err)
+		}
+		if corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected a miss on a loading cache not to read as an absent configuration, got %v", err)
 		}
 		if sys.Count() != 0 {
 			t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
+		}
+	})
+
+	// A bucket the loading cache does hold is answered from it, so loading
+	// changes nothing for the buckets that have already been read.
+	t.Run("aBucketACacheThatIsStillLoadingAlreadyHolds", func(t *testing.T) {
+		sys := installLoadingTestBucketMetadataSys(t)
+		setTestBucketCORSConfig(sys, knownBucket, cfg)
+
+		got, err := preflightCORSConfig(ctx, knownBucket)
+		if err != nil {
+			t.Fatalf("expected the stored configuration, got error: %v", err)
+		}
+		if got != cfg {
+			t.Fatalf("expected the stored configuration to be returned as-is, got %+v", got)
+		}
+	})
+
+	// The reserved bucket is never a CORS target, and it is answered for without
+	// consulting anything - loaded or not.
+	t.Run("theReservedBucket", func(t *testing.T) {
+		for name, install := range map[string]func(*testing.T) *BucketMetadataSys{
+			"loaded":  installTestBucketMetadataSys,
+			"loading": installLoadingTestBucketMetadataSys,
+		} {
+			t.Run(name, func(t *testing.T) {
+				sys := install(t)
+
+				got, err := preflightCORSConfig(ctx, minioMetaBucket)
+				if got != nil {
+					t.Fatalf("expected no configuration, got %+v", got)
+				}
+				if !corsPreflightConfigAbsent(err) {
+					t.Fatalf("expected the reserved bucket to have no CORS configuration, got %v", err)
+				}
+				if sys.Count() != 0 {
+					t.Fatalf("expected the lookup not to add a metadata entry, got %d", sys.Count())
+				}
+			})
 		}
 	})
 
@@ -2950,7 +3343,7 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, nil)
 
-		got, err := preflightCORSConfig(knownBucket)
+		got, err := preflightCORSConfig(ctx, knownBucket)
 		if got != nil {
 			t.Fatalf("expected no configuration, got %+v", got)
 		}
@@ -2961,6 +3354,9 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 		if notFound.Bucket != knownBucket {
 			t.Fatalf("expected the sentinel to name the bucket %q, got %q", knownBucket, notFound.Bucket)
 		}
+		if !corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected the sentinel to read as an absent configuration, got %v", err)
+		}
 		if sys.Count() != 1 {
 			t.Fatalf("expected exactly the one bucket that was stored, got %d", sys.Count())
 		}
@@ -2970,7 +3366,7 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, cfg)
 
-		got, err := preflightCORSConfig(knownBucket)
+		got, err := preflightCORSConfig(ctx, knownBucket)
 		if err != nil {
 			t.Fatalf("expected the stored configuration, got error: %v", err)
 		}
@@ -2988,14 +3384,18 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 		sys := installTestBucketMetadataSys(t)
 		setTestBucketCORSConfig(sys, knownBucket, cfg)
 
-		if got, err := preflightCORSConfig(knownBucket); err != nil || got != cfg {
+		if got, err := preflightCORSConfig(ctx, knownBucket); err != nil || got != cfg {
 			t.Fatalf("expected the stored configuration, got %+v and error %v", got, err)
 		}
 
 		setTestBucketCORSConfig(sys, knownBucket, nil)
 
-		if got, err := preflightCORSConfig(knownBucket); err == nil {
+		got, err := preflightCORSConfig(ctx, knownBucket)
+		if err == nil {
 			t.Fatalf("expected no configuration once it was removed, got %+v", got)
+		}
+		if !corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected a removed configuration to read as an absent one, got %v", err)
 		}
 	})
 
@@ -3003,7 +3403,8 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 		sys := installTestBucketMetadataSys(t)
 
 		for i := range 512 {
-			if _, err := preflightCORSConfig(fmt.Sprintf("blitzy-cors-probe-%d", i)); err == nil {
+			bucket := fmt.Sprintf("blitzy-cors-probe-%d", i)
+			if _, err := preflightCORSConfig(ctx, bucket); err == nil {
 				t.Fatalf("expected an unknown bucket to have no configuration, got one for probe %d", i)
 			}
 		}
@@ -3011,6 +3412,176 @@ func TestPreflightCORSConfigIsCacheOnly(t *testing.T) {
 			t.Fatalf("expected 512 unknown lookups to add no metadata entries, got %d", sys.Count())
 		}
 	})
+
+	// The same probing while the cache is still loading must be equally free of
+	// consequences for the cache, however it is answered.
+	t.Run("manyUnknownBucketsNeverGrowALoadingMetadataMap", func(t *testing.T) {
+		sys := installLoadingTestBucketMetadataSys(t)
+		installTestNoObjectLayer(t)
+
+		for i := range 512 {
+			bucket := fmt.Sprintf("blitzy-cors-loading-probe-%d", i)
+			if _, err := preflightCORSConfig(ctx, bucket); err == nil {
+				t.Fatalf("expected an unknown bucket to have no configuration, got one for probe %d", i)
+			}
+		}
+		if sys.Count() != 0 {
+			t.Fatalf("expected 512 unknown lookups to add no metadata entries, got %d", sys.Count())
+		}
+	})
+
+	// A context that is already done must not turn into a lookup that reports an
+	// absent configuration, because a canceled read establishes nothing.
+	t.Run("aCanceledContextDuringLoading", func(t *testing.T) {
+		installLoadingTestBucketMetadataSys(t)
+		installTestNoObjectLayer(t)
+
+		canceled, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		got, err := preflightCORSConfig(canceled, unknownBucket)
+		if got != nil {
+			t.Fatalf("expected no configuration, got %+v", got)
+		}
+		if corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected a canceled lookup not to read as an absent configuration, got %v", err)
+		}
+	})
+}
+
+// TestCorsPreflightConfigAbsent covers the classification the middleware's
+// disposition turns on: which errors say a bucket has no CORS configuration of its
+// own, and which say its configuration could not be established.
+//
+// Getting this wrong in either direction is a defect with teeth. Reading an
+// unestablished configuration as an absent one hands the request to the
+// server-wide handler and lets a configured bucket's own rules be bypassed;
+// reading an absent one as unestablished refuses preflights for every bucket that
+// simply has no configuration.
+func TestCorsPreflightConfigAbsent(t *testing.T) {
+	const bucket = "blitzy-cors-classify"
+
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "noError", err: nil, want: false},
+		{
+			name: "theTypedSentinel",
+			err:  BucketCORSConfigNotFound{Bucket: bucket},
+			want: true,
+		},
+		{
+			name: "theTypedSentinelWrapped",
+			err:  fmt.Errorf("for bucket %s: %w", bucket, BucketCORSConfigNotFound{Bucket: bucket}),
+			want: true,
+		},
+		{
+			name: "aCacheOrDocumentMiss",
+			err:  errConfigNotFound,
+			want: true,
+		},
+		{
+			name: "aCacheOrDocumentMissWrapped",
+			err:  fmt.Errorf("reading metadata: %w", errConfigNotFound),
+			want: true,
+		},
+		{
+			name: "anAbsentObjectLayerOrMetadataSubsystem",
+			err:  errServerNotInitialized,
+			want: false,
+		},
+		{
+			name: "aMetadataSubsystemThatHasNotLoaded",
+			err:  errBucketMetadataNotInitialized,
+			want: false,
+		},
+		{
+			name: "theReadGateBeingFull",
+			err:  errCORSPreflightConfigReadsBusy,
+			want: false,
+		},
+		{
+			name: "aReadThatTimedOut",
+			err:  context.DeadlineExceeded,
+			want: false,
+		},
+		{
+			name: "aClientThatWentAway",
+			err:  context.Canceled,
+			want: false,
+		},
+		{
+			name: "aDocumentThatWouldNotParse",
+			err:  errors.New("xml: syntax error"),
+			want: false,
+		},
+		{
+			// A sentinel for a different configuration is not this one.
+			name: "aSiblingConfigurationSentinel",
+			err:  BucketSSEConfigNotFound{Bucket: bucket},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := corsPreflightConfigAbsent(tc.err); got != tc.want {
+				t.Fatalf("expected corsPreflightConfigAbsent(%v) to be %t, got %t", tc.err, tc.want, got)
+			}
+		})
+	}
+}
+
+// TestCorsBackendCORSConfigIsBounded covers the bounds the backend read is held
+// to, which exist because the request that triggers it is unauthenticated.
+//
+// The read gate is the one bound a test can exercise without an object layer:
+// with every slot taken, a request must be refused immediately rather than parked
+// waiting for one, and the refusal must not read as an absent configuration.
+func TestCorsBackendCORSConfigIsBounded(t *testing.T) {
+	const bucket = "blitzy-cors-bounded"
+	ctx := context.Background()
+
+	if got := cap(corsPreflightConfigReads); got != maxCORSPreflightConfigReads {
+		t.Fatalf("expected the read gate to admit %d readers, got %d", maxCORSPreflightConfigReads, got)
+	}
+
+	// Fill the gate, then restore it, so the case runs against exactly the
+	// condition it describes and leaves the gate as it found it.
+	for range maxCORSPreflightConfigReads {
+		corsPreflightConfigReads <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for range maxCORSPreflightConfigReads {
+			<-corsPreflightConfigReads
+		}
+	})
+
+	// An object layer has to be present, or the absent one would be reported
+	// before the gate is ever consulted.
+	savedLayer := globalObjectAPI
+	t.Cleanup(func() { setObjectLayer(savedLayer) })
+	setObjectLayer(&erasureServerPools{})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := corsBackendCORSConfig(ctx, bucket)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errCORSPreflightConfigReadsBusy) {
+			t.Fatalf("expected %v, got %v", errCORSPreflightConfigReadsBusy, err)
+		}
+		if corsPreflightConfigAbsent(err) {
+			t.Fatalf("expected a full read gate not to read as an absent configuration, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("expected a full read gate to refuse immediately rather than wait for a slot")
+	}
 }
 
 // corsPreflightOutcome is how the middleware disposed of a request.
@@ -3097,29 +3668,43 @@ func TestBucketCorsPreflightMiddlewareDisposition(t *testing.T) {
 		wantHeaders map[string]string
 	}{
 		{
-			// The metadata subsystem is not there to be asked, so this layer has
-			// no rules to apply and the request stays the server-wide handler's
-			// to answer, exactly as it was before this layer existed.
-			name: "nilMetadataSystemDelegates",
+			// The metadata subsystem is not there to be asked, so whether this
+			// bucket has rules of its own cannot be established at all. The
+			// request is refused rather than answered from the server-wide
+			// setting, because rules that were never read cannot be known to
+			// allow it and answering globally is how a configured bucket's rules
+			// would be bypassed.
+			name: "nilMetadataSystemDenies",
 			setup: func(t *testing.T) {
 				t.Helper()
 				saved := globalBucketMetadataSys
 				t.Cleanup(func() { globalBucketMetadataSys = saved })
 				globalBucketMetadataSys = nil
 			},
-			want: corsOutcomeDelegated,
+			want: corsOutcomeDenied,
 		},
 		{
-			// A cache that does not hold the bucket - because it has not
-			// finished loading, or because the bucket has no metadata to load -
-			// yields no rules either, so the request is delegated rather than
-			// answered from rules this layer does not have.
-			name: "bucketTheCacheDoesNotHoldDelegates",
+			// A loaded cache holds every bucket that exists, so one it does not
+			// hold demonstrably has no configuration of its own and the request
+			// is delegated exactly as it was before this layer existed.
+			name: "bucketALoadedCacheDoesNotHoldDelegates",
 			setup: func(t *testing.T) {
 				t.Helper()
 				installTestBucketMetadataSys(t)
 			},
 			want: corsOutcomeDelegated,
+		},
+		{
+			// The same miss on a cache that is still loading says nothing about
+			// the bucket, and with no object layer to establish its configuration
+			// from, the request is refused instead of delegated.
+			name: "bucketALoadingCacheDoesNotHoldDenies",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installLoadingTestBucketMetadataSys(t)
+				installTestNoObjectLayer(t)
+			},
+			want: corsOutcomeDenied,
 		},
 		{
 			// The same outcome reached the other way: the bucket's metadata is in
@@ -4062,22 +4647,30 @@ func TestBucketCorsPreflightMiddlewareLeavesNoMetadataTrace(t *testing.T) {
 // for a bucket that has no rules of its own, through the handler a running server
 // actually composes rather than through the middleware alone.
 //
-// The bound it pins is the one a browser feels: a bucket without a configuration
-// of its own must keep being answered from MINIO_API_CORS_ALLOW_ORIGIN, and every
-// reason there are no rules to answer from has to be treated alike - the bucket
-// carries no configuration, the metadata cache has not reached it yet, the cache
-// has finished loading and does not hold it, what is stored carries no rule, or
-// there is no metadata subsystem at all. Telling any of those apart would make a
-// browser's access to a bucket depend on whether this server happens to have read
-// that bucket's metadata yet, a condition no deployment configures and none can
-// observe, on a path that carries no credentials to attribute a refusal to.
+// The bound it pins is the one a browser feels: a bucket that demonstrably has no
+// configuration of its own must keep being answered from
+// MINIO_API_CORS_ALLOW_ORIGIN, and every reason there are demonstrably no rules to
+// answer from has to be treated alike - the bucket carries no configuration, the
+// loaded cache does not hold it, or what is stored carries no rule.
 //
-// The two answers are distinguished by their own fingerprints rather than by
+// A bucket whose configuration could not be established at all is a different
+// matter, and is deliberately not treated alike. While the metadata cache is
+// loading, a miss says nothing: the bucket may have rules that have not been read
+// yet. Answering such a request from the server-wide setting would let a
+// configured bucket's own rules be bypassed for as long as loading takes, so the
+// configuration is established from the backend for that one bucket instead, and
+// only what that read establishes decides the answer. When even that cannot be
+// done - there is no object layer or no metadata subsystem to read through - the
+// request is refused rather than answered globally, which is the one disposition
+// that cannot serve a bucket's data to an origin its rules exclude.
+//
+// The three answers are distinguished by their own fingerprints rather than by
 // inspection: the server-wide handler replies 204 and sets
 // Access-Control-Allow-Credentials, and never emits Access-Control-Expose-Headers
-// on a preflight, while the per-bucket evaluator replies 200 and sets neither. So
-// a rule that matches and a rule set that refuses must both still answer for
-// themselves, which is what keeps this from passing by delegating everything.
+// on a preflight; the per-bucket evaluator replies 200 and sets neither; and a
+// per-bucket refusal is that same 200 carrying no Access-Control-Allow-* header at
+// all. So a rule that matches and a rule set that refuses must both still answer
+// for themselves, which is what keeps this from passing by delegating everything.
 func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 	const (
 		bucket = "blitzy-cors-bucket"
@@ -4093,57 +4686,78 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 		MaxAgeSeconds: 3000,
 	}
 
-	// installLoadedTestBucketMetadataSys presents the replacement cache as having
-	// finished loading, which is the state in which a bucket it does not hold is a
-	// bucket without a configuration rather than one not read yet.
-	installLoadedTestBucketMetadataSys := func(t *testing.T) *BucketMetadataSys {
-		t.Helper()
-
-		sys := installTestBucketMetadataSys(t)
-		sys.Lock()
-		sys.initialized = true
-		sys.Unlock()
-		return sys
-	}
+	// corsFallbackDisposition is which layer is expected to answer the request.
+	type corsFallbackDisposition int
+	const (
+		// corsAnsweredServerWide is the untouched global handler answering.
+		corsAnsweredServerWide corsFallbackDisposition = iota
+		// corsAnsweredPerBucket is the per-bucket evaluator answering from rules
+		// it has in hand, whether it allows the request or refuses it.
+		corsAnsweredPerBucket
+		// corsRefusedPerBucket is the per-bucket evaluator refusing because the
+		// bucket's configuration could not be established.
+		corsRefusedPerBucket
+	)
 
 	testCases := []struct {
 		name  string
 		setup func(t *testing.T)
 		// origin the preflight announces; the stored rule allows only origin.
 		origin string
-		// wantServerWide is whether the server-wide handler is expected to answer.
-		wantServerWide bool
+		// want is the layer expected to answer.
+		want corsFallbackDisposition
 	}{
 		{
 			// The condition a freshly started server is in for as long as it takes
-			// to load bucket metadata: the cache cannot yet say whether the bucket
-			// has a configuration. The global setting has to keep answering.
-			name:           "aBucketAbsentFromACacheThatIsStillLoading",
-			setup:          func(t *testing.T) { t.Helper(); installTestBucketMetadataSys(t) },
-			wantServerWide: true,
+			// to load bucket metadata. The cache cannot say whether the bucket has
+			// a configuration, and with no object layer to establish it from the
+			// request is refused rather than answered from the global setting -
+			// which is also the state in which every S3 handler answers
+			// ErrServerNotInitialized, so the request this preflight asks about
+			// could not have been served either.
+			name: "aBucketAbsentFromACacheThatIsStillLoading",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installLoadingTestBucketMetadataSys(t)
+				installTestNoObjectLayer(t)
+			},
+			want: corsRefusedPerBucket,
 		},
 		{
-			name:           "aBucketAbsentFromALoadedCache",
-			setup:          func(t *testing.T) { t.Helper(); installLoadedTestBucketMetadataSys(t) },
-			wantServerWide: true,
+			name:  "aBucketAbsentFromALoadedCache",
+			setup: func(t *testing.T) { t.Helper(); installTestBucketMetadataSys(t) },
+			want:  corsAnsweredServerWide,
 		},
 		{
 			name: "aBucketWhoseMetadataCarriesNoConfiguration",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, nil)
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, nil)
 			},
-			wantServerWide: true,
+			want: corsAnsweredServerWide,
+		},
+		{
+			// The same bucket, in a cache that has not finished loading: it has
+			// already been read, so its absent configuration is established and
+			// the global setting answers exactly as it does once loading is done.
+			name: "aBucketACacheThatIsStillLoadingHasAlreadyRead",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadingTestBucketMetadataSys(t), bucket, nil)
+			},
+			want: corsAnsweredServerWide,
 		},
 		{
 			name: "aStoredDocumentCarryingNoRule",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig())
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig())
 			},
-			wantServerWide: true,
+			want: corsAnsweredServerWide,
 		},
 		{
+			// Nothing to establish the configuration through, so nothing is known
+			// about the bucket's rules and the request is refused.
 			name: "anAbsentMetadataSubsystem",
 			setup: func(t *testing.T) {
 				t.Helper()
@@ -4151,7 +4765,7 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 				t.Cleanup(func() { globalBucketMetadataSys = saved })
 				globalBucketMetadataSys = nil
 			},
-			wantServerWide: true,
+			want: corsRefusedPerBucket,
 		},
 		{
 			// Rules that are in hand answer for themselves, so the fallback must
@@ -4159,9 +4773,23 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 			name: "aMatchingRuleAnswersInstead",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
 			},
-			wantServerWide: false,
+			want: corsAnsweredPerBucket,
+		},
+		{
+			// The same rules govern while the cache is still loading, because the
+			// bucket they belong to has already been read into it. This is the
+			// case a global fallback must never reach: the origin below is one the
+			// unset global list would allow and the stored rule allows too, so
+			// only the absent Access-Control-Allow-Credentials tells the two
+			// answers apart.
+			name: "aMatchingRuleGovernsWhileTheCacheIsStillLoading",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadingTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+			},
+			want: corsAnsweredPerBucket,
 		},
 		{
 			// And the fallback must not reach a request the rules refuse either,
@@ -4169,16 +4797,31 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 			name: "rulesThatRefuseTheRequestAnswerInstead",
 			setup: func(t *testing.T) {
 				t.Helper()
-				setTestBucketCORSConfig(installLoadedTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+				setTestBucketCORSConfig(installTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
 			},
-			origin:         "https://www.example9.com",
-			wantServerWide: false,
+			origin: "https://www.example9.com",
+			want:   corsAnsweredPerBucket,
+		},
+		{
+			// The stored rules refuse this origin and the cache is still loading,
+			// which is the exact shape of the leak this disposition exists to
+			// prevent: the global setting would have allowed it.
+			name: "rulesThatRefuseTheRequestGovernWhileTheCacheIsStillLoading",
+			setup: func(t *testing.T) {
+				t.Helper()
+				setTestBucketCORSConfig(installLoadingTestBucketMetadataSys(t), bucket, corsTestConfig(rule))
+			},
+			origin: "https://www.example9.com",
+			want:   corsAnsweredPerBucket,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.setup(t)
+			// A refusal is reported, and this test causes several of them, so the
+			// reporter is replaced to keep the server's own out of it.
+			installTestCORSPreflightReporter(t)
 
 			// The S3 handler behind the CORS layers must never be reached by a
 			// preflight: no mux route is registered for OPTIONS, which is the
@@ -4199,7 +4842,7 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 
 			handler.ServeHTTP(rec, req)
 
-			if !tc.wantServerWide {
+			if tc.want != corsAnsweredServerWide {
 				// Answered by the per-bucket evaluator: 200, and the server-wide
 				// handler's Access-Control-Allow-Credentials is absent because
 				// that handler never saw the request.
@@ -4208,6 +4851,15 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 				}
 				if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
 					t.Errorf("expected the server-wide handler not to have answered, it set Access-Control-Allow-Credentials to %q", got)
+				}
+				if tc.want == corsRefusedPerBucket {
+					// A refusal carries no allow header of any kind, which is how
+					// a browser learns the request is not permitted.
+					for _, name := range corsPreflightAllowHeaders {
+						if got := rec.Header().Values(name); len(got) != 0 {
+							t.Errorf("expected a refused preflight to carry no %s, got %v", name, got)
+						}
+					}
 				}
 				return
 			}
@@ -4234,6 +4886,164 @@ func TestBucketCorsPreflightServerWideFallback(t *testing.T) {
 				t.Errorf("expected no Access-Control-Expose-Headers on a server-wide preflight response, got %v", got)
 			}
 		})
+	}
+}
+
+// TestBucketCorsPreflightAcrossTheMetadataLoadWindow proves the property a
+// restart turns on, against a real backend: from the moment a server answers
+// requests, a bucket's stored CORS rules govern its preflights, and a bucket that
+// has none is still answered from MINIO_API_CORS_ALLOW_ORIGIN.
+//
+// The two halves pull in opposite directions, which is why they are asserted
+// together. While the bucket metadata cache is loading it holds neither bucket, so
+// a miss cannot be read as an absence - doing that answers a configured bucket's
+// preflight from the global setting and lets an origin its rules exclude through
+// for as long as loading takes. Nor can a miss be refused outright, because that
+// denies every unconfigured bucket the answer the server has always given it. Only
+// establishing the configuration for the one bucket the request names satisfies
+// both, and only a real object layer can prove it does.
+//
+// The global allow-origin list is unset in this process, which
+// getCorsAllowOrigins reports as "*", so the server-wide handler would allow every
+// origin below. A stored rule set that refuses one is therefore refusing an origin
+// the fallback would have allowed, which is exactly the leak this exists to
+// prevent, and the answers are told apart by their fingerprints: the server-wide
+// handler replies 204 with Access-Control-Allow-Credentials, the per-bucket
+// evaluator replies 200 without it.
+func TestBucketCorsPreflightAcrossTheMetadataLoadWindow(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:          t,
+		objAPITest: testBucketCorsPreflightAcrossTheMetadataLoadWindow,
+	})
+}
+
+func testBucketCorsPreflightAcrossTheMetadataLoadWindow(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, creds auth.Credentials, t *testing.T,
+) {
+	const (
+		configuredOrigin = "https://configured.example"
+		excludedOrigin   = "https://excluded.example"
+	)
+	ctx := t.Context()
+
+	// The rule allows one origin and one method, so every other origin is one the
+	// stored configuration refuses while the global setting would allow it.
+	document := corsTestDoc(corsTestRule(
+		`<ID>load-window</ID>` +
+			`<AllowedMethod>PUT</AllowedMethod>` +
+			`<AllowedOrigin>` + configuredOrigin + `</AllowedOrigin>` +
+			`<AllowedHeader>x-amz-*</AllowedHeader>` +
+			`<ExposeHeader>ETag</ExposeHeader>` +
+			`<MaxAgeSeconds>3000</MaxAgeSeconds>`))
+
+	rec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, newSignedCORSRequest(t, http.MethodPut, bucketName, []byte(document), creds))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: expected the configuration to be stored with %d, got %d with body %q",
+			instanceType, http.StatusOK, rec.Code, truncateForError(rec.Body.String()))
+	}
+
+	// A second bucket that exists and carries no CORS configuration, which is the
+	// bucket whose preflights the global setting has always answered.
+	unconfiguredBucket := getRandomBucketName()
+	if err := obj.MakeBucket(ctx, unconfiguredBucket, MakeBucketOptions{}); err != nil {
+		t.Fatalf("%s: failed to create the unconfigured bucket %s: %v", instanceType, unconfiguredBucket, err)
+	}
+
+	// An object layer has to be reachable for a configuration to be established
+	// from the backend at all, which is the state a server is in once it is
+	// serving requests while its metadata cache still loads.
+	savedLayer := globalObjectAPI
+	t.Cleanup(func() { setObjectLayer(savedLayer) })
+	setObjectLayer(obj)
+
+	// The load window itself: a cache that holds nothing and has not finished
+	// loading, in front of the backend that holds both buckets.
+	sys := installLoadingTestBucketMetadataSys(t)
+	installTestCORSPreflightReporter(t)
+
+	handler := corsHandler(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Errorf("%s: expected a preflight not to reach the wrapped S3 handler", instanceType)
+	}))
+
+	preflight := func(bucket, origin string) *httptest.ResponseRecorder {
+		t.Helper()
+
+		req := httptest.NewRequest(http.MethodOptions, "/"+bucket+"/object", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+		req.Header.Set("Access-Control-Request-Headers", "x-amz-meta-foo")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// The stored rule allows this request, and it is answered from that rule
+	// rather than by the global handler: 200, no Access-Control-Allow-Credentials,
+	// and the rule's own ExposeHeader and MaxAgeSeconds, neither of which the
+	// global handler ever emits on a preflight.
+	rec = preflight(bucketName, configuredOrigin)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: expected the stored rule to answer with %d during the load window, got %d",
+			instanceType, http.StatusOK, rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("%s: expected the stored rule rather than the server-wide handler to answer, it set Access-Control-Allow-Credentials to %q",
+			instanceType, got)
+	}
+	for header, want := range map[string]string{
+		"Access-Control-Allow-Origin":   configuredOrigin,
+		"Access-Control-Allow-Methods":  http.MethodPut,
+		"Access-Control-Allow-Headers":  "x-amz-meta-foo",
+		"Access-Control-Max-Age":        "3000",
+		"Access-Control-Expose-Headers": "ETag",
+	} {
+		if got := rec.Header().Get(header); got != want {
+			t.Fatalf("%s: expected %s to be %q during the load window, got %q", instanceType, header, want, got)
+		}
+	}
+
+	// The same bucket, an origin its rules exclude and the global setting would
+	// allow. This is the leak: it must be refused, with no allow header at all.
+	rec = preflight(bucketName, excludedOrigin)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: expected the stored rules to refuse the excluded origin with %d, got %d",
+			instanceType, http.StatusOK, rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("%s: expected the excluded origin to be refused by the stored rules, the server-wide handler answered it with Access-Control-Allow-Credentials %q",
+			instanceType, got)
+	}
+	for _, header := range corsPreflightAllowHeaders {
+		if got := rec.Header().Values(header); len(got) != 0 {
+			t.Fatalf("%s: expected the excluded origin to receive no %s, got %v", instanceType, header, got)
+		}
+	}
+
+	// A bucket that exists and has no configuration keeps the answer it has always
+	// been given, during the very same window: the server-wide 204.
+	for _, bucket := range []string{unconfiguredBucket, getRandomBucketName()} {
+		rec = preflight(bucket, excludedOrigin)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s: expected the server-wide handler to answer for %s with %d during the load window, got %d",
+				instanceType, bucket, http.StatusNoContent, rec.Code)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != excludedOrigin {
+			t.Fatalf("%s: expected the server-wide handler to allow the origin %q for %s, got %q",
+				instanceType, excludedOrigin, bucket, got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Fatalf("%s: expected the server-wide handler to answer for %s, its Access-Control-Allow-Credentials was %q",
+				instanceType, bucket, got)
+		}
+	}
+
+	// None of this may have grown the metadata cache: the reads are made for one
+	// request and left behind with it, so a preflight naming buckets that do not
+	// exist cannot accumulate anything.
+	if sys.Count() != 0 {
+		t.Fatalf("%s: expected the load-window reads to add no metadata entries, got %d",
+			instanceType, sys.Count())
 	}
 }
 
@@ -4418,6 +5228,187 @@ func TestCorsPreflightRefusalReporterConcurrent(t *testing.T) {
 	}
 }
 
+// corsCapturingLogTarget is a logger target that records the entries sent to it,
+// so a test can assert on the shape of what a refusal report emits rather than
+// only on the text it composes.
+//
+// It satisfies the target contract without doing any of the work a real target
+// does: Send never fails, so nothing is ever re-routed to the console, and once a
+// test releases it the target stops recording, because targets can be added to the
+// logger but not removed and this one outlives the test that installed it.
+type corsCapturingLogTarget struct {
+	mu        sync.Mutex
+	recording bool
+	entries   []log.Entry
+}
+
+func (t *corsCapturingLogTarget) String() string           { return "blitzy-cors-capture" }
+func (t *corsCapturingLogTarget) Endpoint() string         { return "" }
+func (t *corsCapturingLogTarget) Stats() types.TargetStats { return types.TargetStats{} }
+func (t *corsCapturingLogTarget) Init(context.Context) error {
+	return nil
+}
+
+func (t *corsCapturingLogTarget) IsOnline(context.Context) bool { return true }
+func (t *corsCapturingLogTarget) Cancel()                       {}
+func (t *corsCapturingLogTarget) Type() types.TargetType        { return types.TargetHTTP }
+
+func (t *corsCapturingLogTarget) Send(_ context.Context, entry any) error {
+	e, ok := entry.(log.Entry)
+	if !ok {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.recording {
+		t.entries = append(t.entries, e)
+	}
+	return nil
+}
+
+func (t *corsCapturingLogTarget) captured() []log.Entry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.entries)
+}
+
+// installTestCORSLogCapture makes the entries a refusal report emits observable.
+//
+// The test binary disables logging wholesale, so it is re-enabled for the duration
+// of one test and restored afterwards, and the capturing target is released at the
+// same time so that no other test's logging is recorded.
+func installTestCORSLogCapture(t *testing.T) *corsCapturingLogTarget {
+	t.Helper()
+
+	target := &corsCapturingLogTarget{recording: true}
+	if err := logger.AddSystemTarget(context.Background(), target); err != nil {
+		t.Fatalf("failed to install the capturing log target: %v", err)
+	}
+
+	disabled := logger.DisableLog
+	logger.DisableLog = false
+	t.Cleanup(func() {
+		logger.DisableLog = disabled
+		target.mu.Lock()
+		target.recording = false
+		target.mu.Unlock()
+	})
+
+	return target
+}
+
+// TestCorsPreflightRefusalReportCarriesNoStackTrace pins the logging path a
+// refusal report is emitted through.
+//
+// A refusal is a condition this layer expects and handles, not a fault to be
+// traced back to a line of code, and every refusal is produced from the same three
+// call sites - so frames naming them describe the logger and net/http rather than
+// anything an operator can act on. The entry therefore has to carry the reason and
+// no trace at all. That is a property of the emission path and not of the message,
+// so it is asserted on the entry itself: an error-shaped emission would attach a
+// trace and would be caught here even though the text was unchanged.
+func TestCorsPreflightRefusalReportCarriesNoStackTrace(t *testing.T) {
+	target := installTestCORSLogCapture(t)
+	reporter := installTestCORSPreflightReporter(t)
+
+	reporter.report(fmt.Errorf("for bucket %s, %w", "blitzy-cors-bucket",
+		errCORSPreflightHeadersTooLarge))
+
+	entries := target.captured()
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one entry to be emitted, got %d: %+v", len(entries), entries)
+	}
+	entry := entries[0]
+
+	if entry.Trace != nil {
+		t.Fatalf("expected no trace to be attached, got message %q with %d source frame(s): %v",
+			entry.Trace.Message, len(entry.Trace.Source), entry.Trace.Source)
+	}
+	if entry.Level != logger.EventKind {
+		t.Fatalf("expected the entry to be emitted as %q, got %q", logger.EventKind, entry.Level)
+	}
+
+	// The reason has to survive, including the bucket it concerns and the count of
+	// refusals folded into this report, or the entry says less than the refusal did.
+	for _, want := range []string{
+		"Refused a CORS preflight request",
+		"blitzy-cors-bucket",
+		errCORSPreflightHeadersTooLarge.Error(),
+	} {
+		if !strings.Contains(entry.Message, want) {
+			t.Fatalf("expected the message to contain %q, got %q", want, entry.Message)
+		}
+	}
+
+	// Nothing about the internals that produced the refusal belongs in the entry,
+	// whether as a trace or folded into the message itself.
+	for _, unwanted := range []string{
+		".go:", "cmd.", "logger.", "net/http", "bucket-cors",
+	} {
+		if strings.Contains(entry.Message, unwanted) {
+			t.Fatalf("expected the message to name no source location, %q contains %q",
+				entry.Message, unwanted)
+		}
+	}
+}
+
+// TestCorsAuditLogFilterKeys pins the request keys a CORS audit entry drops.
+//
+// An audit entry records a request verbatim, so a signed request's signature is
+// recorded with it, and a signature replayed inside its expiry window
+// re-authenticates the operation it covers. The keys below are the only ones a
+// client can authenticate a request with, so the set has to hold all of them - and
+// each has to be spelled the one way that authenticates, since the header names are
+// canonicalized by net/http and the presigned forms are read case-sensitively out
+// of the query string.
+func TestCorsAuditLogFilterKeys(t *testing.T) {
+	want := []string{
+		"Authorization",
+		"X-Amz-Signature",
+		"Signature",
+		"X-Amz-Security-Token",
+	}
+	if !slices.Equal(corsAuditLogFilterKeys, want) {
+		t.Fatalf("expected the filtered keys to be %v, got %v", want, corsAuditLogFilterKeys)
+	}
+
+	// Spelled through the constants the signature code itself reads them by, so a
+	// rename on either side cannot silently stop a key from being filtered.
+	for i, canonical := range []string{
+		xhttp.Authorization,
+		xhttp.AmzSignature,
+		xhttp.AmzSignatureV2,
+		xhttp.AmzSecurityToken,
+	} {
+		if corsAuditLogFilterKeys[i] != canonical {
+			t.Fatalf("expected filtered key %d to be %q, got %q",
+				i, canonical, corsAuditLogFilterKeys[i])
+		}
+	}
+
+	// A header name is canonicalized before it reaches an entry, so the filtered
+	// spelling has to be the canonical one or the key is never matched.
+	for _, name := range []string{xhttp.Authorization, xhttp.AmzSecurityToken} {
+		if got := http.CanonicalHeaderKey(name); got != name {
+			t.Fatalf("expected %q to already be the canonical header key, got %q", name, got)
+		}
+	}
+
+	// Every CORS handler filters, not just the one that writes a configuration:
+	// reading one and removing one are signed the same way and are recorded the
+	// same way.
+	handlers := map[string]http.HandlerFunc{
+		"PutBucketCors":    objectAPIHandlers{}.PutBucketCorsHandler,
+		"GetBucketCors":    objectAPIHandlers{}.GetBucketCorsHandler,
+		"DeleteBucketCors": objectAPIHandlers{}.DeleteBucketCorsHandler,
+	}
+	for name, handler := range handlers {
+		if handler == nil {
+			t.Fatalf("expected %s to be registered", name)
+		}
+	}
+}
+
 // TestBucketCorsPreflightMiddlewareReportsItsOwnRefusals pins which refusals the
 // evaluator reports.
 //
@@ -4513,10 +5504,10 @@ func TestBucketCorsPreflightMiddlewareReportsItsOwnRefusals(t *testing.T) {
 			wantReported: false,
 		},
 		{
-			// Neither is the delegation of a bucket the cache does not hold,
-			// which is the state a still loading cache and an absent bucket
-			// share. It is the ordinary fallback rather than a condition.
-			name: "delegationOfABucketTheCacheDoesNotHoldIsNotReported",
+			// Neither is the delegation of a bucket a loaded cache does not hold:
+			// that bucket demonstrably has no configuration of its own, which is
+			// the ordinary fallback rather than a condition.
+			name: "delegationOfABucketTheLoadedCacheDoesNotHoldIsNotReported",
 			setup: func(t *testing.T) {
 				t.Helper()
 				installTestBucketMetadataSys(t)
@@ -4525,18 +5516,32 @@ func TestBucketCorsPreflightMiddlewareReportsItsOwnRefusals(t *testing.T) {
 			wantReported: false,
 		},
 		{
-			// And neither is the absence of the metadata subsystem itself, for
-			// the same reason: no rules of this bucket's own were established, so
-			// the request stays the server-wide handler's.
-			name: "delegationWithoutAMetadataSubsystemIsNotReported",
+			// A configuration that could not be established at all is a different
+			// matter, and is exactly what an operator needs told: the request was
+			// refused without the bucket's rules ever being read. Here there is no
+			// metadata subsystem to read them through.
+			name: "aConfigurationThatCouldNotBeEstablishedIsReported",
 			setup: func(t *testing.T) {
 				t.Helper()
 				saved := globalBucketMetadataSys
 				t.Cleanup(func() { globalBucketMetadataSys = saved })
 				globalBucketMetadataSys = nil
 			},
-			want:         corsOutcomeDelegated,
-			wantReported: false,
+			want:         corsOutcomeDenied,
+			wantReported: true,
+		},
+		{
+			// The same report for the same reason reached the other way: the cache
+			// is still loading and there is no object layer to establish this
+			// bucket's configuration from.
+			name: "aBucketMissedInALoadingCacheIsReported",
+			setup: func(t *testing.T) {
+				t.Helper()
+				installLoadingTestBucketMetadataSys(t)
+				installTestNoObjectLayer(t)
+			},
+			want:         corsOutcomeDenied,
+			wantReported: true,
 		},
 		{
 			// A rule matched, so there is nothing to report either.
@@ -5981,7 +6986,7 @@ func testBucketCORSMetadataTimestamp(obj ObjectLayer, instanceType, bucketName s
 				instanceType, stage)
 		}
 
-		preflightConfig, err := preflightCORSConfig(bucketName)
+		preflightConfig, err := preflightCORSConfig(ctx, bucketName)
 		if err != nil {
 			t.Fatalf("%s: %s: expected the preflight lookup to find the configuration, got error: %v",
 				instanceType, stage, err)
@@ -6021,7 +7026,7 @@ func testBucketCORSMetadataTimestamp(obj ObjectLayer, instanceType, bucketName s
 			t.Fatalf("%s: %s: expected GetCORSConfig to report the configuration missing, got error: %v",
 				instanceType, stage, err)
 		}
-		if config, err := preflightCORSConfig(bucketName); err == nil {
+		if config, err := preflightCORSConfig(ctx, bucketName); err == nil {
 			t.Fatalf("%s: %s: expected the preflight lookup to find no configuration, got %+v",
 				instanceType, stage, config)
 		}

@@ -33,6 +33,42 @@ import (
 	"github.com/minio/pkg/v3/policy"
 )
 
+// corsAuditLogFilterKeys names the request keys whose values authenticate a
+// request, and which an audit entry for a CORS operation therefore drops.
+//
+// An audit entry records a request verbatim: every header under requestHeader and
+// every query parameter under requestQuery. For a signed request that means the
+// signature itself, and a signature replayed inside its expiry window
+// re-authenticates the operation it covers. The keys below are the only ones a
+// client can authenticate with, so removing them leaves an entry that cannot be
+// turned back into a request while everything an audit entry is read for is
+// untouched: the API name, the principal in accessKey and parentUser, the bucket,
+// the status, the request ID, the timing, and every remaining header and query
+// parameter - including X-Amz-Date, X-Amz-Content-Sha256, X-Amz-Credential,
+// X-Amz-Expires and X-Amz-SignedHeaders, which say how a request was signed
+// without saying what it was signed with.
+//
+// Each name is the one spelling that authenticates. Header names are canonicalized
+// by net/http before they reach an entry, and the presigned forms are read with
+// url.Values.Get, which is case-sensitive - so a differently spelled key is a key
+// no signature was ever verified against and nothing replayable survives under it.
+//
+// Filtering is applied per handler rather than centrally because logger.AuditLog
+// takes the keys from its caller, and the CORS handlers are the callers this
+// feature adds.
+var corsAuditLogFilterKeys = []string{
+	// Signature V4 and V2 header authentication. Carries "Signature=<hex>" and
+	// "AWS <access key>:<signature>" respectively.
+	xhttp.Authorization,
+	// Signature V4 presigned authentication, in the query string.
+	xhttp.AmzSignature,
+	// Signature V2 presigned authentication, in the query string.
+	xhttp.AmzSignatureV2,
+	// An STS session token, which a request may carry either as a header or as a
+	// query parameter; one name covers both, since both are read under it.
+	xhttp.AmzSecurityToken,
+}
+
 // PutBucketCorsHandler - PUT Bucket CORS.
 // ----------
 // Stores the bucket CORS configuration, replacing any previous one, and returns
@@ -40,7 +76,7 @@ import (
 func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketCors")
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r), corsAuditLogFilterKeys...)
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
@@ -168,9 +204,16 @@ func corsConfigBody(ctx context.Context, r *http.Request) (io.Reader, APIErrorCo
 //
 // A failure raised while the body was read keeps the code that names it rather
 // than being reported as a schema violation: the integrity failures corsConfigBody
-// verifies surface with their own codes, and a transfer that ended early becomes
-// IncompleteBody through toObjectErr, the same conversion the object write path
-// applies. A cause neither recognizes remains a server error.
+// verifies surface with their own codes, and a transfer that ended early goes
+// through toObjectErr, the same conversion the object write path applies. That
+// conversion names it IncompleteBody, but a truncated transfer is answered
+// ClientDisconnected in practice, and deliberately so: a client can only end a
+// transfer early by closing its end of the connection, net/http cancels the
+// request context on that close before the read error is returned, and
+// toAPIErrorCode reports a canceled request context ahead of any other cause.
+// Both codes say the same thing about the same request, so this classifier lets
+// the server-wide precedence stand rather than overriding it for one route. A
+// cause neither recognizes remains a server error.
 //
 // A document that did not validate answers MalformedXML carrying the specific
 // cause, because the code itself only says the document did not validate and the
@@ -197,7 +240,7 @@ func corsConfigAPIError(ctx context.Context, err error) APIError {
 func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetBucketCors")
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r), corsAuditLogFilterKeys...)
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
@@ -238,7 +281,7 @@ func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http
 func (api objectAPIHandlers) DeleteBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DeleteBucketCors")
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r), corsAuditLogFilterKeys...)
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
